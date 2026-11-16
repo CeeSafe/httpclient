@@ -17,6 +17,7 @@ arm64 unless an entry says otherwise.
 | F8 | no DEFLATE decoder and no CRC-32 in lib/std | CeeSafe (library gap) | open; this package has its own |
 | F9 | a `bool` field read inside a returned struct literal is taken as a loan (N0245) | CeeSafe | open |
 | F10 | no practical way to keep a hook (callback) in a long-lived struct used from async code | CeeSafe (ergonomics, not a bug) | open; needs a design answer |
+| F11 | gcc 13 warns `free` called on `ceesafe_vec_empty` in generated C (`-Wfree-nonheap-object`) | CeeSafe (build noise, no runtime fault) | open |
 
 The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
@@ -277,6 +278,30 @@ The .NET client has telemetry hooks (`OnRequest`, `OnResponse`, `OnError`). The 
 **Here:** cosmohttp keeps counters (`Client.stats()`) and has no hooks; a caller times and logs around its own
 calls. **What would help:** an owned closure type that can be stored without a region (a boxed closure), or a
 documented pattern for "a callback registered once, called from async code".
+
+## F11. gcc 13 warns that the generated C frees the empty-vector sentinel
+
+**Kind:** build noise; no runtime fault found. **Found:** 2026-11-17, ceesafec 0.61.0 with gcc 13.3.0 on Ubuntu
+24.04 x86-64 (clang on macOS says nothing). **Not reduced.**
+
+Building cosmohttp's tests (and cosmohttp3's, which include cosmohttp) prints three warnings like:
+
+```
+ceesafe/rt.h:962:9: warning: 'free' called on unallocated object 'ceesafe_vec_empty' [-Wfree-nonheap-object]
+In function 'cee_free_inline',
+    inlined from 'ceeD_VUu8S10SystemHeap' at main.c:103233:23,
+    inlined from 'ceeAR_ceeM_09cosmohttp9H2Session_leadWith' at main.c:75831:5,
+```
+
+The source is `H2Session.leadWith` in `src/h2.cee`: a local `var target = Vector<u8>.create();` that is swapped
+with a stream's body on some paths (`swap(mut st.streams[d].body, mut target)`) and dropped at the end of each
+loop turn. The generated drop frees only when the capacity is not 0 (`if (p->cap != 0u) ceesafe_free(p->ptr, ...)`,
+`src/backend/c_helpers.cee`), and an empty vector's pointer is the sentinel with capacity 0, so the free is never
+reached with the sentinel. After inlining, gcc sees the pointer's initial value and cannot see that the capacity
+goes with it. The tests and both sweeps pass on that build.
+
+**What would help:** a drop that tests the pointer against the sentinel (which gcc can follow), or the warning
+switched off for generated code on gcc, so a user's build is quiet.
 
 ## F2. Withdrawn: diagnostics were not printed twice
 

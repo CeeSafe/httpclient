@@ -468,20 +468,22 @@ public struct Methods {
     };
 }
 
-/// Appends a request head to `out`: the request line, `Host`, the caller's `fields` (complete `name: value\r\n`
-/// lines), `Content-Length` when `length` is given, and the empty line.
+/// Appends a request head to `out`: the request line, `Host`, the caller's `fields` and the client's `extra` ones
+/// (complete `name: value\r\n` lines), `Accept-Encoding: gzip, deflate` if `coded`, `Content-Length` when `length` is given, and the empty line.
 public fn writeRequestHead(
     out: borrow mut Vector<u8>,
     method: Method,
     url: Slice<u8>,
     parts: borrow UrlParts,
     fields: Slice<u8>,
+    extra: Slice<u8>,
     length: u64?,
+    coded: bool,
 ) -> Result<void, AllocError> {
     let token = Methods.token(method).bytes();
     let target = parts.target(url);
     let authority = parts.authority(url);
-    out.reserve(token.length + target.length + authority.length + fields.length + 64)?;
+    out.reserve(token.length + target.length + authority.length + fields.length + extra.length + 96)?;
     out.extend(token)?;
     if (target.length == 0 || target[0] != '/') {
         out.extend(" /".bytes())?;
@@ -493,6 +495,10 @@ public fn writeRequestHead(
     out.extend(authority)?;
     out.extend("\r\n".bytes())?;
     out.extend(fields)?;
+    out.extend(extra)?;
+    if (coded) {
+        out.extend("Accept-Encoding: gzip, deflate\r\n".bytes())?;
+    }
     match (length) {
         Some(n) => {
             out.extend("Content-Length: ".bytes())?;

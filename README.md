@@ -4,9 +4,9 @@ An HTTP/1.1 and HTTP/2 client for [CeeSafe](https://ceesafe.github.io/CeeSafe/),
 write, the response is parsed in buffers that are reused, and a request on a warm connection allocates nothing.
 It is a new design after the .NET library [CosmoHttpClient](../../CosmoHttpClient), not a translation of it.
 
-**Status:** HTTP/1.1 and HTTP/2 over TCP and TLS, connection pooling, buffered and streamed responses, redirects.
-Not yet: HTTP/3, WebSockets, cookies, a response cache, decompression, request bodies that are streamed (see
-[What is not here yet](#what-is-not-here-yet)).
+**Status:** HTTP/1.1 and HTTP/2 over TCP and TLS, connection pooling, buffered and streamed responses, redirects,
+retries, gzip and deflate, cookies, a response cache, WebSockets, streamed request bodies. Not yet: HTTP/3
+(see [What is not here yet](#what-is-not-here-yet)).
 
 ```ceesafe
 import web_core;
@@ -187,13 +187,62 @@ not the same measurement.
 - **Redirects** (`maxRedirects`, off by default). 303 becomes a GET, and so do 301 and 302 after a POST; 307 and 308
   repeat the request. Another origin gets no `Authorization`, `Cookie` or `Proxy-Authorization`; https to http is
   not followed.
+- **A response cache** (`cacheBytes`, 0 by default: none; RFC 9111, a private cache in memory). A buffered GET is
+  answered from a stored 200 that is still fresh (`cache-control: max-age`, else `expires`, with `age` counted), with
+  no connection at all; `response.fromCache()` says so. A stale one with an `etag` or `last-modified` is asked about,
+  and a 304 makes it fresh again with the fields the 304 brought. Honoured: `no-store` and `no-cache` either way, the
+  request's `max-age`, `pragma: no-cache`, and `vary` (one entry for each value of the named request fields; `*` is
+  never stored). A POST, PUT, PATCH or DELETE that succeeds forgets what was stored for its URL. The store is
+  bounded: the responses used longest ago go first, and none may take more than half of it. It stores what `body()`
+  gives, so a decompressed body is stored as text. Not done: heuristic freshness, `stale-while-revalidate`,
+  `only-if-cached`, statuses other than 200, and responses that vary on cookies the jar chose.
+- **Streamed request bodies** (`client.upload(request, length)`, then `upload.write(bytes)` as often as needed and
+  `upload.finish()` for the buffered response). With a length the body goes under `content-length` and must be
+  exactly as long; without one it is chunked over HTTP/1.1, each chunk's size line and bytes in one vectored write,
+  and simply ends over HTTP/2, where a write waits for the server's window. Nothing of the body is kept, so nothing
+  is sent again: no redirect is followed and no retry made, and a pooled HTTP/1.1 connection the server had closed
+  meanwhile is the caller's error. An upload dropped before `finish` closes its connection or resets its stream.
+- **Lines of a streamed body** (`LineReader.create(maxLine)`, then `reader.next(mut response, mut line)`): NDJSON
+  records, server-sent events, logs. No JSON is parsed here.
+- **Counters** (`client.stats()`): requests ended, responses, errors, cache hits, retries, connections opened and
+  the milliseconds taken. There are no hooks (finding F10): time and log around your own calls.
+- **WebSockets** (`client.webSocket(request, WebSocketOptions.defaults())`; RFC 6455, over HTTP/1.1). The request
+  is a GET for a `ws://` or `wss://` URL; its fields may offer subprotocols, and `ws.protocol()` is the one chosen.
+  `sendText`, `sendBinary`, `ping`, `close(code, reason)` and `receive(mut into)`, which gives `Message.Text`,
+  `Message.Binary` or `Message.Close(code)` with the bytes in the caller's vector, reused from message to message.
+  Fragments are joined, pings answered and pongs dropped inside `receive`. The answer's `Sec-WebSocket-Accept` is
+  checked; a frame that breaks the protocol, text that is not UTF-8 and a message over `maxMessageBytes` close the
+  connection with 1002, 1007 and 1009. A payload goes out in one write up to 64 KiB, masked eight bytes at a time;
+  a large frame's payload is read straight into the message. One task both sends and receives: `receive` may be
+  cancelled (raced against something to send) and called again without losing anything. Not done:
+  permessage-deflate, and WebSockets over HTTP/2 (RFC 8441): a `TlsConfig` for `wss` must offer only `http/1.1`.
+- **Cookies** (`cookies`, off by default; RFC 6265). What `Set-Cookie` sets is kept in memory for the client's
+  lifetime and sent back to the hosts and paths it belongs to, over both protocols and on each request a redirect
+  leads to: `Domain` (the host and its subdomains, never a bare top-level name or another host), `Path`, `Secure`
+  (https only, and only https can set one), `Max-Age` and `Expires` (in the forms servers write), and the
+  `__Secure-` and `__Host-` name prefixes. Longer paths go first, then older cookies; a host keeps its 50 newest. A
+  request with its own `Cookie` field is sent with that alone. There is no public-suffix list, so
+  `Domain=co.uk` is trusted as RFC 6265 trusts it; `SameSite` means nothing to a client that is not a browser.
+- **Decompression** (`decompress`, off by default). The request asks for `gzip, deflate` unless it names its own
+  codings, and a buffered response's body with one of those codings is decompressed: `body()` is the text, and
+  `wasDecoded()` says so. The fields stay the server's (`content-encoding`, the compressed `content-length`). The text
+  may be as long as a buffered body may be (`maxBodyBytes`); a corrupt or cut-short coding is `BadEncoding`. Other
+  codings (`br`, `zstd`), several at once and streamed responses are left as they come. The decoder is this
+  package's own (`src/inflate.cee`): tables for a code's first 10 bits, 64 bits of input in hand, CRC-32 four bytes
+  at a time; checked against bodies compressed by Python's zlib (`tools/gen_inflate_vectors.py`).
+- **Retries** (`retry`, off by default; `RetryPolicy.standard()` is three attempts). A request whose method is safe
+  to repeat is sent again after 408, 429, 500, 502, 503 or 504, and after the network failed (refused, reset, closed,
+  timed out, a response cut short); not after a response that broke HTTP or a limit, and never a POST or PATCH. The
+  delay doubles from `baseMs`, varied by a fifth either way, up to `maxMs`; a `Retry-After` (seconds or an HTTP date)
+  replaces it. Retries are inside redirects, and the last attempt's response is returned whatever its status.
 - **TLS** through CeeSafe.Web's `web_tls` (OpenSSL 3): `Client.withTls(options, config)`; the ALPN it offers
   chooses the version.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 and the `Alt-Svc` upgrade to it; WebSockets; the handler pipeline's cookies, response cache, decompression, status-code retries with backoff and
-telemetry; streamed request bodies and `Expect: 100-continue`; proxies; TLS session resumption; a DNS cache. A name
+Of CosmoHttpClient's surface: HTTP/3 and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); gRPC
+framing and response trailers; typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
+the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache. A name
 with several addresses is tried one address at a time, not raced. In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
 in flight with `maxPerOrigin`).
@@ -202,9 +251,10 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 46 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 87 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
+python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib
 (cd examples/get && ceesafec build && ./out/get https://example.com/ 3)
 ```
 

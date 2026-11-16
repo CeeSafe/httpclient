@@ -25,6 +25,10 @@ public enum Fault {
     BadCompression,
     /// A frame that breaks HTTP/2's rules.
     BadFrame,
+    /// A body whose content coding (gzip, deflate) is corrupt, cut short, or fails its check.
+    BadEncoding,
+    /// A WebSocket handshake answer or frame that breaks RFC 6455, or a text message that is not UTF-8.
+    BadWebSocket,
 }
 
 /// Why a request failed.
@@ -43,6 +47,9 @@ public enum HttpError {
     Response(Fault),
     /// The server reset the request's HTTP/2 stream, with this error code (RFC 9113 §7).
     Reset(u32),
+    /// The server did not switch to WebSocket: its status, or 0 for a connection that negotiated HTTP/2, over which
+    /// this client opens no WebSocket.
+    NotSwitched(u16),
     /// More redirects than `ClientOptions.maxRedirects`.
     TooManyRedirects,
     /// The client was closed.
@@ -60,6 +67,7 @@ public struct HttpErrors {
         HttpError.Net(n) => NetErrors.describe(n),
         HttpError.Response(f) => HttpErrors.fault(f),
         HttpError.Reset(_) => "the server reset the stream",
+        HttpError.NotSwitched(_) => "the server did not switch to WebSocket",
         HttpError.TooManyRedirects => "too many redirects",
         HttpError.Closed => "the client is closed",
     };
@@ -77,6 +85,8 @@ public struct HttpErrors {
         Fault.Unexpected => "unexpected bytes from the server",
         Fault.BadCompression => "bad HPACK field block",
         Fault.BadFrame => "bad HTTP/2 frame",
+        Fault.BadEncoding => "the body's content coding is corrupt",
+        Fault.BadWebSocket => "bad WebSocket handshake or frame",
     };
 
     /// `e` as a client error.

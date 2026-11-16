@@ -1,0 +1,498 @@
+// WebSockets (RFC 6455) over HTTP/1.1: the opening handshake, then messages both ways.
+//
+// A WebSocket owns its connection, which never goes back to a pool. Sending and receiving both need the connection,
+// so one task does both; `receive` may be cancelled (raced against something to send) and called again with the same
+// vector, and loses nothing: what has arrived stays in the socket's buffers and the message so far in the vector.
+// Messages are not compressed (no permessage-deflate is offered).
+import web_core;
+import web_transport;
+import web_tls;
+import encoding;
+
+/// How a WebSocket is opened, and how large its messages may be.
+public struct WebSocketOptions {
+    /// For connecting and the handshake together; 0 for no limit.
+    public handshakeMs: u64;
+    /// The longest message `receive` accepts; a longer one closes the connection (1009).
+    public maxMessageBytes: usize;
+
+    /// 10 s for the handshake, messages up to 16 MiB.
+    public fn defaults() -> WebSocketOptions => WebSocketOptions { handshakeMs: 10000, maxMessageBytes: 16777216 };
+}
+
+/// What `WebSocket.receive` got.
+public enum Message {
+    /// A text message: the vector holds it, and it is UTF-8.
+    Text,
+    /// A binary message: the vector holds it.
+    Binary,
+    /// The server closed, with this status code (1005 if it gave none); the vector holds its reason. Nothing more
+    /// will arrive.
+    Close(u16),
+}
+
+const OP_CONTINUATION: u8 = 0;
+const OP_TEXT: u8 = 1;
+const OP_BINARY: u8 = 2;
+const OP_CLOSE: u8 = 8;
+const OP_PING: u8 = 9;
+const OP_PONG: u8 = 10;
+
+/// An open WebSocket.
+@noncopy
+public struct WebSocket {
+    private link: Link;
+    /// What has been read and not used: `inbuf[start..end]`.
+    private inbuf: Vector<u8>;
+    private start: usize;
+    private end: usize;
+    private out: Vector<u8>;
+    private maxMessage: usize;
+    /// The subprotocol the server chose, empty if none.
+    private chosen: Vector<u8>;
+    private closeSent: bool;
+    private closeReceived: bool;
+    /// A message is being received: its frames' payload so far is in the caller's vector.
+    private inMessage: bool;
+    private messageIsText: bool;
+    /// A data frame's header has been read: `frameLeft` bytes of its payload are still to come, and `frameFinal`
+    /// says whether it ends the message.
+    private frameOpen: bool;
+    private frameLeft: u64;
+    private frameFinal: bool;
+
+    /// The subprotocol the server chose among those the request offered (`Sec-WebSocket-Protocol`), empty if none.
+    public fn protocol(borrow this) -> Slice<u8> => this.chosen.view();
+
+    /// Sends a text message.
+    public async fn sendText(borrow mut this, text: StringView) -> Result<void, HttpError> =>
+        await this.send(OP_TEXT, text.bytes());
+
+    /// Sends a binary message.
+    public async fn sendBinary(borrow mut this, bytes: Slice<u8>) -> Result<void, HttpError> =>
+        await this.send(OP_BINARY, bytes);
+
+    /// Sends a ping with up to 125 bytes of `payload`; the server's pong is dropped by `receive`.
+    public async fn ping(borrow mut this, payload: Slice<u8>) -> Result<void, HttpError> {
+        if (payload.length > 125) {
+            return Err(HttpError.BadRequest);
+        }
+        return await this.send(OP_PING, payload);
+    }
+
+    /// Starts the closing handshake with `code` (1000 is a normal close) and up to 123 bytes of `reason`. Keep
+    /// calling `receive` until it gives `Close` to finish it; nothing can be sent afterwards.
+    public async fn close(borrow mut this, code: u16, reason: StringView) -> Result<void, HttpError> {
+        if (reason.length > 123) {
+            return Err(HttpError.BadRequest);
+        }
+        if (this.closeSent) {
+            return Ok();
+        }
+        var payload = [0u8; 125];
+        payload.writeBE(0, code);
+        payload[2..2 + reason.length].copyFrom(reason.bytes());
+        let sent = await this.send(OP_CLOSE, payload[0..2 + reason.length]);
+        this.closeSent = true;
+        return sent;
+    }
+
+    /// The next message into `into`, which is emptied when a new message begins. Pings are answered and pongs
+    /// dropped on the way. After `Close` the connection is done.
+    public async fn receive(borrow mut this, into: borrow mut Vector<u8>) -> Result<Message, HttpError> {
+        if (this.closeReceived) {
+            return Err(HttpError.Closed);
+        }
+        if (!this.inMessage) {
+            into.clear();
+        }
+        loop {
+            if (this.frameOpen && this.frameLeft > 0) {
+                if (into.length as u64 + this.frameLeft > this.maxMessage as u64) {
+                    return await this.fail(1009, Fault.BodyTooLarge);
+                }
+                let buffered = this.end - this.start;
+                if (buffered > 0) {
+                    var n = buffered;
+                    if (n as u64 > this.frameLeft) {
+                        n = truncate<usize>(this.frameLeft);
+                    }
+                    match (into.extend(this.inbuf[this.start..this.start + n])) {
+                        Ok() => {}
+                        Err(_) => { return Err(HttpErrors.noMemory()); }
+                    }
+                    this.start += n;
+                    this.frameLeft -= n as u64;
+                } else {
+                    // Nothing buffered: the payload goes straight from the connection into the message.
+                    var want: usize = 65536;
+                    if (want as u64 > this.frameLeft) {
+                        want = truncate<usize>(this.frameLeft);
+                    }
+                    let old = into.length;
+                    match (into.resize(old + want, 0)) {
+                        Ok() => {}
+                        Err(_) => { return Err(HttpErrors.noMemory()); }
+                    }
+                    let got = await this.link.read(mut into[old..]);
+                    match (got) {
+                        Ok(n) => {
+                            into.truncate(old + n);
+                            if (n == 0) {
+                                return Err(HttpError.Net(NetError.Closed));
+                            }
+                            this.frameLeft -= n as u64;
+                        }
+                        Err(e) => {
+                            into.truncate(old);
+                            return Err(HttpError.Net(e));
+                        }
+                    }
+                }
+                continue;
+            }
+            if (this.frameOpen) {
+                // The frame's payload is all here.
+                this.frameOpen = false;
+                if (this.frameFinal) {
+                    this.inMessage = false;
+                    if (this.messageIsText) {
+                        if (StringView.fromUtf8(into.view()) == null) {
+                            return await this.fail(1007, Fault.BadWebSocket);
+                        }
+                        return Ok(Message.Text);
+                    }
+                    return Ok(Message.Binary);
+                }
+                continue;
+            }
+            // A frame's header: two bytes, then the length's extension (RFC 6455 §5.2).
+            await this.need(2)?;
+            let first = this.inbuf[this.start];
+            let second = this.inbuf[this.start + 1];
+            let opcode = first & 15;
+            let final = (first & 0x80) != 0;
+            var header: usize = 2;
+            var length = (second & 127) as u64;
+            if (length == 126) {
+                await this.need(4)?;
+                length = this.inbuf.readBE<u16>(this.start + 2) as u64;
+                header = 4;
+            } else if (length == 127) {
+                await this.need(10)?;
+                length = this.inbuf.readBE<u64>(this.start + 2);
+                header = 10;
+            }
+            // No extension was agreed, so the reserved bits are 0; a server never masks; a length uses 63 bits.
+            if ((first & 0x70) != 0 || (second & 0x80) != 0 || length > 0x7FFFFFFFFFFFFFFF) {
+                return await this.fail(1002, Fault.BadWebSocket);
+            }
+            if (opcode >= 8) {
+                // A control frame: whole, and at most 125 bytes (§5.5). It may come between a message's frames.
+                if (!final || length > 125 || (opcode != OP_CLOSE && opcode != OP_PING && opcode != OP_PONG)) {
+                    return await this.fail(1002, Fault.BadWebSocket);
+                }
+                let size = truncate<usize>(length);
+                await this.need(header + size)?;
+                var payload = [0u8; 125];
+                payload[0..size].copyFrom(this.inbuf[this.start + header..this.start + header + size]);
+                this.start += header + size;
+                if (opcode == OP_PING) {
+                    if (!this.closeSent) {
+                        await this.send(OP_PONG, payload[0..size])?;
+                    }
+                } else if (opcode == OP_CLOSE) {
+                    if (size == 1) {
+                        return await this.fail(1002, Fault.BadWebSocket);
+                    }
+                    let code: u16 = if (size >= 2) payload.readBE<u16>(0) else 1005;
+                    this.closeReceived = true;
+                    if (!this.closeSent) {
+                        // The close is answered with its own code (§5.5.1); an error here changes nothing.
+                        let echoLength: usize = if (size >= 2) 2 else 0;
+                        let echoed = await this.send(OP_CLOSE, payload[0..echoLength]);
+                        this.closeSent = true;
+                    }
+                    into.clear();
+                    this.inMessage = false;
+                    if (size > 2) {
+                        match (into.extend(payload[2..size])) {
+                            Ok() => {}
+                            Err(_) => { return Err(HttpErrors.noMemory()); }
+                        }
+                    }
+                    return Ok(Message.Close(code));
+                }
+                continue;
+            }
+            // A data frame: the first of a message, or a continuation of the one in hand.
+            if (opcode == OP_CONTINUATION) {
+                if (!this.inMessage) {
+                    return await this.fail(1002, Fault.BadWebSocket);
+                }
+            } else if (opcode == OP_TEXT || opcode == OP_BINARY) {
+                if (this.inMessage) {
+                    return await this.fail(1002, Fault.BadWebSocket);
+                }
+                this.inMessage = true;
+                this.messageIsText = opcode == OP_TEXT;
+            } else {
+                return await this.fail(1002, Fault.BadWebSocket);
+            }
+            this.start += header;
+            this.frameOpen = true;
+            this.frameLeft = length;
+            this.frameFinal = final;
+        }
+    }
+
+    /// Makes sure `count` unread bytes are in the buffer, reading until they are.
+    async fn need(borrow mut this, count: usize) -> Result<void, HttpError> {
+        while (this.end - this.start < count) {
+            if (this.start == this.end) {
+                this.start = 0;
+                this.end = 0;
+            } else if (this.start > 0 && this.inbuf.length - this.start < count) {
+                let rest = this.end - this.start;
+                this.inbuf.copyWithin(this.start, 0, rest);
+                this.start = 0;
+                this.end = rest;
+            }
+            if (this.inbuf.length < this.start + count) {
+                match (this.inbuf.resize(this.start + count + 4096, 0)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+            match (await this.link.read(mut this.inbuf[this.end..])) {
+                Ok(n) => {
+                    if (n == 0) {
+                        return Err(HttpError.Net(NetError.Closed));
+                    }
+                    this.end += n;
+                }
+                Err(e) => { return Err(HttpError.Net(e)); }
+            }
+        }
+        return Ok();
+    }
+
+    /// The server broke the protocol: it is told so with `code` (§7.4.1), and `fault` is the error.
+    async fn fail(borrow mut this, code: u16, fault: Fault) -> Result<Message, HttpError> {
+        if (!this.closeSent) {
+            var payload = [0u8; 2];
+            payload.writeBE(0, code);
+            let told = await this.send(OP_CLOSE, payload[..]);
+            this.closeSent = true;
+        }
+        this.closeReceived = true;
+        return Err(HttpError.Response(fault));
+    }
+
+    /// One frame with the whole of `payload`, masked with a fresh key (§5.3): the header and the payload's first
+    /// 64 KiB in one write, the rest 64 KiB at a time.
+    async fn send(borrow mut this, opcode: u8, payload: Slice<u8>) -> Result<void, HttpError> {
+        if (this.closeSent) {
+            return Err(HttpError.Closed);
+        }
+        var key = [0u8; 4];
+        match (Random.fill(mut key[..])) {
+            Ok() => {}
+            Err(e) => { return Err(HttpError.Net(NetError.Io(e))); }
+        }
+        this.out.clear();
+        var header = [0u8; 14];
+        header[0] = 0x80 | opcode;
+        var used: usize = 2;
+        if (payload.length < 126) {
+            header[1] = 0x80 | truncate<u8>(payload.length);
+        } else if (payload.length < 65536) {
+            header[1] = 0x80 | 126;
+            header.writeBE(2, truncate<u16>(payload.length));
+            used = 4;
+        } else {
+            header[1] = 0x80 | 127;
+            header.writeBE(2, payload.length as u64);
+            used = 10;
+        }
+        header[used..used + 4].copyFrom(key[..]);
+        used += 4;
+        // The key as 64 bits: a chunk is a multiple of 4 long, so each starts at the key's first byte.
+        let key32 = key.readLE<u32>(0);
+        let key64 = (key32 as u64) | ((key32 as u64) << 32);
+        var at: usize = 0;
+        var first = true;
+        while (first || at < payload.length) {
+            var n = payload.length - at;
+            if (n > 65536) {
+                n = 65536;
+            }
+            let grown = if (first) this.out.extend(header[0..used]) else Ok();
+            let base = this.out.length;
+            let copied = if (grown.isOk()) this.out.extend(payload[at..at + n]) else grown;
+            match (copied) {
+                Ok() => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+            var i: usize = 0;
+            while (i + 8 <= n) {
+                let masked = this.out.readLE<u64>(base + i) ^ key64;
+                this.out.writeLE(base + i, masked);
+                i += 8;
+            }
+            while (i < n) {
+                this.out[base + i] = this.out[base + i] ^ key[i % 4];
+                i += 1;
+            }
+            match (await this.link.write(this.out.view())) {
+                Ok() => {}
+                Err(e) => { return Err(HttpError.Net(e)); }
+            }
+            this.out.clear();
+            at += n;
+            first = false;
+        }
+        return Ok();
+    }
+}
+
+/// Opens a WebSocket with `request` (a GET for a `ws://` or `wss://` URL; any `Sec-WebSocket-Protocol`, `Origin`
+/// or credentials are its fields): connects, sends the upgrade with `key` (16 bytes), and checks the answer
+/// (RFC 6455 §4.1, §4.2.2).
+async fn openWebSocket(
+    client: borrow Client,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    options: WebSocketOptions,
+    key: Slice<u8>,
+) -> Result<WebSocket, HttpError> {
+    let wire = await dial(client, url, parts)?;
+    if (wireAlpn(wire) is Alpn.Http2) {
+        return Err(HttpError.NotSwitched(0)); // the TLS configuration chose h2: no upgrade is possible there
+    }
+    var conn = match (Connection.create(wire, 16384)) {
+        Ok(c) => c,
+        Err(_) => { return Err(HttpErrors.noMemory()); },
+    };
+    var keyText = Vector<u8>.create();
+    var extra = Vector<u8>.create();
+    let built = buildUpgrade(key, mut keyText, mut extra);
+    let written = if (built.isOk()) writeRequestHead(
+        mut conn.out,
+        Method.Get,
+        url,
+        parts,
+        fields,
+        extra.view(),
+        null,
+        false,
+    ) else built;
+    match (written) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    let limits = ClientOptions.defaults();
+    await conn.exchange("".bytes(), false, limits)?;
+    let status = conn.parser.status;
+    if (status != 101) {
+        return Err(HttpError.NotSwitched(status));
+    }
+    // The answer must upgrade to websocket, prove it read the key, and choose only what was offered.
+    var expected = Vector<u8>.create();
+    match (acceptFor(keyText.view(), mut expected)) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    let upgraded = match (conn.find("upgrade".bytes())) {
+        Some(i) => conn.value(i).equalsIgnoreAsciiCase("websocket".bytes()),
+        null => false,
+    };
+    let connected = match (conn.find("connection".bytes())) {
+        Some(i) => hasToken(conn.value(i), "upgrade".bytes()),
+        null => false,
+    };
+    let accepted = match (conn.find("sec-websocket-accept".bytes())) {
+        Some(i) => conn.value(i) == expected.view(),
+        null => false,
+    };
+    if (!upgraded || !connected || !accepted || conn.find("sec-websocket-extensions".bytes()) != null) {
+        return Err(HttpError.Response(Fault.BadWebSocket));
+    }
+    var chosen = Vector<u8>.create();
+    match (conn.find("sec-websocket-protocol".bytes())) {
+        Some(i) => {
+            let offered = match (fieldValue(fields, "sec-websocket-protocol".bytes())) {
+                Some(list) => hasToken(list, conn.value(i)),
+                null => false,
+            };
+            if (!offered) {
+                return Err(HttpError.Response(Fault.BadWebSocket));
+            }
+            match (chosen.extend(conn.value(i))) {
+                Ok() => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+        }
+        null => {}
+    }
+    // What the server sent after its answer is the first of its frames.
+    let start = conn.parser.cursor;
+    let end = conn.filled;
+    return Ok(WebSocket {
+        link: conn.link,
+        inbuf: conn.buffer,
+        start: start,
+        end: end,
+        out: conn.out,
+        maxMessage: options.maxMessageBytes,
+        chosen: chosen,
+        closeSent: false,
+        closeReceived: false,
+        inMessage: false,
+        messageIsText: false,
+        frameOpen: false,
+        frameLeft: 0,
+        frameFinal: false,
+    });
+}
+
+/// The key in base64 into `keyText`, and the upgrade's own fields into `extra`.
+fn buildUpgrade(
+    key: Slice<u8>,
+    keyText: borrow mut Vector<u8>,
+    extra: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    Base64.encode(key, mut keyText)?;
+    extra.extend(
+        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ".bytes(),
+    )?;
+    extra.extend(keyText.view())?;
+    return extra.extend("\r\n".bytes());
+}
+
+/// The `Sec-WebSocket-Accept` a server must answer `keyText` with: base64 of the SHA-1 of the key and the
+/// protocol's GUID (RFC 6455 §4.2.2).
+public fn acceptFor(keyText: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var joined = Vector<u8>.create();
+    joined.extend(keyText)?;
+    joined.extend("258EAFA5-E914-47DA-95CA-C5AB0DC85B11".bytes())?;
+    let digest = sha1(joined.view());
+    return Base64.encode(digest[..], mut out);
+}
+
+/// Whether the comma-separated `list` has `token` (ASCII case ignored).
+fn hasToken(list: Slice<u8>, token: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < list.length) {
+        var end = at;
+        while (end < list.length && list[end] != ',') {
+            end += 1;
+        }
+        if (list[at..end].trim().equalsIgnoreAsciiCase(token)) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}

@@ -48,6 +48,8 @@ const WANT_END: u8 = 2;
 const WANT_DATA: u8 = 3;
 const WANT_WINDOW: u8 = 4;
 const WANT_DRAINED: u8 = 5;
+/// Everything queued has been handed to the connection's writer.
+const WANT_FLUSHED: u8 = 6;
 
 /// One request and its response on a connection. The slot is reused: its buffers keep their memory.
 struct H2Stream {
@@ -349,6 +351,8 @@ struct H2Session {
         endStream: bool,
         buffered: bool,
         maxBody: u64,
+        coded: bool,
+        extra: Slice<u8>,
     ) -> Result<usize?, AllocError> {
         var guard = this.state.write();
         let st = guard.data();
@@ -361,7 +365,19 @@ struct H2Session {
         };
         let id = st.nextId;
         let mark = st.out.length;
-        match (writeHeaders(mut st.out, id, method, url, parts, fields, length, endStream, st.peerMaxFrame)) {
+        match (writeHeaders(
+            mut st.out,
+            id,
+            method,
+            url,
+            parts,
+            fields,
+            extra,
+            length,
+            endStream,
+            coded,
+            st.peerMaxFrame,
+        )) {
             Ok() => {}
             Err(e) => {
                 st.out.truncate(mark);
@@ -403,9 +419,9 @@ struct H2Session {
         return Ok(Some(slot));
     }
 
-    /// Queues `body` as DATA frames, the last ending the stream, as the peer's windows allow; waits for room when
-    /// they are full, and for a write when much is queued.
-    async fn sendBody(borrow this, slot: usize, body: Slice<u8>) -> Result<void, HttpError> {
+    /// Queues `body` as DATA frames, the last ending the stream if `end`, as the peer's windows allow; waits for
+    /// room when they are full, and for a write when much is queued.
+    async fn sendBody(borrow this, slot: usize, body: Slice<u8>, end: bool) -> Result<void, HttpError> {
         var at: usize = 0;
         while (at < body.length) {
             var want: u8 = 0;
@@ -432,7 +448,7 @@ struct H2Session {
                     if (truncate<i64>(n) > room) {
                         n = truncate<usize>(room);
                     }
-                    let last = at + n == body.length;
+                    let last = end && at + n == body.length;
                     let id = st.streams[slot].id;
                     let queued = this.queueData(mut st.out, id, body[at..at + n], last);
                     match (queued) {
@@ -452,6 +468,33 @@ struct H2Session {
             }
         }
         return Ok();
+    }
+
+    /// Ends the request's body with an empty DATA frame, after `sendBody` calls that did not end it.
+    fn endBody(borrow this, slot: usize) -> Result<void, HttpError> {
+        var guard = this.state.write();
+        let st = guard.data();
+        if (st.streams[slot].failed) {
+            return Err(st.streams[slot].failure);
+        }
+        if (st.streams[slot].ended) {
+            return Ok(); // the server answered without taking the body
+        }
+        let id = st.streams[slot].id;
+        match (this.queueData(mut st.out, id, "".bytes(), true)) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        if (st.leading) {
+            this.outSignal.raise();
+        }
+        return Ok();
+    }
+
+    /// The connection's generation, which a response holds to give its slot back.
+    fn currentGeneration(borrow this) -> u64 {
+        let guard = this.state.read();
+        return guard.data().generation;
     }
 
     fn queueData(
@@ -482,6 +525,9 @@ struct H2Session {
         }
         if (want == WANT_WINDOW) {
             return Ok((st.sendWindow > 0 && s.sendWindow > 0) || s.ended);
+        }
+        if (want == WANT_FLUSHED) {
+            return Ok(st.out.length == 0 || s.ended);
         }
         return Ok(st.out.length < OUT_HIGH_WATER);
     }
@@ -558,7 +604,8 @@ struct H2Session {
                 if (st.out.length > 0) {
                     swap(mut st.out, mut io.writing);
                     for (i in 0..st.streams.length) {
-                        if (st.streams[i].waiting && st.streams[i].want == WANT_DRAINED) {
+                        if (st.streams[i].waiting &&
+                            (st.streams[i].want == WANT_DRAINED || st.streams[i].want == WANT_FLUSHED)) {
                             st.streams[i].waiting = false;
                             this.signals[i].raise();
                         }
@@ -1336,8 +1383,10 @@ fn writeHeaders(
     url: Slice<u8>,
     parts: borrow UrlParts,
     fields: Slice<u8>,
+    extra: Slice<u8>,
     length: u64?,
     endStream: bool,
+    coded: bool,
     maxFrame: usize,
 ) -> Result<void, AllocError> {
     let frame = out.length;
@@ -1365,6 +1414,10 @@ fn writeHeaders(
         hpackLiteral(mut out, 4, "".bytes(), target, false)?;
     }
     out.extend(fields)?;
+    out.extend(extra)?;
+    if (coded) {
+        out.push(0x90)?; // the static table's entry 16, whole: `accept-encoding: gzip, deflate`
+    }
     match (length) {
         Some(n) => {
             var digits = [0u8; 20];

@@ -1,0 +1,18 @@
+// Telemetry: counters the client always keeps. There are no hooks: a request returns to its caller, who can time and
+// log it there; a hook stored in the client could neither capture state nor do I/O (see CEESAFE_FINDINGS.md, F10).
+
+/// What a client has done since it was made (`Client.stats`).
+public struct ClientStats {
+    /// Requests made with `get`, `send` or `open` that have ended, and how they ended.
+    public requests: u64;
+    public responses: u64;
+    public errors: u64;
+    /// Responses that came from the cache, with or without asking the server.
+    public cached: u64;
+    /// Requests sent again by the `RetryPolicy`.
+    public retries: u64;
+    /// Connections opened, for requests, uploads and WebSockets.
+    public connections: u64;
+    /// The milliseconds the ended requests took together.
+    public totalMs: u64;
+}

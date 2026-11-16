@@ -1,0 +1,93 @@
+// Lines of a streamed body, and the client's counters.
+import web_core;
+import web_transport;
+
+async fn linesOnce(chunk: usize) -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(
+        client,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n{\"a\":1}\n{\"b\":2}\r\n\r\n9\r\n\n{\"c\":3}\n\r\n4\r\nlast\r\n0\r\n\r\n",
+        chunk,
+        copies,
+    )?;
+    let request = match (Request.create(Method.Get, "http://example.com/records")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var response = match (await client.open(request, "".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var reader = LineReader.create(1024);
+    var line = Vector<u8>.create();
+    let expected = ["{\"a\":1}", "{\"b\":2}", "", "{\"c\":3}", "last"];
+    for (i in 0..expected.length) {
+        match (await reader.next(mut response, mut line)) {
+            Ok(more) => { Check.isTrue(more, "a line")?; }
+            Err(e) => { return Err(failed(e)); }
+        }
+        Check.equalBytes(expected[i].bytes(), line.view())?;
+    }
+    match (await reader.next(mut response, mut line)) {
+        Ok(more) => { Check.isTrue(!more, "the end")?; }
+        Err(e) => { return Err(failed(e)); }
+    }
+    return Ok();
+}
+
+@test
+async fn linesOfAStreamedBody() -> Result<void, TestFailure> {
+    await linesOnce(0)?;
+    await linesOnce(1)?;
+    return await linesOnce(13);
+}
+
+@test
+async fn aLineTooLong() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\nshort\n0123456789012345678901234567890123", 0, copies)?;
+    let request = match (Request.create(Method.Get, "http://example.com/records")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var response = match (await client.open(request, "".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var reader = LineReader.create(16);
+    var line = Vector<u8>.create();
+    match (await reader.next(mut response, mut line)) {
+        Ok(more) => { Check.isTrue(more, "the short line")?; }
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.equalBytes("short".bytes(), line.view())?;
+    Check.isTrue((await reader.next(mut response, mut line)).isErr(), "longer than allowed")?;
+    return Ok();
+}
+
+@test
+async fn theClientCounts() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var options = ClientOptions.defaults();
+    options.cacheBytes = 65536;
+    let client = Client.create(options);
+    script(client, "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", 0, copies)?;
+    for (i in 0..3) {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    Check.isTrue((await client.get("http://example.com/other")).isErr(), "no script is left")?;
+    let stats = client.stats();
+    Check.equalU64(4, stats.requests)?;
+    Check.equalU64(3, stats.responses)?;
+    Check.equalU64(1, stats.errors)?;
+    Check.equalU64(2, stats.cached)?;
+    Check.equalU64(1, stats.connections)?;
+    Check.equalU64(0, stats.retries)?;
+    return Ok();
+}

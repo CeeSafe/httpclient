@@ -28,6 +28,18 @@ public struct ClientOptions {
     public retryStale: bool;
     /// How many redirects a request follows; 0 returns a redirect's response as it is.
     public maxRedirects: u32;
+    /// The size of the response cache, in bytes of URLs, fields and bodies; 0 for none. A buffered GET is answered
+    /// from a stored 200 that is still fresh, or after the server said it is still good (RFC 9111).
+    public cacheBytes: usize;
+    /// Keep the cookies servers set and send them back (RFC 6265), for the client's lifetime: in memory only. A
+    /// request with its own `Cookie` field is sent with that one alone.
+    public cookies: bool;
+    /// Ask for compressed responses (`Accept-Encoding: gzip, deflate`, unless the request has that field) and
+    /// decompress a buffered response's body, so `body()` is the text. Streamed responses are not touched.
+    public decompress: bool;
+    /// When a request is sent again after a status that says "later" or a network failure (`RetryPolicy`). It is
+    /// inside redirects: each request a redirect leads to has its own attempts.
+    public retry: RetryPolicy;
     /// HTTP/2 connections the client may have at once, over all origins.
     public http2Connections: usize;
     /// Requests an HTTP/2 connection carries at once (the server may allow fewer); 0 switches HTTP/2 off.
@@ -37,7 +49,7 @@ public struct ClientOptions {
 
     /// 10 s to connect and to handshake, no response timeout; 16 idle connections per origin for 60 s, no limit on
     /// requests in flight; 16 KiB buffers, kept up to 1 MiB; heads up to 64 KiB and 128 fields; buffered bodies up to
-    /// 1 GiB; stale pooled connections retried; redirects not followed; up to 4 HTTP/2 connections of 100 requests
+    /// 1 GiB; stale pooled connections retried; redirects not followed; no cache; no cookies kept; no decompression; no retries; up to 4 HTTP/2 connections of 100 requests
     /// each, for https origins that choose it.
     public fn defaults() -> ClientOptions => ClientOptions {
         connectMs: 10000,
@@ -53,6 +65,10 @@ public struct ClientOptions {
         maxBodyBytes: 1073741824,
         retryStale: true,
         maxRedirects: 0,
+        cacheBytes: 0,
+        cookies: false,
+        decompress: false,
+        retry: RetryPolicy.never(),
         http2Connections: 4,
         http2Streams: 100,
         http2PriorKnowledge: false,

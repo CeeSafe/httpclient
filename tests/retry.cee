@@ -1,0 +1,199 @@
+// Retries over scripted connections, and the parsing of `Retry-After`.
+import web_core;
+import web_transport;
+
+/// A client that sends a request up to `attempts` times, a millisecond apart.
+fn retrying(attempts: u32) -> Client {
+    var options = ClientOptions.defaults();
+    options.retry = RetryPolicy.standard();
+    options.retry.attempts = attempts;
+    options.retry.baseMs = 1;
+    return Client.create(options);
+}
+
+/// How many requests are in `wire`: one for each request line's ` HTTP/1.1\r\n`.
+fn requestsIn(wire: Slice<u8>) -> u64 {
+    var n: u64 = 0;
+    var at: usize = 0;
+    let mark = " HTTP/1.1\r\n".bytes();
+    loop {
+        match (wire[at..].indexOf(mark)) {
+            Some(i) => {
+                n += 1;
+                at += i + mark.length;
+            }
+            null => { return n; }
+        }
+    }
+}
+
+@test
+async fn aStatusThatSaysLaterIsRetried() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = retrying(3);
+    // 503, then 429 with Retry-After: 0, then the answer: one connection, a read giving one response (56 bytes each).
+    script(
+        client,
+        "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nX-Pad: ppppppp\r\n\r\nHTTP/1.1 429 Slow\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Pad: ppppppp\r\n\r\nok",
+        56,
+        copies,
+    )?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("ok".bytes(), response.body())?;
+    }
+    let wire = written(copies)?;
+    Check.equalU64(3, requestsIn(wire.view()))?;
+    return Ok();
+}
+
+@test
+async fn retriesStopAtTheLimit() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = retrying(2);
+    script(
+        client,
+        "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\nHTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        40,
+        copies,
+    )?;
+    {
+        // The second attempt's 503 is the answer: the last attempt's response is returned whatever its status.
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(503, response.status() as u64)?;
+    }
+    let wire = written(copies)?;
+    Check.equalU64(2, requestsIn(wire.view()))?;
+    return Ok();
+}
+
+@test
+async fn onlySafeMethodsAndOnlyWhenAsked() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let busy = "HTTP/1.1 503 Busy\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    // A POST is not sent again.
+    let client = retrying(3);
+    script(client, busy, 40, copies)?;
+    let request = match (Request.create(Method.Post, "http://example.com/orders")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let response = match (await client.send(request, "x".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(503, response.status() as u64)?;
+    }
+    Check.equalU64(1, requestsIn(written(copies)?.view()))?;
+    // Without a policy nothing is sent again, and a 404 never is.
+    let plain = Client.create(ClientOptions.defaults());
+    script(plain, busy, 40, copies)?;
+    {
+        let response = match (await plain.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(503, response.status() as u64)?;
+    }
+    Check.equalU64(1, requestsIn(written(copies)?.view()))?;
+    let other = retrying(3);
+    script(other, "HTTP/1.1 404 Gone\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 40, copies)?;
+    {
+        let response = match (await other.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(404, response.status() as u64)?;
+    }
+    Check.equalU64(1, requestsIn(written(copies)?.view()))?;
+    return Ok();
+}
+
+@test
+async fn aNetworkFailureIsRetried() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = retrying(3);
+    // The first connection ends without a byte, the second cuts its response short, the third answers.
+    script(client, "", 0, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", 0, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone", 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("done".bytes(), response.body())?;
+    }
+    Check.equalU64(3, requestsIn(written(copies)?.view()))?;
+    // A response that breaks HTTP is not the network's doing: it is the error, at once.
+    let strict = retrying(3);
+    script(strict, "SSH-2.0-OpenSSH_9.6\r\n", 0, copies)?;
+    script(strict, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    match (await strict.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BadStatusLine)) => {}
+        _ => { return Check.fail("a response that is not HTTP"); }
+    }
+    Check.equalU64(1, requestsIn(written(copies)?.view()))?;
+    return Ok();
+}
+
+@test
+fn retryAfterValues() -> Result<void, TestFailure> {
+    // RFC 9110 §5.6.7's example date is 784111777 seconds after 1970.
+    match (httpDateSeconds("Sun, 06 Nov 1994 08:49:37 GMT".bytes())) {
+        Some(at) => { Check.equalU64(784111777, truncate<u64>(at))?; }
+        null => { return Check.fail("the RFC's date"); }
+    }
+    let dates = [
+        "Thu, 01 Jan 1970 00:00:00 GMT", "Tue, 29 Feb 2000 12:00:00 GMT", "Fri, 31 Dec 1999 23:59:59 GMT",
+        "Mon, 16 Nov 2026 19:12:39 GMT", "Sat, 01 Mar 2025 00:00:00 GMT",
+    ];
+    let seconds = [0u64, 951825600, 946684799, 1794856359, 1740787200];
+    for (i in 0..dates.length) {
+        match (httpDateSeconds(dates[i].bytes())) {
+            Some(at) => { Check.equalU64(seconds[i], truncate<u64>(at))?; }
+            null => { return Check.fail(dates[i]); }
+        }
+    }
+    let bad = [
+        "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994", "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 32 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 24:00:00 GMT", "soon", "",
+    ];
+    for (text in bad) {
+        Check.isTrue(httpDateSeconds(text.bytes()) == null, text)?;
+    }
+    let now: i64 = 784111777;
+    Check.equalU64(120000, retryAfterMs("120".bytes(), now) ?? 1)?;
+    Check.equalU64(0, retryAfterMs(" 0 ".bytes(), now) ?? 1)?;
+    Check.equalU64(60000, retryAfterMs("Sun, 06 Nov 1994 08:50:37 GMT".bytes(), now) ?? 1)?;
+    Check.equalU64(0, retryAfterMs("Sun, 06 Nov 1994 08:00:00 GMT".bytes(), now) ?? 1)?; // already past
+    Check.isTrue(retryAfterMs("soon".bytes(), now) == null, "not a delay")?;
+    Check.isTrue(retryAfterMs("-5".bytes(), now) == null, "a negative number")?;
+    return Ok();
+}
+
+@test
+fn delaysDoubleWithinTheirBounds() -> Result<void, TestFailure> {
+    var policy = RetryPolicy.standard();
+    policy.baseMs = 100;
+    policy.maxMs = 1000;
+    let centres = [100u64, 200, 400, 800, 1000, 1000];
+    for (k in 0..centres.length) {
+        for (round in 0..50) {
+            let d = backoffMs(policy, truncate<u32>(k) + 1);
+            let c = centres[k];
+            Check.isTrue(d >= c - c / 5 && d <= c + c / 5, "within a fifth of the doubled delay")?;
+        }
+    }
+    policy.baseMs = 0;
+    Check.equalU64(0, backoffMs(policy, 3))?;
+    return Ok();
+}

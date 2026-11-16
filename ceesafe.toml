@@ -11,3 +11,5 @@ web_core = { path = "../../CeeSafe.Web/packages/web_core" }
 web_transport = { path = "../../CeeSafe.Web/packages/web_transport" }
 # TLS: OpenSSL 3 through web_tls's C shim, the only C below this package.
 web_tls = { path = "../../CeeSafe.Web/packages/web_tls" }
+# Base64, for the WebSocket handshake's key.
+encoding = { path = "../../CeeSafeLibs/encoding" }

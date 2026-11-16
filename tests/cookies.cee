@@ -1,0 +1,286 @@
+// The cookie jar's rules (RFC 6265), and cookies through the client over both protocols.
+import web_core;
+import web_transport;
+
+/// Stores `header` as a `Set-Cookie` from `url` at time `now`.
+fn setCookie(jar: borrow mut CookieJar, header: StringView, url: StringView, now: i64) -> Result<void, TestFailure> {
+    let parts = parsedUrl(url)?;
+    return made(jar.store(header.bytes(), url.bytes(), parts, now));
+}
+
+/// Checks that a request to `url` at time `now` carries exactly `expected` as its `Cookie` value.
+fn expectCookies(jar: borrow mut CookieJar, url: StringView, now: i64, expected: StringView) -> Result<void, TestFailure> {
+    let parts = parsedUrl(url)?;
+    var out = Vector<u8>.create();
+    made(jar.collect(url.bytes(), parts, now, mut out))?;
+    return Check.equalBytes(expected.bytes(), out.view());
+}
+
+@test
+fn cookiesByHostAndPath() -> Result<void, TestFailure> {
+    var jar = CookieJar.create();
+    // No Domain: this host only. No Path: the directory of the URL that set it.
+    setCookie(mut jar, "a=1", "http://example.com/shop/cart", 1000)?;
+    expectCookies(mut jar, "http://example.com/shop/pay", 1000, "a=1")?;
+    expectCookies(mut jar, "http://example.com/shop", 1000, "a=1")?;
+    expectCookies(mut jar, "http://example.com/shop/deep/er?q=1", 1000, "a=1")?;
+    expectCookies(mut jar, "http://example.com/shopping", 1000, "")?;
+    expectCookies(mut jar, "http://example.com/", 1000, "")?;
+    expectCookies(mut jar, "http://www.example.com/shop/pay", 1000, "")?;
+    expectCookies(mut jar, "http://other.test/shop/pay", 1000, "")?;
+    expectCookies(mut jar, "http://EXAMPLE.com:8080/shop/x", 1000, "a=1")?; // a host, not an origin: any port
+    // Domain: the host and its subdomains, with or without the leading dot; Path as given.
+    setCookie(mut jar, "b=2; Domain=example.com; Path=/", "http://www.example.com/x", 1000)?;
+    setCookie(mut jar, "c=3; domain=.Example.COM; path=/api", "http://example.com/", 1000)?;
+    expectCookies(mut jar, "http://example.com/", 1000, "b=2")?;
+    expectCookies(mut jar, "http://deep.www.example.com/api/v1", 1000, "c=3; b=2")?; // the longer path first
+    expectCookies(mut jar, "http://example.com/apix", 1000, "b=2")?;
+    expectCookies(mut jar, "http://notexample.com/", 1000, "")?;
+    // A Domain the host is not under, and a bare top-level name, set nothing.
+    setCookie(mut jar, "d=4; Domain=other.test", "http://example.com/", 1000)?;
+    setCookie(mut jar, "e=5; Domain=com", "http://example.com/", 1000)?;
+    setCookie(mut jar, "f=6; Domain=www.example.com", "http://example.com/", 1000)?; // a subdomain of the setter
+    Check.equalU64(3, jar.cookies.length as u64)?;
+    // An address has no subdomains: Domain may only name it.
+    setCookie(mut jar, "g=7; Domain=127.0.0.1", "http://127.0.0.1:8080/", 1000)?;
+    setCookie(mut jar, "h=8; Domain=0.0.1", "http://127.0.0.1:8080/", 1000)?;
+    expectCookies(mut jar, "http://127.0.0.1/", 1000, "g=7")?;
+    return Ok();
+}
+
+@test
+fn cookiesBySecurityAndTime() -> Result<void, TestFailure> {
+    var jar = CookieJar.create();
+    setCookie(mut jar, "s=1; Secure; Path=/", "https://example.com/", 1000)?;
+    setCookie(mut jar, "t=2; Secure", "http://example.com/", 1000)?; // http cannot set an https-only cookie
+    setCookie(mut jar, "__Secure-u=3; Path=/", "https://example.com/", 1000)?; // the prefix needs Secure
+    setCookie(mut jar, "__Host-v=4; Secure; Path=/; Domain=example.com", "https://example.com/", 1000)?; // no Domain
+    setCookie(mut jar, "__Host-w=5; Secure; Path=/", "https://example.com/", 1000)?;
+    expectCookies(mut jar, "https://example.com/", 1000, "s=1; __Host-w=5")?;
+    expectCookies(mut jar, "http://example.com/", 1000, "")?;
+    // Max-Age counts from when it was set, and outranks Expires; zero, or a date gone by, removes the cookie.
+    setCookie(mut jar, "m=1; Max-Age=10; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "n=2; Expires=Thu, 01 Jan 2099 00:00:00 GMT; Max-Age=5; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "o=3; Expires=Thu, 01 Jan 2099 00:00:00 GMT; Path=/", "http://example.com/", 1000)?;
+    expectCookies(mut jar, "http://example.com/", 1004, "m=1; n=2; o=3")?;
+    expectCookies(mut jar, "http://example.com/", 1005, "m=1; o=3")?;
+    expectCookies(mut jar, "http://example.com/", 1010, "o=3")?;
+    expectCookies(mut jar, "http://example.com/", 4070908799, "o=3")?;
+    expectCookies(mut jar, "http://example.com/", 4070908800, "")?;
+    setCookie(mut jar, "p=1; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "p=2; Path=/", "http://example.com/", 1001)?; // the same cookie: one of it, the new value
+    expectCookies(mut jar, "http://example.com/", 1002, "p=2")?;
+    setCookie(mut jar, "p=gone; Path=/; Max-Age=0", "http://example.com/", 1002)?;
+    expectCookies(mut jar, "http://example.com/", 1002, "")?;
+    setCookie(mut jar, "q=1; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "q=x; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT", "http://example.com/", 1000)?;
+    expectCookies(mut jar, "http://example.com/", 1000, "")?;
+    // What is no cookie: no name, no `=`, too long.
+    setCookie(mut jar, "=novalue; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "justtext", "http://example.com/", 1000)?;
+    var long = String.create();
+    made(long.append("big="))?;
+    for (k in 0..4100) {
+        made(long.append("x"))?;
+    }
+    setCookie(mut jar, long.view(), "http://example.com/", 1000)?;
+    // The cookies that ended are still stored until a request looks: only the https ones are live.
+    expectCookies(mut jar, "https://example.com/", 5000000000, "s=1; __Host-w=5")?;
+    Check.equalU64(2, jar.cookies.length as u64)?;
+    return Ok();
+}
+
+@test
+fn cookieOrderAndLimits() -> Result<void, TestFailure> {
+    var jar = CookieJar.create();
+    setCookie(mut jar, "old=1; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "deep=2; Path=/a/b", "http://example.com/", 1000)?;
+    setCookie(mut jar, "new=3; Path=/", "http://example.com/", 1000)?;
+    setCookie(mut jar, "mid=4; Path=/a", "http://example.com/", 1000)?;
+    setCookie(mut jar, "old=5; Path=/", "http://example.com/", 1000)?; // a new value keeps its place in the order
+    expectCookies(mut jar, "http://example.com/a/b/c", 1000, "deep=2; mid=4; old=5; new=3")?;
+    // A host keeps its 50 newest.
+    var many = CookieJar.create();
+    for (k in 0u64..60) {
+        var header = String.create();
+        made(header.append("c"))?;
+        made(header.appendNumber(k))?;
+        made(header.append("=v; Path=/"))?;
+        setCookie(mut many, header.view(), "http://example.com/", 1000)?;
+    }
+    Check.equalU64(50, many.cookies.length as u64)?;
+    var out = Vector<u8>.create();
+    let url = "http://example.com/";
+    made(many.collect(url.bytes(), parsedUrl(url)?, 1000, mut out))?;
+    Check.isTrue(out.view().startsWith("c10=v; c11=v".bytes()), "the ten oldest went")?;
+    return Ok();
+}
+
+@test
+fn cookieDates() -> Result<void, TestFailure> {
+    // The same instant in the three forms servers write, and a few shapes of the lenient rules.
+    let same = [
+        "Wed, 09 Jun 2021 10:18:14 GMT", "Wed, 09-Jun-2021 10:18:14 GMT", "Wednesday, 09-Jun-21 10:18:14 GMT",
+        "Wed Jun  9 10:18:14 2021", "9 june 2021 10:18:14", "10:18:14 2021 jun 9",
+    ];
+    for (text in same) {
+        match (cookieDateSeconds(text.bytes())) {
+            Some(at) => { Check.equalU64(1623233894, truncate<u64>(at))?; }
+            null => { return Check.fail(text); }
+        }
+    }
+    match (cookieDateSeconds("Tue, 31 Dec 2030 23:59:59 GMT".bytes())) {
+        Some(at) => { Check.equalU64(1924991999, truncate<u64>(at))?; }
+        null => { return Check.fail("2030"); }
+    }
+    match (cookieDateSeconds("Sun, 06-Nov-94 08:49:37 GMT".bytes())) {
+        Some(at) => { Check.equalU64(784111777, truncate<u64>(at))?; } // a two-digit year from 70 is 19xx
+        null => { return Check.fail("a two-digit year"); }
+    }
+    let bad = ["", "tomorrow", "09 Jun 2021", "10:18:14 Jun 2021", "Wed, 09 Foo 2021 10:18:14 GMT", "Wed, 09 Jun 2021 25:18:14 GMT", "Wed, 40 Jun 2021 10:18:14 GMT"];
+    for (text in bad) {
+        Check.isTrue(cookieDateSeconds(text.bytes()) == null, text)?;
+    }
+    return Ok();
+}
+
+fn withCookies(http2: bool) -> Client {
+    var options = ClientOptions.defaults();
+    options.cookies = true;
+    options.http2PriorKnowledge = http2;
+    return Client.create(options);
+}
+
+@test
+async fn cookiesThroughTheClient() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = withCookies(false);
+    // The first response sets two cookies; the second request, on the same connection, brings them back.
+    let first = "HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; Path=/; HttpOnly\r\nSet-Cookie: theme=dark; Path=/app\r\nContent-Length: 0\r\n\r\n";
+    var both = String.create();
+    made(both.append(first))?;
+    made(both.append("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))?;
+    script(client, both.view(), first.length, copies)?;
+    {
+        let response = match (await client.get("http://example.com/app/login")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    Check.equalU64(2, client.cookieCount() as u64)?;
+    Check.equalBytes("GET /app/login HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), written(copies)?.view())?;
+    {
+        let response = match (await client.get("http://example.com/app/home")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("ok".bytes(), response.body())?;
+    }
+    Check.equalBytes(
+        "GET /app/home HTTP/1.1\r\nHost: example.com\r\nCookie: theme=dark; sid=abc\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    // A request that brings its own Cookie field is sent with that alone; another host gets nothing.
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    var mine = match (Request.create(Method.Get, "http://example.com/app/x")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (mine.header("Cookie", "mine=1")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    client.close();
+    let other = withCookies(false);
+    script(other, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    {
+        let response = match (await other.send(mine, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    Check.equalBytes(
+        "GET /app/x HTTP/1.1\r\nHost: example.com\r\nCookie: mine=1\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    // Without the option nothing is kept.
+    let plain = Client.create(ClientOptions.defaults());
+    script(plain, first, 0, copies)?;
+    {
+        let response = match (await plain.get("http://example.com/app/login")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    Check.equalU64(0, plain.cookieCount() as u64)?;
+    client.clearCookies();
+    Check.equalU64(0, client.cookieCount() as u64)?;
+    return Ok();
+}
+
+@test
+async fn cookiesFollowRedirects() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var options = ClientOptions.defaults();
+    options.cookies = true;
+    options.maxRedirects = 3;
+    let client = Client.create(options);
+    // A login that sets a cookie and redirects: the cookie goes with the request the redirect leads to, on the
+    // same host, and not to another host.
+    let first = "HTTP/1.1 302 Found\r\nSet-Cookie: sid=abc; Path=/\r\nLocation: /home\r\nContent-Length: 0\r\n\r\n";
+    let second = "HTTP/1.1 302 Found\r\nLocation: http://other.test/landing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    var both = String.create();
+    made(both.append(first))?;
+    made(both.append(second))?;
+    script(client, both.view(), first.length, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone", 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/login")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("done".bytes(), response.body())?;
+    }
+    Check.equalBytes(
+        "GET /login HTTP/1.1\r\nHost: example.com\r\n\r\nGET /home HTTP/1.1\r\nHost: example.com\r\nCookie: sid=abc\r\n\r\nGET /landing HTTP/1.1\r\nHost: other.test\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    return Ok();
+}
+
+@test
+async fn cookiesOverHttp2() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = withCookies(true);
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["set-cookie", "sid=abc; Path=/", "set-cookie", "lang=en; Path=/"][..], 5)?;
+    let cut = server.length;
+    headers(mut server, 3, "200", [], 5)?;
+    scriptBytes(client, server.view(), cut, 0, copies)?;
+    for (k in 0..2) {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var decoder = HpackDecoder.create(4096);
+    var second: usize = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 1 && sent[i].id == 3) {
+            second = i;
+        }
+    }
+    let expected = [":method", "GET", ":scheme", "http", ":authority", "example.com", ":path", "/", "cookie", "sid=abc; lang=en"];
+    expectRequest(mut decoder, wire.view(), sent[second], expected[..])?;
+    // The field is a literal that is never to be indexed: its first byte's high four bits are 0001.
+    let block = wire[sent[second].start..sent[second].end];
+    Check.equalU64(0x1F, block[block.length - 19] as u64)?;
+    return Ok();
+}

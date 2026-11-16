@@ -1,0 +1,77 @@
+// SHA-1 (RFC 3174), for the WebSocket handshake's `Sec-WebSocket-Accept` (RFC 6455 §4.2.2) and nothing else: it is
+// no longer a hash to trust for security, and lib/std rightly has none.
+
+/// The SHA-1 digest of `data`.
+public fn sha1(data: Slice<u8>) -> [u8; 20] {
+    var h0: u32 = 0x67452301;
+    var h1: u32 = 0xEFCDAB89;
+    var h2: u32 = 0x98BADCFE;
+    var h3: u32 = 0x10325476;
+    var h4: u32 = 0xC3D2E1F0;
+    // The message, a 1 bit, zeros, and its length in bits as 64 bits, in 64-byte blocks. The last one or two blocks
+    // are made here.
+    var tail = [0u8; 128];
+    let whole = data.length / 64 * 64;
+    let rest = data.length - whole;
+    for (i in 0..rest) {
+        tail[i] = data[whole + i];
+    }
+    tail[rest] = 0x80;
+    let tailLength: usize = if (rest < 56) 64 else 128;
+    let bits = data.length as u64 * 8;
+    for (i in 0..8) {
+        tail[tailLength - 1 - i] = truncate<u8>(bits >> (truncate<u64>(i) * 8));
+    }
+    var w = [0u32; 80];
+    var offset: usize = 0;
+    while (offset < whole + tailLength) {
+        for (t in 0..16) {
+            let at = offset + t * 4;
+            w[t] = if (offset < whole) data.readBE<u32>(at) else tail.readBE<u32>(at - whole);
+        }
+        for (t in 16..80) {
+            w[t] = (w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]).rotateLeft(1);
+        }
+        var a = h0;
+        var b = h1;
+        var c = h2;
+        var d = h3;
+        var e = h4;
+        for (t in 0..80) {
+            var f: u32 = 0;
+            var k: u32 = 0;
+            if (t < 20) {
+                f = (b & c) | ((b ^ 0xFFFFFFFF) & d);
+                k = 0x5A827999;
+            } else if (t < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (t < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+            let next = a.rotateLeft(5).wrappingAdd(f).wrappingAdd(e).wrappingAdd(k).wrappingAdd(w[t]);
+            e = d;
+            d = c;
+            c = b.rotateLeft(30);
+            b = a;
+            a = next;
+        }
+        h0 = h0.wrappingAdd(a);
+        h1 = h1.wrappingAdd(b);
+        h2 = h2.wrappingAdd(c);
+        h3 = h3.wrappingAdd(d);
+        h4 = h4.wrappingAdd(e);
+        offset += 64;
+    }
+    var out = [0u8; 20];
+    out.writeBE(0, h0);
+    out.writeBE(4, h1);
+    out.writeBE(8, h2);
+    out.writeBE(12, h3);
+    out.writeBE(16, h4);
+    return out;
+}

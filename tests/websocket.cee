@@ -1,0 +1,334 @@
+// WebSockets: the handshake's hash, then conversations with a scripted server.
+import web_core;
+import web_transport;
+import encoding;
+
+fn digestHex(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    let digest = sha1(text.bytes());
+    var out = Vector<u8>.create();
+    made(Hex.encode(digest[..], mut out))?;
+    return Ok(out);
+}
+
+/// The bytes written as hex.
+fn raw(hex: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    match (Hex.decode(hex.bytes(), mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("bad hex in a test")); }
+    }
+    return Ok(out);
+}
+
+@test
+fn sha1Vectors() -> Result<void, TestFailure> {
+    Check.equalBytes("da39a3ee5e6b4b0d3255bfef95601890afd80709".bytes(), digestHex("")?.view())?;
+    Check.equalBytes("a9993e364706816aba3e25717850c26c9cd0d89d".bytes(), digestHex("abc")?.view())?;
+    // 56 bytes: the length no longer fits the block the message ends in.
+    Check.equalBytes(
+        "84983e441c3bd26ebaae4aa1f95129e5e54670f1".bytes(),
+        digestHex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")?.view(),
+    )?;
+    Check.equalBytes(
+        "ce4303f6b22257d9c9cf314ef1dee4707c6e1c13".bytes(),
+        digestHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?.view(),
+    )?;
+    // RFC 6455 §1.3's example.
+    var accept = Vector<u8>.create();
+    made(acceptFor("dGhlIHNhbXBsZSBub25jZQ==".bytes(), mut accept))?;
+    Check.equalBytes("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".bytes(), accept.view())?;
+    return Ok();
+}
+
+/// The server's answer to a handshake with the key of 16 zero bytes, with `more` fields.
+fn switching(out: borrow mut Vector<u8>, more: StringView) -> Result<void, TestFailure> {
+    made(out.extend("HTTP/1.1 101 Switching Protocols\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: ".bytes()))?;
+    made(acceptFor("AAAAAAAAAAAAAAAAAAAAAA==".bytes(), mut out))?;
+    made(out.extend("\r\n".bytes()))?;
+    made(out.extend(more.bytes()))?;
+    return made(out.extend("\r\n".bytes()));
+}
+
+/// A server's frame: `first` is its first byte (FIN and the opcode).
+fn serverFrame(out: borrow mut Vector<u8>, first: u8, payload: Slice<u8>) -> Result<void, TestFailure> {
+    made(out.push(first))?;
+    if (payload.length < 126) {
+        made(out.push(truncate<u8>(payload.length)))?;
+    } else if (payload.length < 65536) {
+        made(out.push(126))?;
+        made(out.push(truncate<u8>(payload.length >> 8)))?;
+        made(out.push(truncate<u8>(payload.length)))?;
+    } else {
+        made(out.push(127))?;
+        for (i in 0..8) {
+            made(out.push(truncate<u8>(payload.length as u64 >> ((7 - truncate<u64>(i)) * 8))))?;
+        }
+    }
+    return made(out.extend(payload));
+}
+
+/// The client's frame at `wire[at]`: its first byte, its payload unmasked into `payload`, `at` moved past it.
+fn clientFrame(wire: Slice<u8>, at: borrow mut usize, payload: borrow mut Vector<u8>) -> Result<u8, TestFailure> {
+    payload.clear();
+    var p = *at;
+    Check.isTrue(wire.length >= p + 6, "a whole frame header")?;
+    let first = wire[p];
+    Check.isTrue((wire[p + 1] & 0x80) != 0, "a client masks")?;
+    var length = (wire[p + 1] & 127) as usize;
+    p += 2;
+    if (length == 126) {
+        length = wire.readBE<u16>(p) as usize;
+        p += 2;
+    } else if (length == 127) {
+        length = truncate<usize>(wire.readBE<u64>(p));
+        p += 8;
+    }
+    Check.isTrue(wire.length >= p + 4 + length, "a whole frame")?;
+    for (i in 0..length) {
+        made(payload.push(wire[p + 4 + i] ^ wire[p + i % 4]))?;
+    }
+    *at = p + 4 + length;
+    return Ok(first);
+}
+
+async fn opened(client: borrow Client, request: borrow Request) -> Result<WebSocket, TestFailure> {
+    let key = [0u8; 16];
+    return match (await client.webSocketWithKey(request, WebSocketOptions.defaults(), key[..])) {
+        Ok(ws) => Ok(ws),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+/// What `receive` gave: 1 text, 2 binary, 100000 + the code for a close.
+async fn received(ws: borrow mut WebSocket, into: borrow mut Vector<u8>) -> Result<u32, TestFailure> {
+    return match (await ws.receive(mut into)) {
+        Ok(m) => match (m) {
+            Message.Text => Ok(1),
+            Message.Binary => Ok(2),
+            Message.Close(code) => Ok(100000 + code as u32),
+        },
+        Err(e) => Err(failed(e)),
+    };
+}
+
+fn wsRequest(url: StringView) -> Result<Request, TestFailure> {
+    return match (Request.create(Method.Get, url)) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+async fn conversation(chunk: usize) -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(200000))?;
+    let client = Client.create(ClientOptions.defaults());
+    var server = Vector<u8>.create();
+    switching(mut server, "Sec-WebSocket-Protocol: superchat\r\n")?;
+    serverFrame(mut server, 0x81, "hello".bytes())?;
+    serverFrame(mut server, 0x89, "p".bytes())?; // a ping
+    serverFrame(mut server, 0x02, "ab".bytes())?; // a binary message in two frames, a ping between them
+    serverFrame(mut server, 0x89, "mid".bytes())?;
+    serverFrame(mut server, 0x8A, "".bytes())?; // a pong nobody asked for
+    serverFrame(mut server, 0x80, "cd".bytes())?;
+    var large = Vector<u8>.create();
+    for (i in 0..70000) {
+        made(large.push(truncate<u8>(i * 7)))?;
+    }
+    serverFrame(mut server, 0x82, large[0..300])?;
+    serverFrame(mut server, 0x82, large.view())?;
+    serverFrame(mut server, 0x81, "".bytes())?;
+    serverFrame(mut server, 0x88, raw("03e8627965")?.view())?;
+    scriptBytes(client, server.view(), chunk, 0, copies)?;
+    var request = wsRequest("ws://example.com/chat?room=1")?;
+    match (request.header("Sec-WebSocket-Protocol", "chat, superchat")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    var ws = await opened(client, request)?;
+    Check.equalBytes("superchat".bytes(), ws.protocol())?;
+    var into = Vector<u8>.create();
+    match (await ws.sendText("hi")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes("hello".bytes(), into.view())?;
+    Check.equalU64(2, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes("abcd".bytes(), into.view())?;
+    Check.equalU64(2, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes(large[0..300], into.view())?;
+    Check.equalU64(2, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes(large.view(), into.view())?;
+    match (await ws.sendBinary(large.view())) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    match (await ws.sendBinary(large[0..1000])) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+    Check.equalU64(0, into.length as u64)?;
+    Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes("bye".bytes(), into.view())?;
+    Check.isTrue((await ws.receive(mut into)).isErr(), "nothing after the close")?;
+    Check.isTrue((await ws.sendText("late")).isErr(), "nothing sent after the close")?;
+    // What the client wrote: the upgrade, then its frames, every one masked.
+    let wire = written(copies)?;
+    let head = "GET /chat?room=1 HTTP/1.1\r\nHost: example.com\r\nSec-WebSocket-Protocol: chat, superchat\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";
+    Check.isTrue(wire.length > head.length, "the upgrade and frames")?;
+    Check.equalBytes(head.bytes(), wire[0..head.length])?;
+    var at = head.length;
+    var payload = Vector<u8>.create();
+    Check.equalU64(0x81, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("hi".bytes(), payload.view())?;
+    Check.equalU64(0x8A, clientFrame(wire.view(), mut at, mut payload)? as u64)?; // the pongs
+    Check.equalBytes("p".bytes(), payload.view())?;
+    Check.equalU64(0x8A, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("mid".bytes(), payload.view())?;
+    Check.equalU64(0x82, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(large.view(), payload.view())?;
+    Check.equalU64(0x82, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(large[0..1000], payload.view())?;
+    Check.equalU64(0x88, clientFrame(wire.view(), mut at, mut payload)? as u64)?; // the close, echoed
+    Check.equalBytes(raw("03e8")?.view(), payload.view())?;
+    Check.equalU64(wire.length as u64, at as u64)?;
+    return Ok();
+}
+
+@test
+async fn aConversation() -> Result<void, TestFailure> {
+    await conversation(0)?;
+    await conversation(1)?;
+    return await conversation(977);
+}
+
+@test
+async fn theClientClosesFirst() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    var server = Vector<u8>.create();
+    switching(mut server, "")?;
+    serverFrame(mut server, 0x81, "last".bytes())?;
+    serverFrame(mut server, 0x88, raw("03e9")?.view())?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    let request = wsRequest("ws://example.com:8080/")?;
+    var ws = await opened(client, request)?;
+    Check.equalU64(0, ws.protocol().length as u64)?;
+    match (await ws.close(1000, "done")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.isTrue((await ws.ping("x".bytes())).isErr(), "nothing after our close")?;
+    var into = Vector<u8>.create();
+    Check.equalU64(1, await received(mut ws, mut into)? as u64)?; // what was on its way still arrives
+    Check.equalBytes("last".bytes(), into.view())?;
+    Check.equalU64(101001, await received(mut ws, mut into)? as u64)?;
+    let wire = written(copies)?;
+    let head = "GET / HTTP/1.1\r\nHost: example.com:8080\r\n";
+    Check.equalBytes(head.bytes(), wire[0..head.length])?;
+    var at = (wire.view().indexOf("\r\n\r\n".bytes()) ?? 0) + 4;
+    var payload = Vector<u8>.create();
+    Check.equalU64(0x88, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(raw("03e8646f6e65")?.view(), payload.view())?;
+    Check.equalU64(wire.length as u64, at as u64)?; // the server's close is not answered twice
+    return Ok();
+}
+
+/// A handshake answered with `answer`: the status if the server did not switch, 1 for an answer that breaks the
+/// protocol, 2 for another error.
+async fn refused(answer: Slice<u8>, offer: StringView) -> Result<u64, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    scriptBytes(client, answer, 0, 0, copies)?;
+    var request = wsRequest("ws://example.com/")?;
+    if (offer.length > 0) {
+        match (request.header("Sec-WebSocket-Protocol", offer)) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+    }
+    let key = [0u8; 16];
+    return match (await client.webSocketWithKey(request, WebSocketOptions.defaults(), key[..])) {
+        Ok(_) => Err(TestFailure.create("the handshake was accepted")),
+        Err(e) => match (e) {
+            HttpError.NotSwitched(status) => Ok(status as u64),
+            _ => if (HttpErrors.describe(e).bytes() == "bad WebSocket handshake or frame".bytes()) Ok(1) else Ok(2),
+        },
+    };
+}
+
+@test
+async fn handshakesThatAreRefused() -> Result<void, TestFailure> {
+    Check.equalU64(404, await refused("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".bytes(), "")?)?;
+    // An accept for another key.
+    let wrong = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    Check.equalU64(1, await refused(wrong.bytes(), "")?)?;
+    var none = Vector<u8>.create();
+    switching(mut none, "Sec-WebSocket-Protocol: chat\r\n")?;
+    Check.equalU64(1, await refused(none.view(), "")?)?; // a subprotocol nobody offered
+    Check.equalU64(1, await refused(none.view(), "superchat, chatty")?)?;
+    var extension = Vector<u8>.create();
+    switching(mut extension, "Sec-WebSocket-Extensions: permessage-deflate\r\n")?;
+    Check.equalU64(1, await refused(extension.view(), "")?)?;
+    let client = Client.create(ClientOptions.defaults());
+    let post = match (Request.create(Method.Post, "ws://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue((await client.webSocket(post, WebSocketOptions.defaults())).isErr(), "only a GET upgrades")?;
+    let secure = wsRequest("wss://example.com/")?;
+    Check.isTrue((await client.webSocket(secure, WebSocketOptions.defaults())).isErr(), "wss needs TLS")?;
+    return Ok();
+}
+
+/// A server that sends `frames` after the handshake: the code of the close the client answers its fault with.
+async fn faultCode(frames: Slice<u8>, limit: usize) -> Result<u64, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    var server = Vector<u8>.create();
+    switching(mut server, "")?;
+    made(server.extend(frames))?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    let request = wsRequest("ws://example.com/")?;
+    var options = WebSocketOptions.defaults();
+    options.maxMessageBytes = limit;
+    let key = [0u8; 16];
+    var ws = match (await client.webSocketWithKey(request, options, key[..])) {
+        Ok(w) => w,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var into = Vector<u8>.create();
+    loop {
+        match (await ws.receive(mut into)) {
+            Ok(_) => {}
+            Err(_) => { break; }
+        }
+    }
+    Check.isTrue((await ws.receive(mut into)).isErr(), "done after a fault")?;
+    let wire = written(copies)?;
+    var at = (wire.view().indexOf("\r\n\r\n".bytes()) ?? 0) + 4;
+    if (at == wire.length) {
+        return Ok(0); // nothing was sent: the connection just ended
+    }
+    var payload = Vector<u8>.create();
+    Check.equalU64(0x88, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalU64(2, payload.length as u64)?;
+    Check.equalU64(wire.length as u64, at as u64)?;
+    return Ok(payload.readBE<u16>(0) as u64);
+}
+
+@test
+async fn framesThatBreakTheProtocol() -> Result<void, TestFailure> {
+    Check.equalU64(1002, await faultCode(raw("8182000000006869")?.view(), 1000)?)?; // a server that masks
+    Check.equalU64(1002, await faultCode(raw("c1026869")?.view(), 1000)?)?; // a reserved bit
+    Check.equalU64(1002, await faultCode(raw("83026869")?.view(), 1000)?)?; // an opcode that does not exist
+    Check.equalU64(1002, await faultCode(raw("80026869")?.view(), 1000)?)?; // a continuation of nothing
+    Check.equalU64(1002, await faultCode(raw("010268698102686f")?.view(), 1000)?)?; // a message inside a message
+    Check.equalU64(1002, await faultCode(raw("090170")?.view(), 1000)?)?; // a ping in pieces
+    Check.equalU64(1002, await faultCode(raw("880178")?.view(), 1000)?)?; // a close with half a code
+    Check.equalU64(1007, await faultCode(raw("8102c328")?.view(), 1000)?)?; // text that is not UTF-8
+    Check.equalU64(1009, await faultCode(raw("827e03e9")?.view(), 1000)?)?; // 1001 bytes announced
+    Check.equalU64(1009, await faultCode(raw("0203616263807e03e6")?.view(), 1000)?)?; // 3 + 998
+    Check.equalU64(0, await faultCode(raw("810568656c")?.view(), 1000)?)?; // cut short: an error, nothing to say
+    return Ok();
+}

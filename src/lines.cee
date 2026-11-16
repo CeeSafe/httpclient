@@ -1,0 +1,78 @@
+// Lines of a streamed body: NDJSON records, server-sent events, logs.
+
+/// Reads a streamed response (`Client.open`) a line at a time. It keeps what it has read past the line it gave, so
+/// one reader goes with one response to its end.
+public struct LineReader {
+    private buffer: Vector<u8>;
+    private start: usize;
+    private end: usize;
+    private done: bool;
+    private maxLine: usize;
+
+    /// A reader of lines up to `maxLine` bytes long; a longer one is `BodyTooLarge`.
+    public fn create(maxLine: usize) -> LineReader =>
+        LineReader { buffer: Vector<u8>.create(), start: 0, end: 0, done: false, maxLine: maxLine };
+
+    /// The next line of `response` into `line`, without its line end (`\n` or `\r\n`): true, or false at the end of
+    /// the body. A last line without a line end counts if it is not empty.
+    public async fn next(
+        borrow mut this,
+        response: borrow mut Response,
+        line: borrow mut Vector<u8>,
+    ) -> Result<bool, HttpError> {
+        line.clear();
+        var searched = this.start;
+        loop {
+            match (this.buffer[searched..this.end].indexOfByte('\n')) {
+                Some(i) => {
+                    var stop = searched + i;
+                    let next = stop + 1;
+                    if (stop > this.start && this.buffer[stop - 1] == '\r') {
+                        stop -= 1;
+                    }
+                    match (line.extend(this.buffer[this.start..stop])) {
+                        Ok() => {}
+                        Err(_) => { return Err(HttpErrors.noMemory()); }
+                    }
+                    this.start = next;
+                    return Ok(true);
+                }
+                null => {}
+            }
+            if (this.done) {
+                if (this.start == this.end) {
+                    return Ok(false);
+                }
+                match (line.extend(this.buffer[this.start..this.end])) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+                this.start = this.end;
+                return Ok(true);
+            }
+            if (this.end - this.start > this.maxLine) {
+                return Err(HttpError.Response(Fault.BodyTooLarge));
+            }
+            // Room for more: the unread part moves to the front, and the buffer grows when it is full of one line.
+            if (this.start > 0) {
+                let rest = this.end - this.start;
+                this.buffer.copyWithin(this.start, 0, rest);
+                this.start = 0;
+                this.end = rest;
+            }
+            if (this.end == this.buffer.length) {
+                let size = if (this.buffer.length == 0) 4096 else this.buffer.length * 2;
+                match (this.buffer.resize(size, 0)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+            searched = this.end;
+            let n = await response.read(mut this.buffer[this.end..])?;
+            if (n == 0) {
+                this.done = true;
+            }
+            this.end += n;
+        }
+    }
+}

@@ -1,0 +1,138 @@
+// Retries (RFC 9110 §9.2.2, §10.2.3): a request whose method is safe to repeat is sent again after a status that
+// says "later" or after the network failed, with a delay that doubles, or the one `Retry-After` names.
+import web_core;
+
+/// When a request is sent again. Off unless `attempts` is above 1.
+public struct RetryPolicy {
+    /// How many times a request is sent in all; 1 never sends it again.
+    public attempts: u32;
+    /// The delay before the second attempt; it doubles for each one after, and each is varied by a fifth either way so
+    /// that clients which failed together do not come back together.
+    public baseMs: u64;
+    /// The longest delay, also for one a `Retry-After` names.
+    public maxMs: u64;
+    /// Send again after 408, 429, 500, 502, 503 and 504.
+    public onStatus: bool;
+    /// Send again after the network failed: the connection refused, reset, closed or timed out, a response cut short.
+    public onNetwork: bool;
+
+    /// Never send a request again.
+    public fn never() -> RetryPolicy =>
+        RetryPolicy { attempts: 1, baseMs: 100, maxMs: 30000, onStatus: true, onNetwork: true };
+
+    /// Three attempts, 100 ms then 200 ms apart (30 s at most), for statuses and network failures.
+    public fn standard() -> RetryPolicy =>
+        RetryPolicy { attempts: 3, baseMs: 100, maxMs: 30000, onStatus: true, onNetwork: true };
+}
+
+/// Whether `status` says the same request may succeed later.
+fn retryStatus(status: u16) -> bool =>
+    status == 408 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+
+/// Whether `e` is the network's doing, not the request's or the response's: a new attempt may go through. A task
+/// that was cancelled is not sent again, nor is a response that broke HTTP or a limit.
+fn retryNetwork(e: HttpError) -> bool => match (e) {
+    HttpError.Net(NetError.Cancelled) => false,
+    HttpError.Net(NetError.OutOfMemory) => false,
+    HttpError.Net(NetError.LimitExceeded) => false,
+    HttpError.Net(NetError.Tls(_)) => false,
+    HttpError.Net(_) => true,
+    HttpError.NoAddress => true,
+    HttpError.Reset(_) => true,
+    HttpError.Response(Fault.Truncated) => true,
+    _ => false,
+};
+
+/// The delay before attempt `attempt + 1` (the first retry follows attempt 1): `baseMs` doubled for each attempt
+/// already made beyond the first, at most `maxMs`, then varied by up to a fifth either way.
+fn backoffMs(policy: borrow RetryPolicy, attempt: u32) -> u64 {
+    var delay = policy.baseMs;
+    var k: u32 = 1;
+    while (k < attempt && delay < policy.maxMs) {
+        delay = delay.saturatingMul(2);
+        k += 1;
+    }
+    if (delay > policy.maxMs) {
+        delay = policy.maxMs;
+    }
+    let spread = delay / 5;
+    if (spread == 0) {
+        return delay;
+    }
+    // Without a random number (the system's source failed) the delay is the plain one.
+    let jitter = match (Random.below(spread * 2 + 1)) {
+        Ok(v) => v,
+        Err(_) => spread,
+    };
+    return delay - spread + jitter;
+}
+
+/// The delay a `Retry-After` value asks for, in milliseconds from `nowSeconds` (Unix time): a number of seconds, or
+/// an HTTP date (RFC 9110 §10.2.3). Null for a value that is neither.
+public fn retryAfterMs(value: Slice<u8>, nowSeconds: i64) -> u64? {
+    let text = value.trim();
+    if (text.length == 0) {
+        return null;
+    }
+    var digits = true;
+    for (b in text) {
+        if (b < '0' || b > '9') {
+            digits = false;
+        }
+    }
+    if (digits) {
+        let seconds = text.parseInt<u64>() ?? 0xFFFFFFFF; // too many digits to hold: a very long time
+        return Some(seconds.saturatingMul(1000));
+    }
+    let at = httpDateSeconds(text)?;
+    if (at <= nowSeconds) {
+        return Some(0u64);
+    }
+    return Some(truncate<u64>(at - nowSeconds).saturatingMul(1000));
+}
+
+/// The Unix time of an HTTP date in its preferred form, `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110 §5.6.7); null
+/// for anything else, the obsolete forms included.
+public fn httpDateSeconds(text: Slice<u8>) -> i64? {
+    if (text.length != 29 || text[3] != ',' || text[4] != ' ' || text[7] != ' ' || text[11] != ' ' || text[16] != ' ' ||
+        text[19] != ':' ||
+        text[22] != ':' || text[25] != ' ' || text[26] != 'G' || text[27] != 'M' || text[28] != 'T') {
+        return null;
+    }
+    let day = number(text[5..7])?;
+    let year = number(text[12..16])?;
+    let hour = number(text[17..19])?;
+    let minute = number(text[20..22])?;
+    let second = number(text[23..25])?;
+    let names = "JanFebMarAprMayJunJulAugSepOctNovDec".bytes();
+    var month: i64 = 0;
+    for (m in 0..12) {
+        if (names[m * 3] == text[8] && names[m * 3 + 1] == text[9] && names[m * 3 + 2] == text[10]) {
+            month = truncate<i64>(m) + 1;
+        }
+    }
+    if (month == 0 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60 || year < 1970) {
+        return null;
+    }
+    // Days from 1970-01-01 to the date, by the civil calendar (the algorithm counts from 0000-03-01 in 400-year eras).
+    let y = if (month <= 2) year - 1 else year;
+    let era = y / 400;
+    let yearOfEra = y - era * 400;
+    let shifted = if (month > 2) month - 3 else month + 9;
+    let dayOfYear = (153 * shifted + 2) / 5 + day - 1;
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    let days = era * 146097 + dayOfEra - 719468;
+    return Some(days * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+/// The decimal number `digits` is, or null if a byte is no digit.
+fn number(digits: Slice<u8>) -> i64? {
+    var n: i64 = 0;
+    for (b in digits) {
+        if (b < '0' || b > '9') {
+            return null;
+        }
+        n = n * 10 + (b - '0') as i64;
+    }
+    return Some(n);
+}

@@ -1,0 +1,426 @@
+// Cookies (RFC 6265): what `Set-Cookie` stores, and which of them a request to a URL carries.
+//
+// The jar keeps no list of public suffixes, so it cannot tell `example.co.uk` from `co.uk`. It refuses a `Domain`
+// without a dot in it (`com`, `localhost`) and otherwise trusts the attribute as RFC 6265 does without that list.
+
+/// The most cookies a jar holds, and one host's share; the oldest go first. A cookie's name and value together may
+/// be this long.
+const JAR_LIMIT: usize = 3000;
+const HOST_LIMIT: usize = 50;
+const COOKIE_BYTES: usize = 4096;
+
+struct Cookie {
+    name: Vector<u8>;
+    value: Vector<u8>;
+    /// The host it belongs to, lowercase; with `hostOnly` exactly that host, else that host and its subdomains.
+    domain: Vector<u8>;
+    hostOnly: bool;
+    path: Vector<u8>;
+    secure: bool;
+    /// When it ends, in Unix seconds; the largest value for one that lasts as long as the jar.
+    expires: i64;
+    /// The order it was first set in: cookies of equal path length are sent oldest first.
+    created: u64;
+}
+
+/// A client's cookies.
+struct CookieJar {
+    cookies: Vector<Cookie>;
+    counter: u64;
+
+    fn create() -> CookieJar => CookieJar { cookies: Vector<Cookie>.create(), counter: 0 };
+
+    /// Stores what a `Set-Cookie` value from `url` sets, or removes what it expires. A cookie the URL may not set
+    /// is ignored (RFC 6265 §5.3): a `Domain` that is not the host's, a `Secure` one from http.
+    fn store(
+        borrow mut this,
+        header: Slice<u8>,
+        url: Slice<u8>,
+        parts: borrow UrlParts,
+        now: i64,
+    ) -> Result<void, AllocError> {
+        let host = parts.host(url);
+        let pair = match (header.indexOfByte(';')) {
+            Some(i) => header[0..i],
+            null => header,
+        };
+        let equals = match (pair.indexOfByte('=')) {
+            Some(i) => i,
+            null => { return Ok(); },
+        };
+        let name = pair[0..equals].trim();
+        let value = pair[equals + 1..].trim();
+        if (name.length == 0 || name.length + value.length > COOKIE_BYTES) {
+            return Ok();
+        }
+        var domain = host;
+        var hostOnly = true;
+        var path = defaultPath(parts.target(url));
+        var secure = false;
+        var expires: i64 = 0x7FFFFFFFFFFFFFFF;
+        var maxAge = false;
+        var hasDomain = false;
+        var hasPath = false;
+        var at = pair.length;
+        while (at < header.length) {
+            // An attribute: `; name[=value]`.
+            let rest = header[at + 1..];
+            let end = rest.indexOfByte(';') ?? rest.length;
+            let attribute = rest[0..end];
+            at += 1 + end;
+            var key = attribute.trim();
+            var argument = attribute[attribute.length..];
+            match (attribute.indexOfByte('=')) {
+                Some(i) => {
+                    key = attribute[0..i].trim();
+                    argument = attribute[i + 1..].trim();
+                }
+                null => {}
+            }
+            if (key.equalsIgnoreAsciiCase("secure".bytes())) {
+                secure = true;
+            } else if (key.equalsIgnoreAsciiCase("path".bytes())) {
+                if (argument.length > 0 && argument[0] == '/') {
+                    path = argument;
+                    hasPath = true;
+                }
+            } else if (key.equalsIgnoreAsciiCase("domain".bytes())) {
+                if (argument.length > 0 && argument[0] == '.') {
+                    argument = argument[1..];
+                }
+                if (argument.length > 0) {
+                    domain = argument;
+                    hostOnly = false;
+                    hasDomain = true;
+                }
+            } else if (key.equalsIgnoreAsciiCase("max-age".bytes())) {
+                // Digits, with a `-` allowed in front: zero or less ends the cookie now. It outranks Expires.
+                var digits = argument;
+                var negative = false;
+                if (digits.length > 0 && digits[0] == '-') {
+                    negative = true;
+                    digits = digits[1..];
+                }
+                var valid = digits.length > 0;
+                for (b in digits) {
+                    if (b < '0' || b > '9') {
+                        valid = false;
+                    }
+                }
+                if (valid) {
+                    maxAge = true;
+                    let seconds = digits.parseInt<i64>() ?? 0x7FFFFFFF;
+                    expires = if (negative || seconds == 0) 0 else now.saturatingAdd(seconds);
+                }
+            } else if (key.equalsIgnoreAsciiCase("expires".bytes()) && !maxAge) {
+                match (cookieDateSeconds(argument)) {
+                    Some(when) => { expires = when; }
+                    null => {}
+                }
+            }
+        }
+        if (!hostOnly) {
+            // The host must be the domain or under it, and the domain no bare top-level name.
+            if (isIpLiteral(host) || domain.indexOfByte('.') == null || !domainMatches(host, domain)) {
+                if (!domain.equalsIgnoreAsciiCase(host)) {
+                    return Ok();
+                }
+                hostOnly = true; // `Domain` naming the host itself, where no subdomain can exist
+            }
+        }
+        if (secure && !parts.secure) {
+            return Ok(); // an http response cannot set a cookie meant for https only
+        }
+        // The name prefixes that pin a cookie (RFC 6265bis §4.1.3).
+        if (name.startsWith("__Secure-".bytes()) && !secure) {
+            return Ok();
+        }
+        if (name.startsWith("__Host-".bytes()) && (!secure || hasDomain || !hasPath || path.length != 1)) {
+            return Ok();
+        }
+        // The same name, domain and path: the new one takes the old one's place and its age.
+        var created = this.counter;
+        var k: usize = 0;
+        while (k < this.cookies.length) {
+            let have = borrow this.cookies[k];
+            if (have.name.view() == name && have.domain.view().equalsIgnoreAsciiCase(
+                domain,
+            ) && have.path.view() == path) {
+                created = have.created;
+                let old = this.cookies.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        if (expires <= now) {
+            return Ok(); // it only removed the old one
+        }
+        if (created == this.counter) {
+            this.counter += 1;
+        }
+        var kept = Cookie {
+            name: Vector<u8>.create(),
+            value: Vector<u8>.create(),
+            domain: Vector<u8>.create(),
+            hostOnly: hostOnly,
+            path: Vector<u8>.create(),
+            secure: secure,
+            expires: expires,
+            created: created,
+        };
+        kept.name.extend(name)?;
+        kept.value.extend(value)?;
+        kept.domain.reserve(domain.length)?;
+        for (b in domain) {
+            kept.domain.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+        }
+        kept.path.extend(path)?;
+        this.cookies.push(kept)?;
+        this.trim(domain);
+        return Ok();
+    }
+
+    /// Keeps the jar within its limits: the oldest cookie of `domain` goes while it has too many, then the oldest
+    /// of all.
+    fn trim(borrow mut this, domain: Slice<u8>) {
+        loop {
+            var ofDomain: usize = 0;
+            var oldest: usize = 0;
+            var oldestOfDomain: usize = 0;
+            var found = false;
+            for (k in 0..this.cookies.length) {
+                if (this.cookies[k].created < this.cookies[oldest].created) {
+                    oldest = k;
+                }
+                if (this.cookies[k].domain.view().equalsIgnoreAsciiCase(domain)) {
+                    ofDomain += 1;
+                    if (!found || this.cookies[k].created < this.cookies[oldestOfDomain].created) {
+                        oldestOfDomain = k;
+                        found = true;
+                    }
+                }
+            }
+            if (ofDomain > HOST_LIMIT) {
+                let dropped = this.cookies.remove(oldestOfDomain);
+            } else if (this.cookies.length > JAR_LIMIT) {
+                let dropped = this.cookies.remove(oldest);
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Appends to `out` the value of the `Cookie` field for a request to `url` (`a=1; b=2`), nothing if no cookie
+    /// applies. Cookies that have ended are dropped on the way. Longer paths come first, then older cookies
+    /// (RFC 6265 §5.4).
+    fn collect(
+        borrow mut this,
+        url: Slice<u8>,
+        parts: borrow UrlParts,
+        now: i64,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        var k: usize = 0;
+        while (k < this.cookies.length) {
+            if (this.cookies[k].expires <= now) {
+                let ended = this.cookies.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        let host = parts.host(url);
+        let target = parts.target(url);
+        let path = match (target.indexOfByte('?')) {
+            Some(i) => target[0..i],
+            null => target,
+        };
+        // The matching cookies, in order: there are few, so each pass picks the next.
+        var sent = Vector<bool>.create();
+        sent.resize(this.cookies.length, false)?;
+        loop {
+            var best: usize = this.cookies.length;
+            for (i in 0..this.cookies.length) {
+                let c = borrow this.cookies[i];
+                if (sent[i] || (c.secure && !parts.secure) || !pathMatches(path, c.path.view())) {
+                    continue;
+                }
+                let domainOk = if (c.hostOnly) c.domain.view().equalsIgnoreAsciiCase(host) else domainMatches(
+                    host,
+                    c.domain.view(),
+                );
+                if (!domainOk) {
+                    continue;
+                }
+                if (best == this.cookies.length || c.path.length > this.cookies[best].path.length ||
+                    (c.path.length == this.cookies[best].path.length && c.created < this.cookies[best].created)) {
+                    best = i;
+                }
+            }
+            if (best == this.cookies.length) {
+                return Ok();
+            }
+            sent[best] = true;
+            if (out.length > 0) {
+                out.extend("; ".bytes())?;
+            }
+            out.extend(this.cookies[best].name.view())?;
+            out.push('=')?;
+            out.extend(this.cookies[best].value.view())?;
+        }
+    }
+}
+
+/// The path a cookie gets when `Set-Cookie` names none (RFC 6265 §5.1.4): the request's path up to its last slash.
+fn defaultPath<region r>(target: Slice<r, u8>) -> Slice<r, u8> {
+    var path = target;
+    match (target.indexOfByte('?')) {
+        Some(i) => { path = target[0..i]; }
+        null => {}
+    }
+    var last: usize = 0;
+    for (i in 0..path.length) {
+        if (path[i] == '/') {
+            last = i;
+        }
+    }
+    if (path.length == 0 || path[0] != '/' || last == 0) {
+        return "/".bytes();
+    }
+    return path[0..last];
+}
+
+/// Whether `host` is `domain` or a subdomain of it (RFC 6265 §5.1.3). An address has no subdomains.
+fn domainMatches(host: Slice<u8>, domain: Slice<u8>) -> bool {
+    if (host.equalsIgnoreAsciiCase(domain)) {
+        return true;
+    }
+    if (isIpLiteral(host) || host.length <= domain.length) {
+        return false;
+    }
+    let from = host.length - domain.length;
+    return host[from - 1] == '.' && host[from..].equalsIgnoreAsciiCase(domain);
+}
+
+/// Whether a request for `path` carries a cookie of `cookiePath` (RFC 6265 §5.1.4).
+fn pathMatches(path: Slice<u8>, cookiePath: Slice<u8>) -> bool {
+    let request = if (path.length == 0) "/".bytes() else path;
+    if (!request.startsWith(cookiePath)) {
+        return false;
+    }
+    return request.length == cookiePath.length || cookiePath[cookiePath.length - 1] == '/' ||
+        request[cookiePath.length] == '/';
+}
+
+/// Whether `host` is an IPv4 or IPv6 address, not a name.
+fn isIpLiteral(host: Slice<u8>) -> bool {
+    if (host.indexOfByte(':') != null) {
+        return true;
+    }
+    for (b in host) {
+        if (!((b >= '0' && b <= '9') || b == '.')) {
+            return false;
+        }
+    }
+    return host.length > 0;
+}
+
+/// The Unix time of a cookie's `Expires` (RFC 6265 §5.1.1's lenient rules): a time `hh:mm:ss`, a day of the month,
+/// a month's name and a year, in any order, separated by anything else. Null if one is missing or out of range.
+public fn cookieDateSeconds(text: Slice<u8>) -> i64? {
+    var hour: i64 = -1;
+    var minute: i64 = 0;
+    var second: i64 = 0;
+    var day: i64 = -1;
+    var month: i64 = -1;
+    var year: i64 = -1;
+    let names = "janfebmaraprmayjunjulaugsepoctnovdec".bytes();
+    var at: usize = 0;
+    while (at < text.length) {
+        // A token: letters, digits and colons.
+        var end = at;
+        while (end < text.length && isDateChar(text[end])) {
+            end += 1;
+        }
+        let token = text[at..end];
+        at = end + 1;
+        if (token.length == 0) {
+            continue;
+        }
+        if (hour < 0 && token.indexOfByte(':') != null) {
+            var fields = [0i64; 3];
+            var index: usize = 0;
+            var digits: usize = 0;
+            var ok = true;
+            for (b in token) {
+                if (b == ':') {
+                    if (digits == 0 || index == 2) {
+                        ok = false;
+                    }
+                    index += if (index < 2) 1 else 0;
+                    digits = 0;
+                } else if (b >= '0' && b <= '9' && digits < 2) {
+                    fields[index] = fields[index] * 10 + (b - '0') as i64;
+                    digits += 1;
+                } else {
+                    ok = false;
+                }
+            }
+            if (ok && index == 2 && digits > 0) {
+                hour = fields[0];
+                minute = fields[1];
+                second = fields[2];
+                continue;
+            }
+        }
+        var number: i64 = 0;
+        var numeric = true;
+        for (b in token) {
+            if (b < '0' || b > '9') {
+                numeric = false;
+            } else if (number < 100000) {
+                number = number * 10 + (b - '0') as i64;
+            }
+        }
+        if (numeric) {
+            if (day < 0 && token.length <= 2) {
+                day = number;
+            } else if (year < 0 && token.length >= 2 && token.length <= 4) {
+                year = number;
+                if (year >= 70 && year <= 99) {
+                    year += 1900;
+                } else if (year >= 0 && year <= 69) {
+                    year += 2000;
+                }
+            }
+            continue;
+        }
+        if (month < 0 && token.length >= 3) {
+            for (m in 0..12) {
+                if (token[0..3].equalsIgnoreAsciiCase(names[m * 3..m * 3 + 3])) {
+                    month = truncate<i64>(m) + 1;
+                }
+            }
+        }
+    }
+    if (hour < 0 || day < 1 || day > 31 || month < 1 || year < 1601 || hour > 23 || minute > 59 || second > 59) {
+        return null;
+    }
+    if (year > 9999) {
+        year = 9999;
+    }
+    return Some(daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second);
+}
+
+fn isDateChar(b: u8) -> bool =>
+    (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == ':';
+
+/// The days from 1970-01-01 to a date of the civil calendar (negative before it).
+fn daysFromCivil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if (month <= 2) year - 1 else year;
+    let era = y / 400;
+    let yearOfEra = y - era * 400;
+    let shifted = if (month > 2) month - 3 else month + 9;
+    let dayOfYear = (153 * shifted + 2) / 5 + day - 1;
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    return era * 146097 + dayOfEra - 719468;
+}

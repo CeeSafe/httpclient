@@ -1,7 +1,8 @@
 // URLs: an absolute http(s) URL split into the parts a request needs, as offsets into the caller's text. Nothing is
 // copied or allocated.
 
-/// An absolute `http://` or `https://` URL, as offsets into its text.
+/// An absolute `http://` or `https://` URL (or `ws://`, `wss://`: the same with other names), as offsets into its
+/// text.
 public struct UrlParts {
     /// `https`.
     public secure: bool;
@@ -28,6 +29,11 @@ public struct UrlParts {
             at = 7;
         } else if (text.length >= 8 && schemeIs(text, "https://".bytes())) {
             at = 8;
+            secure = true;
+        } else if (text.length >= 5 && schemeIs(text, "ws://".bytes())) {
+            at = 5; // a WebSocket's URL is http's with another name (RFC 6455 §3)
+        } else if (text.length >= 6 && schemeIs(text, "wss://".bytes())) {
+            at = 6;
             secure = true;
         } else {
             return null;

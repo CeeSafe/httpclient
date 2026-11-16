@@ -14,6 +14,9 @@ arm64 unless an entry says otherwise.
 | F5 | web_client allocates 32 to 35 times for each request | CeeSafe.Web | 10 now, on `fix/web-client-findings`; the rest needs another API |
 | F6 | a loop's local cannot lend to a `drop` type made through `?` | CeeSafe | fixed in ceesafec 0.61.0 (ADR 0160 §3) |
 | F7 | a wait blocks after a full kqueue change queue's early send readied tasks | CeeSafe (runtime) | fixed in ceesafec 0.61.0 |
+| F8 | no DEFLATE decoder and no CRC-32 in lib/std | CeeSafe (library gap) | open; this package has its own |
+| F9 | a `bool` field read inside a returned struct literal is taken as a loan (N0245) | CeeSafe | open |
+| F10 | no practical way to keep a hook (callback) in a long-lived struct used from async code | CeeSafe (ergonomics, not a bug) | open; needs a design answer |
 
 The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
@@ -201,6 +204,79 @@ it, because no wake pipe is opened; that is why this client never did.
 
 **Fix:** the early send's result is kept (`early_ready`), and the wait that follows does not block when it readied a
 task or drained a wake. 180 runs of the reduction at 64, 128 and 192 tasks: none hung.
+
+## F8. lib/std has no DEFLATE decoder and no CRC-32
+
+**Kind:** library gap, not a bug. **Found:** 2026-11-16, ceesafec 0.61.0, adding gzip and deflate to this client.
+
+lib/std has `Crc32c` (Castagnoli) and `Crc64Nvme`, but not CRC-32 as gzip, zip and PNG use it (ISO 3309, polynomial
+0xEDB88320), and no DEFLATE, gzip or zlib. CeeSafe.Web's `web_ws` has a public `Inflater` for permessage-deflate, a
+bit at a time and without the gzip and zlib wrappers; using it here would also pull `web_http`, `web_http1` and the
+WebSocket code into a client that needs none of them.
+
+**Here:** `src/inflate.cee` has its own decoder (DEFLATE with a 10-bit lookup table, gzip, zlib, CRC-32 and
+Adler-32), tested against bodies compressed by Python's zlib.
+
+**Wanted, if lib/std is the place:** `Crc32` beside `Crc32c`, and an inflate that `web_ws` and an HTTP client could
+both use. A compressor is not needed for this.
+
+## F9. A Copy field read inside a returned struct literal is taken as a loan of its parameter
+
+**Kind:** borrow checker, a correct program rejected. **Found:** 2026-11-17, ceesafec 0.61.0. **Reduced:** yes.
+
+A function returns a struct with a region, built from one parameter's loan, and sets a `bool` field of it from a
+field of another borrowed parameter. Written in the literal, the read is N0245, "the returned reference may be
+derived from parameter 'entry', which the return type does not list". A `bool` holds no loan. The same value read
+into a local first is accepted.
+
+```ceesafe
+struct Owner {
+    count: u32;
+}
+
+struct Entry {
+    flag: bool;
+    size: usize;
+}
+
+struct Lease<region c> {
+    owner: borrow(c) Owner;
+    flag: bool;
+}
+
+// N0245: the field read inside the literal is taken as a loan of `entry`.
+fn direct<region c>(owner: borrow(c) Owner, entry: borrow Entry) -> Lease<c> {
+    return Lease { owner: owner, flag: entry.flag };
+}
+
+// Accepted: the same value through a local.
+fn local<region c>(owner: borrow(c) Owner, entry: borrow Entry) -> Lease<c> {
+    let flag = entry.flag;
+    return Lease { owner: owner, flag: flag };
+}
+```
+
+**Here:** `storedResponse` in `src/client.cee` reads `entry.decoded` into a local before the literal.
+
+## F10. A hook kept in a long-lived struct and called from async code has no practical form
+
+**Kind:** ergonomics gap, not a compiler bug: every rule involved is doing its job. **Found:** 2026-11-17,
+ceesafec 0.61.0. **Not explored to the end:** an async closure type (`@effects(suspend)`) in a field was not tried.
+
+The .NET client has telemetry hooks (`OnRequest`, `OnResponse`, `OnError`). The port wanted the same as fields of
+`ClientOptions`. Each form met a wall:
+
+- a plain function value, `(fn(Method, Slice<u8>) -> void)?`, checks as a field, but calling it from an `async fn`
+  is N0295: a function type without an effect list may sleep (type-system.md §36.3), and that error then spreads to
+  every async caller of the client;
+- `@effects(alloc) fn(...)` can be called, but a function of that type may not do console or file I/O, and a plain
+  function captures nothing, so it has nowhere to put what it sees;
+- a capturing closure (`borrow @effects(alloc) fn(...)`) could update the caller's state, but a struct that borrows a
+  closure has a region parameter, which would then be on `ClientOptions`, `Client`, and every type that names them.
+
+**Here:** cosmohttp keeps counters (`Client.stats()`) and has no hooks; a caller times and logs around its own
+calls. **What would help:** an owned closure type that can be stored without a region (a boxed closure), or a
+documented pattern for "a callback registered once, called from async code".
 
 ## F2. Withdrawn: diagnostics were not printed twice
 

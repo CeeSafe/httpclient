@@ -1,0 +1,377 @@
+// The response cache (RFC 9111), a private one: what one client fetched, kept in memory for that client.
+//
+// It stores answers to GET with status 200 that say how long they stay fresh (`cache-control: max-age`, or `expires`)
+// or carry a validator (`etag`, `last-modified`). A fresh answer is served without the network; a stale one with a
+// validator is asked about (`if-none-match`, `if-modified-since`), and a 304 makes it fresh again. The store is
+// bounded: the answers used longest ago go when it is full.
+
+/// A stored response.
+struct CacheEntry {
+    url: Vector<u8>;
+    /// The request fields the response varies on (RFC 9111 §4.1), as the request had them: `name\0value\0` each,
+    /// names lowercase.
+    vary: Vector<u8>;
+    /// The response's fields, `name: value\r\n` each.
+    fields: Vector<u8>;
+    body: Vector<u8>;
+    /// The body was decompressed before it was stored.
+    decoded: bool;
+    /// When it was stored or last validated (Unix seconds), and how old it was then (`age`).
+    storedAt: i64;
+    initialAge: i64;
+    /// How long it stays fresh from `storedAt`, in seconds; 0 for one that is always asked about.
+    lifetime: i64;
+    /// `cache-control: no-cache`: served only after the server agreed.
+    mustValidate: bool;
+    /// When it was last served, in the cache's own count: the smallest goes first.
+    used: u64;
+}
+
+/// What a request's or a response's `cache-control` says.
+struct CacheControl {
+    noStore: bool;
+    noCache: bool;
+    maxAge: i64; // -1: not given
+}
+
+/// Parses a `cache-control` value (RFC 9111 §5.2): the directives this cache acts on.
+fn cacheControl(value: Slice<u8>) -> CacheControl {
+    var c = CacheControl { noStore: false, noCache: false, maxAge: -1 };
+    var at: usize = 0;
+    while (at < value.length) {
+        var end = at;
+        while (end < value.length && value[end] != ',') {
+            end += 1;
+        }
+        let directive = value[at..end].trim();
+        at = end + 1;
+        var name = directive;
+        var argument = directive[directive.length..];
+        match (directive.indexOfByte('=')) {
+            Some(i) => {
+                name = directive[0..i].trim();
+                argument = directive[i + 1..].trim();
+            }
+            null => {}
+        }
+        if (name.equalsIgnoreAsciiCase("no-store".bytes())) {
+            c.noStore = true;
+        } else if (name.equalsIgnoreAsciiCase("no-cache".bytes())) {
+            c.noCache = true;
+        } else if (name.equalsIgnoreAsciiCase("max-age".bytes())) {
+            if (argument.length >= 2 && argument[0] == '"' && argument[argument.length - 1] == '"') {
+                argument = argument[1..argument.length - 1];
+            }
+            var digits = argument.length > 0;
+            for (b in argument) {
+                if (b < '0' || b > '9') {
+                    digits = false;
+                }
+            }
+            if (digits) {
+                c.maxAge = argument.parseInt<i64>() ?? 0x7FFFFFFF; // too many digits: a very long time
+            }
+        }
+    }
+    return c;
+}
+
+/// The value of the first field named `name` (lowercase) among the lines of `fields`, `name: value\r\n` each.
+fn fieldValue<region r>(fields: Slice<r, u8>, name: Slice<u8>) -> Slice<r, u8>? {
+    var at: usize = 0;
+    while (at < fields.length) {
+        let rest = fields[at..];
+        let end = rest.indexOfByte('\n') ?? rest.length;
+        if (end > name.length && rest[name.length] == ':' && rest[0..name.length].equalsIgnoreAsciiCase(name)) {
+            return Some(rest[name.length + 1..end].trim());
+        }
+        at += end + 1;
+    }
+    return null;
+}
+
+/// How many seconds a response with these fields stays fresh from `now` (RFC 9111 §4.2.1): `max-age`, else the time
+/// from `date` (or now) to `expires`; 0 if it says neither or has expired.
+fn freshnessLifetime(fields: Slice<u8>, now: i64) -> i64 {
+    match (fieldValue(fields, "cache-control".bytes())) {
+        Some(value) => {
+            let c = cacheControl(value);
+            if (c.maxAge >= 0) {
+                return c.maxAge;
+            }
+        }
+        null => {}
+    }
+    let expires = match (fieldValue(fields, "expires".bytes())) {
+        Some(value) => match (cookieDateSeconds(value)) {
+            Some(at) => at,
+            null => { return 0; }, // a date that cannot be read is in the past (§5.3)
+        },
+        null => { return 0; },
+    };
+    let date = match (fieldValue(fields, "date".bytes())) {
+        Some(value) => cookieDateSeconds(value) ?? now,
+        null => now,
+    };
+    return if (expires > date) expires - date else 0;
+}
+
+/// A client's response cache.
+struct ResponseCache {
+    entries: Vector<CacheEntry>;
+    /// The bytes held (URLs, fields and bodies), and the most that may be.
+    bytes: usize;
+    limit: usize;
+    counter: u64;
+
+    fn create(limit: usize) -> ResponseCache =>
+        ResponseCache { entries: Vector<CacheEntry>.create(), bytes: 0, limit: limit, counter: 0 };
+
+    /// The entry for `url` whose `vary` fields have the values this request's `fields` have, or none.
+    fn find(borrow this, url: Slice<u8>, fields: Slice<u8>) -> usize? {
+        for (i in 0..this.entries.length) {
+            let e = borrow this.entries[i];
+            if (e.url.view() == url && variesAlike(e.vary.view(), fields)) {
+                return Some(i);
+            }
+        }
+        return null;
+    }
+
+    /// Whether entry `i` may be served at `now` without asking: its age is within its lifetime, and within the
+    /// request's own `max-age` if it gave one (`requestMaxAge` at least 0).
+    fn isFresh(borrow this, i: usize, now: i64, requestMaxAge: i64) -> bool {
+        let e = borrow this.entries[i];
+        if (e.mustValidate) {
+            return false;
+        }
+        let elapsed = if (now > e.storedAt) now - e.storedAt else 0;
+        let age = e.initialAge.saturatingAdd(elapsed);
+        if (requestMaxAge >= 0 && age > requestMaxAge) {
+            return false;
+        }
+        return age < e.lifetime;
+    }
+
+    /// Marks entry `i` as just used.
+    fn touch(borrow mut this, i: usize) {
+        this.counter += 1;
+        this.entries[i].used = this.counter;
+    }
+
+    /// Removes every entry for `url`: a request that may have changed what is there went through.
+    fn remove(borrow mut this, url: Slice<u8>) {
+        var i: usize = 0;
+        while (i < this.entries.length) {
+            if (this.entries[i].url.view() == url) {
+                this.bytes -= entrySize(this.entries[i]);
+                let gone = this.entries.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Stores a response to a GET for `url`, in place of the one it had for the same `vary` values. `requestFields`
+    /// are the request's; `fields` and `body` the response's. Nothing is stored that the response forbids, that
+    /// could never be served (no lifetime and no validator), or that would take more than half the cache.
+    fn store(
+        borrow mut this,
+        url: Slice<u8>,
+        requestFields: Slice<u8>,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        decoded: bool,
+        now: i64,
+    ) -> Result<void, AllocError> {
+        var control = CacheControl { noStore: false, noCache: false, maxAge: -1 };
+        match (fieldValue(fields, "cache-control".bytes())) {
+            Some(value) => { control = cacheControl(value); }
+            null => {}
+        }
+        if (control.noStore) {
+            return Ok();
+        }
+        let lifetime = freshnessLifetime(fields, now);
+        let validator = fieldValue(
+            fields,
+            "etag".bytes(),
+        ) != null || fieldValue(fields, "last-modified".bytes()) != null;
+        if (lifetime == 0 && !validator) {
+            return Ok();
+        }
+        var vary = Vector<u8>.create();
+        match (fieldValue(fields, "vary".bytes())) {
+            Some(names) => {
+                var at: usize = 0;
+                while (at < names.length) {
+                    var end = at;
+                    while (end < names.length && names[end] != ',') {
+                        end += 1;
+                    }
+                    let name = names[at..end].trim();
+                    at = end + 1;
+                    if (name.length == 0) {
+                        continue;
+                    }
+                    if (name.length == 1 && name[0] == '*') {
+                        return Ok(); // it varies on something no request shows: never the same twice
+                    }
+                    for (b in name) {
+                        vary.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+                    }
+                    vary.push(0)?;
+                    match (fieldValue(requestFields, name)) {
+                        Some(value) => { vary.extend(value)?; }
+                        null => {}
+                    }
+                    vary.push(0)?;
+                }
+            }
+            null => {}
+        }
+        let size = url.length + vary.length + fields.length + body.length;
+        if (size > this.limit / 2) {
+            return Ok();
+        }
+        match (this.find(url, requestFields)) {
+            Some(i) => {
+                this.bytes -= entrySize(this.entries[i]);
+                let replaced = this.entries.remove(i);
+            }
+            null => {}
+        }
+        while (this.entries.length > 0 && this.bytes + size > this.limit) {
+            var oldest: usize = 0;
+            for (i in 1..this.entries.length) {
+                if (this.entries[i].used < this.entries[oldest].used) {
+                    oldest = i;
+                }
+            }
+            this.bytes -= entrySize(this.entries[oldest]);
+            let evicted = this.entries.remove(oldest);
+        }
+        var age: i64 = 0;
+        match (fieldValue(fields, "age".bytes())) {
+            Some(value) => { age = value.parseInt<i64>() ?? 0; }
+            null => {}
+        }
+        this.counter += 1;
+        var entry = CacheEntry {
+            url: Vector<u8>.create(),
+            vary: vary,
+            fields: Vector<u8>.create(),
+            body: Vector<u8>.create(),
+            decoded: decoded,
+            storedAt: now,
+            initialAge: if (age > 0) age else 0,
+            lifetime: lifetime,
+            mustValidate: control.noCache,
+            used: this.counter,
+        };
+        entry.url.extend(url)?;
+        entry.fields.extend(fields)?;
+        entry.body.extend(body)?;
+        this.entries.push(entry)?;
+        this.bytes += size;
+        return Ok();
+    }
+
+    /// A 304 answered for entry `i`: the stored response is good again from `now`, with the fields the 304 brought
+    /// in place of its own of the same names (RFC 9111 §3.2, §4.3.4).
+    fn refresh(borrow mut this, i: usize, fresh: Slice<u8>, now: i64) -> Result<void, AllocError> {
+        var merged = Vector<u8>.create();
+        let old = this.entries[i].fields.view();
+        // The stored fields the 304 does not replace, then the 304's own. A 304 has no body, so its
+        // `content-length`, if it sent one, describes nothing and is not taken.
+        var at: usize = 0;
+        while (at < old.length) {
+            let rest = old[at..];
+            let end = (rest.indexOfByte('\n') ?? (rest.length - 1)) + 1;
+            let line = rest[0..end];
+            let colon = line.indexOfByte(':') ?? 0;
+            if (fieldValue(
+                fresh,
+                line[0..colon],
+            ) == null || line[0..colon].equalsIgnoreAsciiCase("content-length".bytes())) {
+                merged.extend(line)?;
+            }
+            at += end;
+        }
+        at = 0;
+        while (at < fresh.length) {
+            let rest = fresh[at..];
+            let end = (rest.indexOfByte('\n') ?? (rest.length - 1)) + 1;
+            let line = rest[0..end];
+            let colon = line.indexOfByte(':') ?? 0;
+            if (!line[0..colon].equalsIgnoreAsciiCase("content-length".bytes())) {
+                merged.extend(line)?;
+            }
+            at += end;
+        }
+        let before = this.entries[i].fields.length;
+        this.bytes = this.bytes - before + merged.length;
+        this.entries[i].fields = merged;
+        this.entries[i].storedAt = now;
+        var age: i64 = 0;
+        var control = CacheControl { noStore: false, noCache: false, maxAge: -1 };
+        let fields = this.entries[i].fields.view();
+        match (fieldValue(fields, "age".bytes())) {
+            Some(value) => { age = value.parseInt<i64>() ?? 0; }
+            null => {}
+        }
+        match (fieldValue(fields, "cache-control".bytes())) {
+            Some(value) => { control = cacheControl(value); }
+            null => {}
+        }
+        let lifetime = freshnessLifetime(fields, now);
+        this.entries[i].initialAge = if (age > 0) age else 0;
+        this.entries[i].lifetime = lifetime;
+        this.entries[i].mustValidate = control.noCache;
+        return Ok();
+    }
+}
+
+fn entrySize(e: borrow CacheEntry) -> usize => e.url.length + e.vary.length + e.fields.length + e.body.length;
+
+/// Whether a request with `fields` has, for every name in `vary` (`name\0value\0` each), the value recorded there.
+fn variesAlike(vary: Slice<u8>, fields: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < vary.length) {
+        let nameEnd = at + (vary[at..].indexOfByte(0) ?? 0);
+        let valueEnd = nameEnd + 1 + (vary[nameEnd + 1..].indexOfByte(0) ?? 0);
+        let name = vary[at..nameEnd];
+        let recorded = vary[nameEnd + 1..valueEnd];
+        let have = match (fieldValue(fields, name)) {
+            Some(v) => v,
+            null => fields[0..0],
+        };
+        if (have != recorded) {
+            return false;
+        }
+        at = valueEnd + 1;
+    }
+    return true;
+}
+
+/// Appends to `out` the fields that ask whether a stored response with `stored` fields is still good: `if-none-match`
+/// with its `etag`, `if-modified-since` with its `last-modified`. Nothing if it has neither.
+fn validators(stored: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    match (fieldValue(stored, "etag".bytes())) {
+        Some(tag) => {
+            out.extend("If-None-Match: ".bytes())?;
+            out.extend(tag)?;
+            out.extend("\r\n".bytes())?;
+        }
+        null => {}
+    }
+    match (fieldValue(stored, "last-modified".bytes())) {
+        Some(date) => {
+            out.extend("If-Modified-Since: ".bytes())?;
+            out.extend(date)?;
+            out.extend("\r\n".bytes())?;
+        }
+        null => {}
+    }
+    return Ok();
+}

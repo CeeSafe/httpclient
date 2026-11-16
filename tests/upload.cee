@@ -1,0 +1,204 @@
+// Requests whose bodies are written piece by piece.
+import web_core;
+import web_transport;
+
+async fn began<region c>(client: borrow(c) Client, request: borrow Request, length: u64?) -> Result<Upload<c>, TestFailure> {
+    return match (await client.upload(request, length)) {
+        Ok(u) => Ok(u),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+async fn wrote(upload: borrow mut Upload, bytes: Slice<u8>) -> Result<void, TestFailure> {
+    return match (await upload.write(bytes)) {
+        Ok() => Ok(),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+fn asked(method: Method, url: StringView) -> Result<Request, TestFailure> {
+    return match (Request.create(method, url)) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+@test
+async fn anUploadWithALength() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok", 0, copies)?;
+    let request = asked(Method.Put, "http://example.com/file")?;
+    var large = Vector<u8>.create();
+    for (i in 0..6000) {
+        made(large.push(truncate<u8>(i * 3)))?;
+    }
+    {
+        var upload = await began(client, request, Some(6011))?;
+        await wrote(mut upload, "hello ".bytes())?; // goes with the head
+        await wrote(mut upload, "".bytes())?;
+        await wrote(mut upload, large.view())?;
+        await wrote(mut upload, "world".bytes())?;
+        Check.isTrue((await upload.write("!".bytes())).isErr(), "more than the length")?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(201, response.status() as u64)?;
+        Check.equalBytes("ok".bytes(), response.body())?;
+    }
+    Check.equalU64(1, client.idleConnections() as u64)?; // the connection is as good as after any request
+    let wire = written(copies)?;
+    let head = "PUT /file HTTP/1.1\r\nHost: example.com\r\nContent-Length: 6011\r\n\r\nhello ";
+    Check.equalU64((head.length + 6005) as u64, wire.length as u64)?;
+    Check.equalBytes(head.bytes(), wire[0..head.length])?;
+    Check.equalBytes(large.view(), wire[head.length..head.length + 6000])?;
+    Check.equalBytes("world".bytes(), wire[head.length + 6000..])?;
+    // No body at all (another origin: the scripted connection above has nothing more to say).
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    let empty = asked(Method.Put, "http://other.example/file")?;
+    {
+        let upload = await began(client, empty, Some(0))?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+    }
+    Check.equalBytes(
+        "PUT /file HTTP/1.1\r\nHost: other.example\r\nContent-Length: 0\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    return Ok();
+}
+
+@test
+async fn anUploadWithoutALengthIsChunked() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone", 0, copies)?;
+    let request = asked(Method.Post, "http://example.com/log")?;
+    var large = Vector<u8>.create();
+    made(large.resize(5000, 'x'))?;
+    {
+        var upload = await began(client, request, null)?;
+        await wrote(mut upload, "abc".bytes())?;
+        await wrote(mut upload, large.view())?;
+        await wrote(mut upload, "0123456789abcdefg".bytes())?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("done".bytes(), response.body())?;
+    }
+    var expected = Vector<u8>.create();
+    made(expected.extend("POST /log HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n1388\r\n".bytes()))?;
+    made(expected.extend(large.view()))?;
+    made(expected.extend("\r\n11\r\n0123456789abcdefg\r\n0\r\n\r\n".bytes()))?;
+    Check.equalBytes(expected.view(), written(copies)?.view())?;
+    // Nothing written at all: the head and the last chunk in one write.
+    script(client, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", 0, copies)?;
+    {
+        let upload = await began(client, request, null)?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(204, response.status() as u64)?;
+    }
+    Check.equalBytes(
+        "POST /log HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    return Ok();
+}
+
+@test
+async fn anUploadCutShortIsAbandoned() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    let request = asked(Method.Put, "http://example.com/file")?;
+    {
+        var upload = await began(client, request, Some(10))?;
+        await wrote(mut upload, "short".bytes())?;
+        Check.isTrue((await upload.finish()).isErr(), "less than the length")?;
+    }
+    Check.equalU64(0, client.idleConnections() as u64)?; // half a request went out: the connection is closed
+    {
+        let head = asked(Method.Head, "http://example.com/file")?;
+        Check.isTrue((await client.upload(head, null)).isErr(), "a HEAD has no body")?;
+    }
+    return Ok();
+}
+
+@test
+async fn anUploadOverHttp2() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(1048576))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", [], 4)?;
+    data(mut server, 1, "done", true)?;
+    // Stream 3 is abandoned; stream 5 is answered, in a read of its own.
+    let first = server.length;
+    headers(mut server, 5, "204", [], 5)?;
+    scriptBytes(client, server.view(), first, 0, copies)?;
+    let request = asked(Method.Post, "http://example.com/log")?;
+    var large = Vector<u8>.create();
+    for (i in 0..40000) {
+        made(large.push(truncate<u8>(i * 5)))?;
+    }
+    {
+        var upload = await began(client, request, null)?;
+        await wrote(mut upload, "part one, ".bytes())?;
+        await wrote(mut upload, large.view())?;
+        await wrote(mut upload, "part two".bytes())?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.isTrue(response.isHttp2(), "over HTTP/2")?;
+        Check.equalBytes("done".bytes(), response.body())?;
+    }
+    {
+        var abandoned = await began(client, request, Some(100))?;
+        await wrote(mut abandoned, "never finished".bytes())?;
+    }
+    {
+        let upload = await began(client, request, Some(0))?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(204, response.status() as u64)?;
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var body = Vector<u8>.create();
+    var lastFlags: u8 = 0xFF;
+    var headersEnded: u64 = 0;
+    var reset: u64 = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 1 && (sent[i].flags & 1) != 0) {
+            headersEnded += 1;
+        }
+        if (sent[i].kind == 0 && sent[i].id == 1) {
+            Check.isTrue(sent[i].end - sent[i].start <= 16384, "no frame above the peer's limit")?;
+            made(body.extend(wire[sent[i].start..sent[i].end]))?;
+            lastFlags = sent[i].flags;
+        }
+        if (sent[i].kind == 3 && sent[i].id == 3) {
+            reset += 1;
+        }
+    }
+    Check.equalU64(0, headersEnded)?; // the body ends a stream, never its HEADERS
+    Check.equalU64(1, lastFlags as u64)?;
+    Check.equalU64(40018, body.length as u64)?;
+    Check.equalBytes("part one, ".bytes(), body[0..10])?;
+    Check.equalBytes(large.view(), body[10..40010])?;
+    Check.equalBytes("part two".bytes(), body[40010..])?;
+    Check.equalU64(1, reset)?; // the abandoned stream was cancelled
+    return Ok();
+}

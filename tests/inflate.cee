@@ -1,0 +1,362 @@
+// Decompression against bodies compressed by Python's zlib (tools/gen_inflate_vectors.py writes tests/data/): the
+// decoder must give back each text from its gzip, zlib and bare DEFLATE forms.
+
+/// Checks that `coded` decodes to `text` as gzip (`kind` 0) or as the `deflate` content coding (1).
+fn expectDecoded(
+    inflater: borrow mut Inflater,
+    kind: u32,
+    coded: Slice<u8>,
+    text: Slice<u8>,
+    what: StringView,
+) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let r = if (kind == 0) inflater.gunzip(coded, mut out, 1048576) else inflater.undeflate(coded, mut out, 1048576);
+    match (r) {
+        Ok() => {}
+        Err(f) => { return Check.fail(what); }
+    }
+    Check.equalU64(text.length as u64, out.length as u64)?;
+    return Check.equalBytes(text, out.view());
+}
+
+@test
+fn inflatesEveryForm() -> Result<void, TestFailure> {
+    var inflater = Inflater.create();
+    expectDecoded(mut inflater, 0, embed("data/empty.gz"), embed("data/empty.raw"), "empty.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/empty.zz"), embed("data/empty.raw"), "empty.zz")?;
+    expectDecoded(mut inflater, 1, embed("data/empty.df"), embed("data/empty.raw"), "empty.df")?;
+    expectDecoded(mut inflater, 0, embed("data/hello.gz"), embed("data/hello.raw"), "hello.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/hello.zz"), embed("data/hello.raw"), "hello.zz")?;
+    expectDecoded(mut inflater, 1, embed("data/hello.df"), embed("data/hello.raw"), "hello.df")?;
+    expectDecoded(mut inflater, 0, embed("data/stored.gz"), embed("data/stored.raw"), "stored.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/stored.zz"), embed("data/stored.raw"), "stored.zz")?;
+    expectDecoded(mut inflater, 1, embed("data/stored.df"), embed("data/stored.raw"), "stored.df")?;
+    expectDecoded(mut inflater, 0, embed("data/text.gz"), embed("data/text.raw"), "text.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/text.zz"), embed("data/text.raw"), "text.zz")?;
+    expectDecoded(mut inflater, 1, embed("data/text.df"), embed("data/text.raw"), "text.df")?;
+    expectDecoded(mut inflater, 0, embed("data/noise.gz"), embed("data/noise.raw"), "noise.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/noise.zz"), embed("data/noise.raw"), "noise.zz")?;
+    expectDecoded(mut inflater, 0, embed("data/skew.gz"), embed("data/skew.raw"), "skew.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/skew.zz"), embed("data/skew.raw"), "skew.zz")?;
+    expectDecoded(mut inflater, 1, embed("data/skew.df"), embed("data/skew.raw"), "skew.df")?;
+    expectDecoded(mut inflater, 0, embed("data/run.gz"), embed("data/run.raw"), "run.gz")?;
+    expectDecoded(mut inflater, 1, embed("data/run.zz"), embed("data/run.raw"), "run.zz")?;
+    expectDecoded(mut inflater, 0, embed("data/small.gz"), embed("data/small.raw"), "small.gz")?;
+    expectDecoded(mut inflater, 0, embed("data/members.gz"), embed("data/members.raw"), "members.gz")?;
+    expectDecoded(mut inflater, 0, embed("data/flags.gz"), embed("data/flags.raw"), "flags.gz")?;
+    // A fixed-codes block after a dynamic one and back again: the tables are rebuilt each way.
+    expectDecoded(mut inflater, 0, embed("data/hello.gz"), embed("data/hello.raw"), "hello.gz again")?;
+    expectDecoded(mut inflater, 0, embed("data/text.gz"), embed("data/text.raw"), "text.gz again")?;
+    return Ok();
+}
+
+@test
+fn crc32OfKnownTexts() -> Result<void, TestFailure> {
+    // The check value of CRC-32 (ISO 3309): "123456789" gives 0xCBF43926.
+    let inflater = Inflater.create();
+    Check.equalU64(0xCBF43926, inflater.crc32("123456789".bytes()) as u64)?;
+    Check.equalU64(0, inflater.crc32("".bytes()) as u64)?;
+    Check.equalU64(0xE8B7BE43, inflater.crc32("a".bytes()) as u64)?;
+    Check.equalU64(0x414FA339, inflater.crc32("The quick brown fox jumps over the lazy dog".bytes()) as u64)?;
+    return Ok();
+}
+
+@test
+fn outputLimit() -> Result<void, TestFailure> {
+    var inflater = Inflater.create();
+    var out = Vector<u8>.create();
+    // 100,000 bytes from 133: a limit below that stops the decoder, and it never makes more room than the limit.
+    match (inflater.gunzip(embed("data/run.gz"), mut out, 99999)) {
+        Err(Fault.BodyTooLarge) => {}
+        _ => { return Check.fail("a body past the limit, by matches"); }
+    }
+    Check.isTrue(out.length <= 99999, "no more room than the limit")?;
+    match (inflater.gunzip(embed("data/stored.gz"), mut out, 1000)) {
+        Err(Fault.BodyTooLarge) => {}
+        _ => { return Check.fail("a body past the limit, stored"); }
+    }
+    match (inflater.undeflate(embed("data/skew.df"), mut out, 59999)) {
+        Err(Fault.BodyTooLarge) => {}
+        _ => { return Check.fail("a body past the limit, by literals"); }
+    }
+    match (inflater.gunzip(embed("data/run.gz"), mut out, 100000)) {
+        Ok() => { Check.equalU64(100000, out.length as u64)?; }
+        Err(_) => { return Check.fail("a body exactly at the limit"); }
+    }
+    return Ok();
+}
+
+/// Every cut and every changed byte of `coded` (gzip) must be an error or, by a change that happens to keep the
+/// stream valid, the text exactly: never a panic, and never another text.
+fn damaged(inflater: borrow mut Inflater, coded: Slice<u8>, text: Slice<u8>) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    for (n in 0..coded.length) {
+        match (inflater.gunzip(coded[0..n], mut out, 1048576)) {
+            Ok() => { return Check.fail("a gzip cut short decoded"); }
+            Err(_) => {}
+        }
+    }
+    var copy = Vector<u8>.create();
+    made(copy.extend(coded))?;
+    for (i in 0..coded.length) {
+        for (flip in [1u8, 0x10, 0x80, 0xFF]) {
+            copy[i] = coded[i] ^ flip;
+            match (inflater.gunzip(copy.view(), mut out, 1048576)) {
+                Ok() => { Check.equalBytes(text, out.view())?; }
+                Err(_) => {}
+            }
+        }
+        copy[i] = coded[i];
+    }
+    return Ok();
+}
+
+@test
+fn damagedGzipIsRefused() -> Result<void, TestFailure> {
+    var inflater = Inflater.create();
+    damaged(mut inflater, embed("data/hello.gz"), embed("data/hello.raw"))?;
+    damaged(mut inflater, embed("data/small.gz"), embed("data/small.raw"))?;
+    damaged(mut inflater, embed("data/flags.gz"), embed("data/flags.raw"))?;
+    return Ok();
+}
+
+@test
+fn damagedDeflateNeverPanics() -> Result<void, TestFailure> {
+    // Bare DEFLATE has no check, so a changed byte may decode to another text: all that is asked is an answer.
+    var inflater = Inflater.create();
+    let coded = embed("data/small.df");
+    var out = Vector<u8>.create();
+    var copy = Vector<u8>.create();
+    made(copy.extend(coded))?;
+    var answers: u64 = 0;
+    for (i in 0..coded.length) {
+        for (flip in [1u8, 2, 4, 8, 0x10, 0x20, 0x40, 0x80]) {
+            copy[i] = coded[i] ^ flip;
+            match (inflater.undeflate(copy.view(), mut out, 65536)) {
+                Ok() => { answers += 1; }
+                Err(_) => { answers += 1; }
+            }
+        }
+        copy[i] = coded[i];
+    }
+    Check.equalU64((coded.length * 8) as u64, answers)?;
+    // zlib has one (Adler-32): a changed text is refused.
+    let wrapped = embed("data/small.zz");
+    var changed = Vector<u8>.create();
+    made(changed.extend(wrapped))?;
+    changed[wrapped.length - 1] = wrapped[wrapped.length - 1] ^ 1;
+    match (inflater.undeflate(changed.view(), mut out, 65536)) {
+        Err(Fault.BadEncoding) => {}
+        _ => { return Check.fail("a zlib stream with a wrong check"); }
+    }
+    return Ok();
+}
+
+/// A client that asks for compressed responses and decompresses them.
+fn decoding() -> Client {
+    var options = ClientOptions.defaults();
+    options.decompress = true;
+    return Client.create(options);
+}
+
+/// The next dial of `client` gets a connection whose server sends `head` and then `body`.
+fn scriptCoded(client: borrow Client, head: StringView, body: Slice<u8>, copies: borrow Channel<u8>) -> Result<void, TestFailure> {
+    var bytes = Vector<u8>.create();
+    made(bytes.extend(head.bytes()))?;
+    made(bytes.extend(body))?;
+    return scriptBytes(client, bytes.view(), 0, 0, copies);
+}
+
+@test
+async fn compressedResponsesAreDecoded() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = decoding();
+    scriptCoded(
+        client,
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 269\r\n\r\n",
+        embed("data/small.gz"),
+        copies,
+    )?;
+    {
+        let response = match (await client.get("http://example.com/text")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.wasDecoded(), "decoded")?;
+        Check.equalBytes(embed("data/small.raw"), response.body())?;
+        // The fields are the server's: the coding is still named, and the length is the compressed one.
+        match (response.header("content-encoding")) {
+            Some(v) => { Check.equalBytes("gzip".bytes(), v)?; }
+            null => { return Check.fail("content-encoding"); }
+        }
+        Check.equalU64(269, response.contentLength() ?? 0)?;
+    }
+    Check.equalBytes(
+        "GET /text HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip, deflate\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    Check.equalU64(1, client.idleConnections() as u64)?; // the connection is as good as after any response
+    // The deflate coding, as zlib and as bare DEFLATE, in chunks.
+    let zlib = decoding();
+    scriptCoded(zlib, "HTTP/1.1 200 OK\r\nContent-Encoding: Deflate\r\nContent-Length: 257\r\n\r\n", embed("data/small.zz"), copies)?;
+    {
+        let response = match (await zlib.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes(embed("data/small.raw"), response.body())?;
+    }
+    let bare = decoding();
+    scriptCoded(bare, "HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\nContent-Length: 251\r\n\r\n", embed("data/small.df"), copies)?;
+    {
+        let response = match (await bare.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes(embed("data/small.raw"), response.body())?;
+    }
+    return Ok();
+}
+
+@test
+async fn whatIsNotDecoded() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let gzipHead = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 269\r\n\r\n";
+    // Without the option: nothing is asked for, and a compressed body is left as it came.
+    let plain = Client.create(ClientOptions.defaults());
+    scriptCoded(plain, gzipHead, embed("data/small.gz"), copies)?;
+    {
+        let response = match (await plain.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(!response.wasDecoded(), "left alone")?;
+        Check.equalBytes(embed("data/small.gz"), response.body())?;
+    }
+    Check.equalBytes("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), written(copies)?.view())?;
+    // A request that names its own codings keeps them; an unknown coding, or two, is left as it came.
+    let client = decoding();
+    scriptCoded(client, "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\n", "bytes".bytes(), copies)?;
+    var request = match (Request.create(Method.Get, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (request.header("Accept-Encoding", "br")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    {
+        let response = match (await client.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(!response.wasDecoded(), "an unknown coding")?;
+        Check.equalBytes("bytes".bytes(), response.body())?;
+    }
+    Check.equalBytes(
+        "GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: br\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    let twice = decoding();
+    scriptCoded(twice, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip, gzip\r\nContent-Length: 5\r\n\r\n", "bytes".bytes(), copies)?;
+    {
+        let response = match (await twice.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("bytes".bytes(), response.body())?;
+    }
+    // A streamed response is not decoded, so nothing is asked for; a HEAD's answer has no body to decode.
+    let streaming = decoding();
+    scriptCoded(streaming, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", "ok".bytes(), copies)?;
+    let drained = written(copies)?;
+    let get = match (Request.create(Method.Get, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        var response = match (await streaming.open(get, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var out = Vector<u8>.create();
+        await drain(mut response, 8, mut out)?;
+        Check.equalBytes("ok".bytes(), out.view())?;
+    }
+    Check.equalBytes("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), written(copies)?.view())?;
+    let heading = decoding();
+    scriptCoded(heading, gzipHead, "".bytes(), copies)?;
+    let head = match (Request.create(Method.Head, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let response = match (await heading.send(head, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(0, response.body().length as u64)?;
+        Check.isTrue(!response.wasDecoded(), "nothing to decode")?;
+    }
+    return Ok();
+}
+
+@test
+async fn aCorruptCodingIsAFault() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = decoding();
+    var damagedBody = Vector<u8>.create();
+    made(damagedBody.extend(embed("data/small.gz")))?;
+    damagedBody[100] = damagedBody[100] ^ 0x55;
+    scriptCoded(client, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 269\r\n\r\n", damagedBody.view(), copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BadEncoding)) => {}
+        Err(e) => { return Err(failed(e)); }
+        Ok(_) => { return Check.fail("a corrupt gzip decoded"); }
+    }
+    // The text may be no longer than a buffered body may be: 100,000 bytes from 133 are refused under a smaller limit.
+    var options = ClientOptions.defaults();
+    options.decompress = true;
+    options.maxBodyBytes = 50000;
+    let bounded = Client.create(options);
+    scriptCoded(bounded, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 133\r\n\r\n", embed("data/run.gz"), copies)?;
+    match (await bounded.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BodyTooLarge)) => {}
+        Err(e) => { return Err(failed(e)); }
+        Ok(_) => { return Check.fail("a body past the limit decoded"); }
+    }
+    return Ok();
+}
+
+@test
+async fn compressedResponsesOverHttp2() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var options = ClientOptions.defaults();
+    options.decompress = true;
+    options.http2PriorKnowledge = true;
+    let client = Client.create(options);
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["content-encoding", "gzip"][..], 4)?;
+    let coded = embed("data/small.gz");
+    frame(mut server, 0, 0, 1, coded[0..100])?;
+    frame(mut server, 0, 1, 1, coded[100..])?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/text")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.isHttp2() && response.wasDecoded(), "over HTTP/2, decoded")?;
+        Check.equalBytes(embed("data/small.raw"), response.body())?;
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var decoder = HpackDecoder.create(4096);
+    let expected = [
+        ":method", "GET", ":scheme", "http", ":authority", "example.com", ":path", "/text", "accept-encoding",
+        "gzip, deflate",
+    ];
+    expectRequest(mut decoder, wire.view(), sent[2], expected[..])?;
+    return Ok();
+}

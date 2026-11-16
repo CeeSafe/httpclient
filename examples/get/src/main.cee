@@ -7,15 +7,17 @@ import web_core;
 import web_tls;
 import cosmohttp;
 
-/// A client that verifies https servers against the system's roots and offers HTTP/2 and HTTP/1.1 (only
-/// HTTP/1.1 with GET_HTTP1 set).
+/// A client that verifies https servers against the system's roots, offers HTTP/2 and HTTP/1.1 (only HTTP/1.1 with
+/// GET_HTTP1 set), and asks for compressed responses (not with GET_PLAIN set).
 fn client() -> Result<Client, TlsSetupError> {
     var config = TlsConfig.client()?;
     config.trustSystem()?;
     let both = [Alpn.Http2, Alpn.Http11];
     let one = [Alpn.Http11];
     config.setAlpn(if (Environment.variable("GET_HTTP1") == null) both[..] else one[..])?;
-    return Ok(Client.withTls(ClientOptions.defaults(), config));
+    var options = ClientOptions.defaults();
+    options.decompress = Environment.variable("GET_PLAIN") == null; // gzip and deflate, unless GET_PLAIN is set
+    return Ok(Client.withTls(options, config));
 }
 
 async fn fetch(http: borrow Client, url: StringView, count: u64) -> Result<void, AsyncError> {
@@ -33,7 +35,9 @@ async fn fetch(http: borrow Client, url: StringView, count: u64) -> Result<void,
         line.appendNumber(response.status() as u64)!;
         line.append(", ")!;
         line.appendNumber(response.body().length as u64)!;
-        line.append(" bytes, ")!;
+        line.append(if (response.wasDecoded()) " bytes decompressed (" else " bytes (")!;
+        line.appendNumber(response.contentLength() ?? 0)!;
+        line.append(" on the wire by content-length), ")!;
         line.appendNumber(Timer.now() - started)!;
         line.append(" ms")!;
         await AsyncConsole.writeLine(line.view())?;

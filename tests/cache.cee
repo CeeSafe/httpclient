@@ -1,0 +1,289 @@
+// The response cache: its rules on their own, then through the client.
+import web_core;
+import web_transport;
+
+@test
+fn cacheControlDirectives() -> Result<void, TestFailure> {
+    let a = cacheControl("public, max-age=3600".bytes());
+    Check.isTrue(!a.noStore && !a.noCache && a.maxAge == 3600, "max-age")?;
+    let b = cacheControl("No-Store ,NO-CACHE, max-age=\"60\"".bytes());
+    Check.isTrue(b.noStore && b.noCache && b.maxAge == 60, "any case, a quoted number")?;
+    let c = cacheControl("max-age=soon, private, s-maxage=9".bytes());
+    Check.isTrue(!c.noStore && !c.noCache && c.maxAge == -1, "not a number; s-maxage is a shared cache's")?;
+    let d = cacheControl("".bytes());
+    Check.isTrue(d.maxAge == -1, "nothing")?;
+    return Ok();
+}
+
+@test
+fn freshnessAndAge() -> Result<void, TestFailure> {
+    var cache = ResponseCache.create(100000);
+    let url = "http://example.com/a".bytes();
+    // max-age 100, already 30 old when it came (age): fresh for 70 more seconds.
+    made(cache.store(url, "".bytes(), "Cache-Control: max-age=100\r\nAge: 30\r\n".bytes(), "body".bytes(), false, 1000))?;
+    let i = cache.find(url, "".bytes()) ?? 99;
+    Check.equalU64(0, i as u64)?;
+    Check.isTrue(cache.isFresh(i, 1000, -1), "fresh when stored")?;
+    Check.isTrue(cache.isFresh(i, 1069, -1), "fresh at 99 seconds of age")?;
+    Check.isTrue(!cache.isFresh(i, 1070, -1), "stale at 100")?;
+    Check.isTrue(!cache.isFresh(i, 1000, 20), "older than the request allows")?;
+    Check.isTrue(cache.isFresh(i, 1000, 30), "as old as the request allows")?;
+    // Expires counts from Date; max-age outranks it; an unreadable Expires is the past.
+    Check.equalU64(
+        60,
+        truncate<u64>(freshnessLifetime("Date: Sun, 06 Nov 1994 08:49:37 GMT\r\nExpires: Sun, 06 Nov 1994 08:50:37 GMT\r\n".bytes(), 5)),
+    )?;
+    Check.equalU64(
+        7,
+        truncate<u64>(freshnessLifetime("Expires: Sun, 06 Nov 1994 08:50:37 GMT\r\nCache-Control: max-age=7\r\n".bytes(), 5)),
+    )?;
+    Check.equalU64(0, truncate<u64>(freshnessLifetime("Expires: 0\r\n".bytes(), 5)))?;
+    Check.equalU64(0, truncate<u64>(freshnessLifetime("ETag: \"x\"\r\n".bytes(), 5)))?;
+    // no-cache is stored and always asked about.
+    let other = "http://example.com/b".bytes();
+    made(cache.store(other, "".bytes(), "Cache-Control: no-cache, max-age=100\r\nETag: \"x\"\r\n".bytes(), "b".bytes(), false, 1000))?;
+    let j = cache.find(other, "".bytes()) ?? 99;
+    Check.isTrue(!cache.isFresh(j, 1000, -1), "no-cache is never served unasked")?;
+    return Ok();
+}
+
+@test
+fn whatIsStored() -> Result<void, TestFailure> {
+    var cache = ResponseCache.create(1000);
+    let fresh = "Cache-Control: max-age=60\r\n".bytes();
+    made(cache.store("http://h/no-store".bytes(), "".bytes(), "Cache-Control: no-store, max-age=60\r\n".bytes(), "x".bytes(), false, 0))?;
+    made(cache.store("http://h/nothing".bytes(), "".bytes(), "Content-Type: text/plain\r\n".bytes(), "x".bytes(), false, 0))?;
+    made(cache.store("http://h/vary-all".bytes(), "".bytes(), "Cache-Control: max-age=60\r\nVary: *\r\n".bytes(), "x".bytes(), false, 0))?;
+    var large = Vector<u8>.create();
+    made(large.resize(600, 'x'))?;
+    made(cache.store("http://h/large".bytes(), "".bytes(), fresh, large.view(), false, 0))?;
+    Check.equalU64(0, cache.entries.length as u64)?;
+    made(cache.store("http://h/validator".bytes(), "".bytes(), "Last-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n".bytes(), "x".bytes(), false, 0))?;
+    Check.equalU64(1, cache.entries.length as u64)?;
+    // Vary: one entry for each value of the named request field, found by it.
+    let vary = "Cache-Control: max-age=60\r\nVary: Accept-Language, X-Other\r\n".bytes();
+    made(cache.store("http://h/page".bytes(), "Accept-Language: en\r\n".bytes(), vary, "hello".bytes(), false, 0))?;
+    made(cache.store("http://h/page".bytes(), "accept-language: fr\r\nX-Unrelated: 1\r\n".bytes(), vary, "salut".bytes(), false, 0))?;
+    Check.equalU64(3, cache.entries.length as u64)?;
+    match (cache.find("http://h/page".bytes(), "ACCEPT-LANGUAGE: fr\r\n".bytes())) {
+        Some(i) => { Check.equalBytes("salut".bytes(), cache.entries[i].body.view())?; }
+        null => { return Check.fail("the French page"); }
+    }
+    Check.isTrue(cache.find("http://h/page".bytes(), "Accept-Language: de\r\n".bytes()) == null, "no German page")?;
+    Check.isTrue(cache.find("http://h/page".bytes(), "Accept-Language: en\r\nX-Other: 1\r\n".bytes()) == null, "another field")?;
+    // The same request again takes the old one's place.
+    made(cache.store("http://h/page".bytes(), "Accept-Language: en\r\n".bytes(), vary, "hi".bytes(), false, 0))?;
+    Check.equalU64(3, cache.entries.length as u64)?;
+    // Full: the entry used longest ago goes. The validator entry is the oldest; touch it, and the French page is.
+    cache.touch(0);
+    var filler = Vector<u8>.create();
+    made(filler.resize(450, 'y'))?;
+    made(cache.store("http://h/filler".bytes(), "".bytes(), fresh, filler.view(), false, 0))?;
+    made(cache.store("http://h/filler2".bytes(), "".bytes(), fresh, filler.view(), false, 0))?;
+    Check.isTrue(cache.bytes <= 1000, "within its size")?;
+    Check.isTrue(cache.find("http://h/filler2".bytes(), "".bytes()) != null, "the newest is there")?;
+    Check.isTrue(cache.find("http://h/page".bytes(), "Accept-Language: fr\r\n".bytes()) == null, "the least used went")?;
+    cache.remove("http://h/filler2".bytes());
+    Check.isTrue(cache.find("http://h/filler2".bytes(), "".bytes()) == null, "removed")?;
+    return Ok();
+}
+
+@test
+fn aNotModifiedRefreshes() -> Result<void, TestFailure> {
+    var cache = ResponseCache.create(100000);
+    let url = "http://example.com/doc".bytes();
+    made(cache.store(
+        url,
+        "".bytes(),
+        "Content-Type: text/plain\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Length: 4\r\n".bytes(),
+        "text".bytes(),
+        false,
+        1000,
+    ))?;
+    Check.isTrue(!cache.isFresh(0, 1000, -1), "to be asked about")?;
+    var asks = Vector<u8>.create();
+    made(validators(cache.entries[0].fields.view(), mut asks))?;
+    Check.equalBytes("If-None-Match: \"v1\"\r\n".bytes(), asks.view())?;
+    // The 304's fields take the place of the stored ones of the same names; its content-length does not.
+    made(cache.refresh(0, "Cache-Control: max-age=50\r\nX-New: 1\r\nContent-Length: 0\r\n".bytes(), 2000))?;
+    Check.equalBytes(
+        "Content-Type: text/plain\r\nETag: \"v1\"\r\nContent-Length: 4\r\nCache-Control: max-age=50\r\nX-New: 1\r\n".bytes(),
+        cache.entries[0].fields.view(),
+    )?;
+    Check.isTrue(cache.isFresh(0, 2049, -1) && !cache.isFresh(0, 2050, -1), "fresh for 50 seconds from the 304")?;
+    Check.equalBytes("text".bytes(), cache.entries[0].body.view())?;
+    return Ok();
+}
+
+fn caching() -> Client {
+    var options = ClientOptions.defaults();
+    options.cacheBytes = 1048576;
+    return Client.create(options);
+}
+
+async fn fetched(client: borrow Client, request: borrow Request, body: StringView, cached: bool) -> Result<void, TestFailure> {
+    let response = match (await client.send(request, "".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    Check.equalBytes(body.bytes(), response.body())?;
+    return Check.isTrue(response.fromCache() == cached, if (cached) "from the cache" else "from the network");
+}
+
+@test
+async fn freshResponsesAreServedFromTheCache() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = caching();
+    script(client, "HTTP/1.1 200 OK\r\nCache-Control: max-age=3600\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\none", 0, copies)?;
+    let request = match (Request.create(Method.Get, "http://example.com/page")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    await fetched(client, request, "one", false)?;
+    let first = written(copies)?;
+    Check.equalU64(1, client.cachedResponses() as u64)?;
+    // The second time there is no connection to dial (the script is used up), and none is needed.
+    {
+        let response = match (await client.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.fromCache(), "from the cache")?;
+        Check.equalBytes("one".bytes(), response.body())?;
+        Check.equalU64(4, response.headerCount() as u64)?;
+        match (response.header("content-type")) {
+            Some(v) => { Check.equalBytes("text/plain".bytes(), v)?; }
+            null => { return Check.fail("a stored field"); }
+        }
+    }
+    Check.equalU64(0, written(copies)?.length as u64)?;
+    // A request that forbids it goes to the network; so does another URL, and a HEAD.
+    script(client, "HTTP/1.1 200 OK\r\nCache-Control: max-age=3600\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo", 0, copies)?;
+    var direct = match (Request.create(Method.Get, "http://example.com/page")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (direct.header("Cache-Control", "no-store")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    await fetched(client, direct, "two", false)?;
+    await fetched(client, request, "one", true)?; // what no-store fetched was not kept
+    // A POST that succeeds forgets what was stored for its URL.
+    script(client, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", 0, copies)?;
+    let post = match (Request.create(Method.Post, "http://example.com/page")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let response = match (await client.send(post, "x".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(204, response.status() as u64)?;
+    }
+    Check.equalU64(0, client.cachedResponses() as u64)?;
+    return Ok();
+}
+
+@test
+async fn staleResponsesAreAskedAbout() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = caching();
+    let request = match (Request.create(Method.Get, "http://example.com/doc")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    script(client, "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfirst", 0, copies)?;
+    await fetched(client, request, "first", false)?;
+    let sent = written(copies)?;
+    Check.equalBytes("GET /doc HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), sent.view())?;
+    // Stale at once: the next request asks, the server says it has not changed and gives it an hour.
+    script(client, "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nCache-Control: max-age=3600\r\nX-Checked: yes\r\nConnection: close\r\n\r\n", 0, copies)?;
+    {
+        let response = match (await client.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.isTrue(response.fromCache(), "the stored response, confirmed")?;
+        Check.equalBytes("first".bytes(), response.body())?;
+        match (response.header("x-checked")) {
+            Some(v) => { Check.equalBytes("yes".bytes(), v)?; }
+            null => { return Check.fail("the 304's field"); }
+        }
+    }
+    Check.equalBytes(
+        "GET /doc HTTP/1.1\r\nHost: example.com\r\nIf-None-Match: \"v1\"\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    await fetched(client, request, "first", true)?; // fresh now: nothing is sent
+    Check.equalU64(0, written(copies)?.length as u64)?;
+    // no-cache on the request asks again; this time the document changed.
+    script(client, "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nCache-Control: max-age=3600\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond", 0, copies)?;
+    var again = match (Request.create(Method.Get, "http://example.com/doc")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (again.header("Cache-Control", "no-cache")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    await fetched(client, again, "second", false)?;
+    Check.equalBytes(
+        "GET /doc HTTP/1.1\r\nHost: example.com\r\nCache-Control: no-cache\r\nIf-None-Match: \"v1\"\r\n\r\n".bytes(),
+        written(copies)?.view(),
+    )?;
+    await fetched(client, request, "second", true)?;
+    client.clearCache();
+    Check.equalU64(0, client.cachedResponses() as u64)?;
+    return Ok();
+}
+
+@test
+async fn theCacheOverHttp2AndWithDecompression() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var options = ClientOptions.defaults();
+    options.cacheBytes = 1048576;
+    options.decompress = true;
+    options.http2PriorKnowledge = true;
+    let client = Client.create(options);
+    // A compressed response with a validator, then a 304 for the question about it.
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["content-encoding", "gzip", "etag", "\"z\"", "cache-control", "max-age=0"][..], 4)?;
+    frame(mut server, 0, 1, 1, embed("data/small.gz"))?;
+    let cut = server.length;
+    headers(mut server, 3, "304", ["cache-control", "max-age=600"][..], 5)?;
+    scriptBytes(client, server.view(), cut, 0, copies)?;
+    for (k in 0..3) {
+        let response = match (await client.get("http://example.com/text")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes(embed("data/small.raw"), response.body())?; // the text is what is stored
+        Check.isTrue(response.wasDecoded(), "decoded, also from the cache")?;
+        Check.isTrue(response.fromCache() == (k > 0), "the first from the network")?;
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var requests: u64 = 0;
+    var decoder = HpackDecoder.create(4096);
+    for (i in 0..sent.length) {
+        if (sent[i].kind != 1) {
+            continue;
+        }
+        requests += 1;
+        if (sent[i].id == 3) {
+            let expected = [
+                ":method", "GET", ":scheme", "http", ":authority", "example.com", ":path", "/text", "if-none-match", "\"z\"",
+                "accept-encoding", "gzip, deflate",
+            ];
+            expectRequest(mut decoder, wire.view(), sent[i], expected[..])?;
+        }
+    }
+    Check.equalU64(2, requests)?; // the third was fresh
+    return Ok();
+}

@@ -202,6 +202,12 @@ not the same measurement.
   and simply ends over HTTP/2, where a write waits for the server's window. Nothing of the body is kept, so nothing
   is sent again: no redirect is followed and no retry made, and a pooled HTTP/1.1 connection the server had closed
   meanwhile is the caller's error. An upload dropped before `finish` closes its connection or resets its stream.
+- **gRPC** (`grpcRequest(url)`, `grpcUnary(client, request, message)`, `grpcNext(response.body(), mut at)`,
+  `grpcStatus(response)`, `grpcMessage(response, mut text)`; `GrpcReader` for a server that streams). Messages are
+  bytes: encoding them is the caller's. Over HTTP/2 only; no compressed messages; no call where both sides stream at
+  once.
+- **Response trailers** over HTTP/2 (`response.trailerCount()`, `trailerName(i)`, `trailerValue(i)`,
+  `trailer(name)`); a streamed response has them once `read` gives 0. A chunked HTTP/1.1 body's are skipped.
 - **Lines of a streamed body** (`LineReader.create(maxLine)`, then `reader.next(mut response, mut line)`): NDJSON
   records, server-sent events, logs. No JSON is parsed here.
 - **Counters** (`client.stats()`): requests ended, responses, errors, cache hits, retries, connections opened and
@@ -240,8 +246,7 @@ not the same measurement.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); gRPC
-framing and response trailers; typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
+Of CosmoHttpClient's surface: HTTP/3 and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache. A name
 with several addresses is tried one address at a time, not raced. In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
@@ -251,7 +256,7 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 87 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 90 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
 python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib

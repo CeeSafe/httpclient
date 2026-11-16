@@ -814,6 +814,7 @@ fn storedResponse<region c>(client: borrow(c) Client, entry: borrow CacheEntry) 
         streamed: false,
         decoded: decoded,
         cached: true,
+        trailers: 0,
     });
 }
 
@@ -1167,11 +1168,13 @@ async fn roundTrip<region c>(
                     streamed: !buffered,
                     decoded: false,
                     cached: false,
+                    trailers: 0,
                 };
                 let taken = session.takeResponse(at.slot, mut response.head, mut response.spans, mut response.data);
                 response.generation = taken.generation;
                 response.code = taken.status;
                 response.filled = taken.filled;
+                response.trailers = taken.trailers;
                 match (done) {
                     Ok() => {
                         if (options.cookies) {
@@ -1229,6 +1232,7 @@ async fn roundTrip<region c>(
                             streamed: !buffered,
                             decoded: false,
                             cached: false,
+                            trailers: 0,
                         };
                         if (options.cookies) {
                             client.keepCookies(response, url, parts);
@@ -1493,6 +1497,8 @@ public struct Response<region c> {
     private decoded: bool;
     /// It was served from the client's cache: `head`, `spans` and `data` are copies of the stored response.
     private cached: bool;
+    /// How many of `spans`, the last ones, are trailers (HTTP/2).
+    private trailers: usize;
 
     /// The status code.
     public fn status(borrow this) -> u16 => match (borrow this.conn) {
@@ -1562,7 +1568,7 @@ public struct Response<region c> {
     /// How many fields the head has.
     public fn headerCount(borrow this) -> usize => match (borrow this.conn) {
         Some(c) => c.headers.length,
-        null => if (this.spans.length > 0) this.spans.length - 1 else 0,
+        null => if (this.spans.length > 0) this.spans.length - 1 - this.trailers else 0,
     };
 
     /// Field `i`'s name: as the server wrote it over HTTP/1.1, lowercase over HTTP/2.
@@ -1584,7 +1590,7 @@ public struct Response<region c> {
             null => {}
         }
         let wanted = name.bytes();
-        for (i in 1..this.spans.length) {
+        for (i in 1..this.spans.length - this.trailers) {
             let s = this.spans[i];
             if (s.nameEnd - s.nameStart == wanted.length && this.head[s.nameStart..s.nameEnd].equalsIgnoreAsciiCase(
                 wanted,
@@ -1627,7 +1633,41 @@ public struct Response<region c> {
         if (!this.viaH2 || !this.streamed) {
             return Ok(0);
         }
-        return await this.client.sessions[this.session].read(this.slot, buffer);
+        let session = borrow this.client.sessions[this.session];
+        let n = await session.read(this.slot, buffer)?;
+        if (n == 0 && this.trailers == 0) {
+            // The body has ended: the trailers that came with its end join the response.
+            match (session.takeTrailers(this.slot, mut this.head, mut this.spans)) {
+                Ok(count) => { this.trailers = count; }
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+        }
+        return Ok(n);
+    }
+
+    /// How many trailers the response has: fields sent after the body, over HTTP/2 (over HTTP/1.1 a chunked body's
+    /// trailers are skipped). A streamed response has them once `read` has given 0.
+    public fn trailerCount(borrow this) -> usize => this.trailers;
+
+    /// Trailer `i`'s name (lowercase) and value.
+    public fn trailerName(borrow this, i: usize) -> Slice<u8> {
+        let s = this.spans[this.spans.length - this.trailers + i];
+        return this.head[s.nameStart..s.nameEnd];
+    }
+
+    public fn trailerValue(borrow this, i: usize) -> Slice<u8> {
+        let s = this.spans[this.spans.length - this.trailers + i];
+        return this.head[s.valueStart..s.valueEnd];
+    }
+
+    /// The value of the first trailer named `name` (ASCII case ignored).
+    public fn trailer(borrow this, name: StringView) -> Slice<u8>? {
+        for (i in 0..this.trailers) {
+            if (this.trailerName(i).equalsIgnoreAsciiCase(name.bytes())) {
+                return Some(this.trailerValue(i));
+            }
+        }
+        return null;
     }
 
     /// Whether the whole response has been read.
@@ -1797,6 +1837,7 @@ public struct Upload<region c> {
             me.response.generation = taken.generation;
             me.response.code = taken.status;
             me.response.filled = taken.filled;
+            me.response.trailers = taken.trailers;
             done?;
         } else {
             let chunked = me.chunked;
@@ -1981,6 +2022,7 @@ async fn beginUpload<region c>(
             streamed: false,
             decoded: false,
             cached: false,
+            trailers: 0,
         },
         url: kept,
         parts: parts,

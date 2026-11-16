@@ -1,0 +1,188 @@
+// gRPC over HTTP/2: message framing and the status a call ends with (the gRPC over HTTP/2 protocol document).
+//
+// A message goes as one byte that says whether it is compressed, its length as four bytes, and its bytes. The call's
+// status comes in the trailers (`grpc-status`, `grpc-message`), or in the head of a response that has no body.
+// Messages are bytes here: encoding them (protobuf) is the caller's. Compressed messages are not taken, and none is
+// asked for.
+
+/// gRPC's status codes that this file names itself; the others are the server's.
+public const GRPC_OK: u32 = 0;
+public const GRPC_UNKNOWN: u32 = 2;
+public const GRPC_PERMISSION_DENIED: u32 = 7;
+public const GRPC_UNIMPLEMENTED: u32 = 12;
+public const GRPC_INTERNAL: u32 = 13;
+public const GRPC_UNAVAILABLE: u32 = 14;
+public const GRPC_UNAUTHENTICATED: u32 = 16;
+
+/// Appends `message` to `out` as one gRPC frame.
+public fn grpcFrame(message: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var header = [0u8; 5];
+    header.writeBE(1, truncate<u32>(message.length));
+    out.extend(header[..])?;
+    return out.extend(message);
+}
+
+/// The next message in `body`, a buffered response's, from `*at`, which moves past it; null at the end.
+/// `BadFrame` for a frame that is cut short, `BadEncoding` for a compressed one.
+public fn grpcNext<region r>(body: Slice<r, u8>, at: borrow mut usize) -> Result<Slice<r, u8>?, HttpError> {
+    let from = *at;
+    if (from >= body.length) {
+        return Ok(null);
+    }
+    if (body.length - from < 5) {
+        return Err(HttpError.Response(Fault.BadFrame));
+    }
+    if (body[from] != 0) {
+        return Err(HttpError.Response(Fault.BadEncoding));
+    }
+    let length = body.readBE<u32>(from + 1) as usize;
+    if (body.length - from - 5 < length) {
+        return Err(HttpError.Response(Fault.BadFrame));
+    }
+    *at = from + 5 + length;
+    return Ok(Some(body[from + 5..from + 5 + length]));
+}
+
+/// The status a call ended with: `grpc-status` from the trailers, or from the head of a response without a body. A
+/// streamed response has it once its body is read to the end. Without one, the HTTP status says what went wrong
+/// (the protocol's table), and a 200 without one is `GRPC_INTERNAL`.
+public fn grpcStatus(response: borrow Response) -> u32 {
+    let text = match (response.trailer("grpc-status")) {
+        Some(t) => Some(t),
+        null => response.header("grpc-status"),
+    };
+    match (text) {
+        Some(t) => { return t.parseInt<u32>() ?? GRPC_INTERNAL; }
+        null => {}
+    }
+    let http = response.status();
+    if (http == 401) {
+        return GRPC_UNAUTHENTICATED;
+    }
+    if (http == 403) {
+        return GRPC_PERMISSION_DENIED;
+    }
+    if (http == 404) {
+        return GRPC_UNIMPLEMENTED;
+    }
+    if (http == 429 || http == 502 || http == 503 || http == 504) {
+        return GRPC_UNAVAILABLE;
+    }
+    if (http == 200 || http == 400) {
+        return GRPC_INTERNAL;
+    }
+    return GRPC_UNKNOWN;
+}
+
+/// Appends the call's `grpc-message` to `out`, its percent-encoding undone; nothing if the server sent none.
+public fn grpcMessage(response: borrow Response, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let text = match (response.trailer("grpc-message")) {
+        Some(t) => t,
+        null => match (response.header("grpc-message")) {
+            Some(t) => t,
+            null => { return Ok(); },
+        },
+    };
+    var i: usize = 0;
+    while (i < text.length) {
+        if (text[i] == '%' && i + 2 < text.length && hexValue(text[i + 1]) < 16 && hexValue(text[i + 2]) < 16) {
+            out.push(hexValue(text[i + 1]) * 16 + hexValue(text[i + 2]))?;
+            i += 3;
+        } else {
+            out.push(text[i])?;
+            i += 1;
+        }
+    }
+    return Ok();
+}
+
+fn hexValue(b: u8) -> u8 {
+    if (b >= '0' && b <= '9') {
+        return b - '0';
+    }
+    if (b >= 'a' && b <= 'f') {
+        return b - 'a' + 10;
+    }
+    if (b >= 'A' && b <= 'F') {
+        return b - 'A' + 10;
+    }
+    return 16;
+}
+
+/// A request for the gRPC method at `url` (`https://host/package.Service/Method`): a POST with gRPC's fields. Add
+/// the call's metadata with `header`.
+public fn grpcRequest(url: StringView) -> Result<Request, HttpError> {
+    var request = Request.create(Method.Post, url)?;
+    request.header("content-type", "application/grpc")?;
+    request.header("te", "trailers")?;
+    return Ok(request);
+}
+
+/// A call with one message, its response buffered: read the replies with `grpcNext(response.body(), mut at)` and
+/// the outcome with `grpcStatus(response)`. gRPC needs HTTP/2: over TLS a server that offers it, or
+/// `http2PriorKnowledge` for `http://`.
+public async fn grpcUnary<region c>(
+    client: borrow(c) Client,
+    request: borrow Request,
+    message: Slice<u8>,
+) -> Result<Response<c>, HttpError> {
+    var framed = Vector<u8>.create();
+    match (grpcFrame(message, mut framed)) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    return await client.send(request, framed.view());
+}
+
+/// Reads the messages of a streamed response (`Client.open`), for a call whose server sends many.
+public struct GrpcReader {
+    private header: [u8; 5];
+    private have: usize;
+    private maxMessage: usize;
+
+    /// A reader of messages up to `maxMessage` bytes; a longer one is `BodyTooLarge`.
+    public fn create(maxMessage: usize) -> GrpcReader =>
+        GrpcReader { header: [0u8; 5], have: 0, maxMessage: maxMessage };
+
+    /// The next message of `response` into `message`: true, or false at the end of the body, after which
+    /// `grpcStatus(response)` is the call's outcome. It is read straight into `message`. Not to be cancelled in the
+    /// middle of a message: what was read of it is lost.
+    public async fn next(
+        borrow mut this,
+        response: borrow mut Response,
+        message: borrow mut Vector<u8>,
+    ) -> Result<bool, HttpError> {
+        message.clear();
+        while (this.have < 5) {
+            let n = await response.read(mut this.header[this.have..])?;
+            if (n == 0) {
+                if (this.have == 0) {
+                    return Ok(false);
+                }
+                return Err(HttpError.Response(Fault.Truncated));
+            }
+            this.have += n;
+        }
+        this.have = 0;
+        if (this.header[0] != 0) {
+            return Err(HttpError.Response(Fault.BadEncoding));
+        }
+        let length = this.header.readBE<u32>(1) as usize;
+        if (length > this.maxMessage) {
+            return Err(HttpError.Response(Fault.BodyTooLarge));
+        }
+        match (message.resize(length, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        var filled: usize = 0;
+        while (filled < length) {
+            let n = await response.read(mut message[filled..])?;
+            if (n == 0) {
+                return Err(HttpError.Response(Fault.Truncated));
+            }
+            filled += n;
+        }
+        return Ok(true);
+    }
+}

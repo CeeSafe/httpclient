@@ -90,6 +90,9 @@ struct H2Stream {
     /// A task sleeps on the slot's signal, for `want`.
     waiting: bool;
     want: u8;
+    /// Trailers arrived: they are `spans[trailersAt..]`, after the response's own fields if those are still here.
+    hasTrailers: bool;
+    trailersAt: usize;
 
     fn empty() -> H2Stream => H2Stream {
         id: 0,
@@ -115,6 +118,8 @@ struct H2Stream {
         unacked: 0,
         waiting: false,
         want: 0,
+        hasTrailers: false,
+        trailersAt: 0,
     };
 }
 
@@ -413,6 +418,8 @@ struct H2Session {
         s.unacked = 0;
         s.waiting = false;
         s.want = 0;
+        s.hasTrailers = false;
+        s.trailersAt = 0;
         if (st.leading) {
             this.outSignal.raise();
         }
@@ -1106,17 +1113,29 @@ struct H2Session {
     /// A complete field block for stream `id`: a response's head, an interim response's, or trailers.
     fn fields(borrow this, st: borrow mut H2State, id: u32, block: Slice<u8>, ends: bool) -> Result<void, Fault> {
         let slot = this.find(st, id);
-        if (slot == NO_SLOT || st.streams[slot].ended || st.streams[slot].headDone) {
-            // Nobody reads these (a stream that is gone, or trailers), but the HPACK table must see them.
+        if (slot == NO_SLOT || st.streams[slot].ended) {
+            // Nobody reads these (the stream is gone), but the HPACK table must see them.
             st.scrapHead.clear();
             st.scrapSpans.clear();
             st.decoder.decode(block, mut st.scrapHead, mut st.scrapSpans, this.maxHeadBytes, this.maxHeaders)?;
-            if (slot != NO_SLOT && !st.streams[slot].ended) {
-                if (!ends) {
-                    return Err(Fault.BadFrame); // a second head that does not end the stream (RFC 9113 §8.1)
-                }
-                this.endStream(st, slot);
+            return Ok();
+        }
+        if (st.streams[slot].headDone) {
+            // Trailers: kept after the response's fields, or alone if a streamed response took those already.
+            let at = st.streams[slot].spans.length;
+            st.decoder.decode(
+                block,
+                mut st.streams[slot].head,
+                mut st.streams[slot].spans,
+                this.maxHeadBytes,
+                this.maxHeaders,
+            )?;
+            if (!ends) {
+                return Err(Fault.BadFrame); // a second head that does not end the stream (RFC 9113 §8.1)
             }
+            st.streams[slot].hasTrailers = true;
+            st.streams[slot].trailersAt = at;
+            this.endStream(st, slot);
             return Ok();
         }
         st.streams[slot].answered = true;
@@ -1194,6 +1213,8 @@ struct H2Session {
         var guard = this.state.write();
         let st = guard.data();
         let s = borrow mut st.streams[slot];
+        let trailers = if (s.hasTrailers) s.spans.length - s.trailersAt else 0;
+        s.hasTrailers = false;
         swap(mut s.head, mut head);
         swap(mut s.spans, mut spans);
         var filled: usize = 0;
@@ -1201,7 +1222,37 @@ struct H2Session {
             swap(mut s.body, mut body);
             filled = s.filled;
         }
-        return H2Taken { status: s.status, filled: filled, generation: st.generation };
+        return H2Taken { status: s.status, filled: filled, generation: st.generation, trailers: trailers };
+    }
+
+    /// Appends the trailers that arrived after `takeResponse` to the response's fields: how many.
+    fn takeTrailers(
+        borrow this,
+        slot: usize,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+    ) -> Result<usize, AllocError> {
+        var guard = this.state.write();
+        let st = guard.data();
+        let s = borrow mut st.streams[slot];
+        if (!s.hasTrailers) {
+            return Ok(0);
+        }
+        let base = head.length;
+        head.extend(s.head.view())?;
+        var count: usize = 0;
+        for (i in s.trailersAt..s.spans.length) {
+            let f = s.spans[i];
+            spans.push(HeaderSpan {
+                nameStart: f.nameStart + base,
+                nameEnd: f.nameEnd + base,
+                valueStart: f.valueStart + base,
+                valueEnd: f.valueEnd + base,
+            })?;
+            count += 1;
+        }
+        s.hasTrailers = false;
+        return Ok(count);
     }
 
     /// The next bytes of the streamed body in `slot` into `buffer`: at least one, or 0 at its end.
@@ -1317,6 +1368,8 @@ struct H2Taken {
     status: u16;
     filled: usize;
     generation: u64;
+    /// How many of the fields taken, the last ones, are trailers.
+    trailers: usize;
 }
 
 /// One read from `link` into `into`, given up when `signal` is raised first: the count (0 at the end of the

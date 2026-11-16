@@ -1,0 +1,176 @@
+// gRPC: frames, trailers and the status, over scripted HTTP/2 connections.
+import web_core;
+import web_transport;
+
+/// A HEADERS frame without `:status`: trailers, ending the stream.
+fn trailers(out: borrow mut Vector<u8>, id: u32, fields: Slice<StringView>) -> Result<void, TestFailure> {
+    var block = Vector<u8>.create();
+    var i: usize = 0;
+    while (i < fields.length) {
+        made(hpackLiteral(mut block, 0, fields[i].bytes(), fields[i + 1].bytes(), false))?;
+        i += 2;
+    }
+    return frame(mut out, 1, 5, id, block.view());
+}
+
+fn grpcData(out: borrow mut Vector<u8>, id: u32, message: StringView) -> Result<void, TestFailure> {
+    var framed = Vector<u8>.create();
+    made(grpcFrame(message.bytes(), mut framed))?;
+    return frame(mut out, 0, 0, id, framed.view());
+}
+
+fn called(url: StringView) -> Result<Request, TestFailure> {
+    return match (grpcRequest(url)) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+@test
+async fn aUnaryCall() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["content-type", "application/grpc"][..], 4)?;
+    grpcData(mut server, 1, "reply")?;
+    grpcData(mut server, 1, "")?;
+    trailers(mut server, 1, ["grpc-status", "0", "grpc-message", "all%20good%2C thanks%"][..])?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    let request = called("http://example.com/pkg.Service/Method")?;
+    let response = match (await grpcUnary(client, request, "hello".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    Check.equalU64(0, grpcStatus(response) as u64)?;
+    Check.equalU64(1, response.headerCount() as u64)?; // the trailers are not among the fields
+    Check.isTrue(response.header("grpc-status") == null, "a trailer is not a field")?;
+    Check.equalU64(2, response.trailerCount() as u64)?;
+    Check.equalBytes("grpc-message".bytes(), response.trailerName(1))?;
+    var text = Vector<u8>.create();
+    made(grpcMessage(response, mut text))?;
+    Check.equalBytes("all good, thanks%".bytes(), text.view())?;
+    var at: usize = 0;
+    match (grpcNext(response.body(), mut at)) {
+        Ok(Some(m)) => { Check.equalBytes("reply".bytes(), m)?; }
+        Ok(null) => { return Check.fail("a message"); }
+        Err(e) => { return Err(failed(e)); }
+    }
+    match (grpcNext(response.body(), mut at)) {
+        Ok(Some(m)) => { Check.equalU64(0, m.length as u64)?; }
+        Ok(null) => { return Check.fail("an empty message"); }
+        Err(e) => { return Err(failed(e)); }
+    }
+    match (grpcNext(response.body(), mut at)) {
+        Ok(Some(_)) => { return Check.fail("no third message"); }
+        Ok(null) => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    // What was sent: gRPC's fields, and the message in a frame.
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var decoder = HpackDecoder.create(4096);
+    var body = Vector<u8>.create();
+    var sawFields = false;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 1) {
+            var head = Vector<u8>.create();
+            var spans = Vector<HeaderSpan>.create();
+            match (decoder.decode(wire[sent[i].start..sent[i].end], mut head, mut spans, 65536, 100)) {
+                Ok() => {}
+                Err(_) => { return Check.fail("the request's fields"); }
+            }
+            sawFields = head.view().indexOf("content-typeapplication/grpc".bytes()) != null &&
+                head.view().indexOf("tetrailers".bytes()) != null;
+        }
+        if (sent[i].kind == 0) {
+            made(body.extend(wire[sent[i].start..sent[i].end]))?;
+        }
+    }
+    Check.isTrue(sawFields, "content-type and te")?;
+    Check.equalBytes(raw("0000000005")?.view(), body[0..5])?;
+    Check.equalBytes("hello".bytes(), body[5..])?;
+    return Ok();
+}
+
+@test
+async fn aCallRefusedWithoutABody() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["content-type", "application/grpc", "grpc-status", "5", "grpc-message", "no such thing"][..], 5)?;
+    let cut = server.length;
+    headers(mut server, 3, "503", [], 5)?;
+    scriptBytes(client, server.view(), cut, 0, copies)?;
+    let request = called("http://example.com/pkg.Service/Method")?;
+    {
+        let response = match (await grpcUnary(client, request, "hello".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(5, grpcStatus(response) as u64)?;
+        var text = Vector<u8>.create();
+        made(grpcMessage(response, mut text))?;
+        Check.equalBytes("no such thing".bytes(), text.view())?;
+        Check.equalU64(0, response.trailerCount() as u64)?;
+    }
+    let response = match (await grpcUnary(client, request, "hello".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(14, grpcStatus(response) as u64)?; // a 503 without a gRPC status: unavailable
+    // Frames that are not whole.
+    var at: usize = 0;
+    Check.isTrue(grpcNext(raw("00000000")?.view(), mut at).isErr(), "half a header")?;
+    Check.isTrue(grpcNext(raw("0000000003aabb")?.view(), mut at).isErr(), "half a message")?;
+    Check.isTrue(grpcNext(raw("0100000001aa")?.view(), mut at).isErr(), "compressed")?;
+    Check.equalU64(0, at as u64)?;
+    return Ok();
+}
+
+async fn streamOnce(chunk: usize) -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "200", ["content-type", "application/grpc"][..], 4)?;
+    grpcData(mut server, 1, "one")?;
+    grpcData(mut server, 1, "")?;
+    grpcData(mut server, 1, "three, the longest of them")?;
+    trailers(mut server, 1, ["grpc-status", "9"][..])?;
+    scriptBytes(client, server.view(), chunk, 0, copies)?;
+    let request = called("http://example.com/pkg.Service/Watch")?;
+    var framed = Vector<u8>.create();
+    made(grpcFrame("start".bytes(), mut framed))?;
+    var response = match (await client.open(request, framed.view())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    var reader = GrpcReader.create(64);
+    var message = Vector<u8>.create();
+    let expected = ["one", "", "three, the longest of them"];
+    for (i in 0..expected.length) {
+        match (await reader.next(mut response, mut message)) {
+            Ok(more) => { Check.isTrue(more, "a message")?; }
+            Err(e) => { return Err(failed(e)); }
+        }
+        Check.equalBytes(expected[i].bytes(), message.view())?;
+    }
+    match (await reader.next(mut response, mut message)) {
+        Ok(more) => { Check.isTrue(!more, "the end")?; }
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.equalU64(1, response.trailerCount() as u64)?;
+    Check.equalU64(9, grpcStatus(response) as u64)?;
+    Check.equalU64(1, response.headerCount() as u64)?;
+    return Ok();
+}
+
+@test
+async fn aServerStreamingCall() -> Result<void, TestFailure> {
+    await streamOnce(0)?;
+    await streamOnce(1)?;
+    return await streamOnce(11);
+}

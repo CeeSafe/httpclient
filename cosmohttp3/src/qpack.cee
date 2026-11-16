@@ -1,0 +1,210 @@
+// QPACK (RFC 9204), the part a client needs when neither side uses a dynamic table.
+//
+// This client tells the server its decoder's table holds nothing (SETTINGS_QPACK_MAX_TABLE_CAPACITY is 0, the
+// default), so a response's field section can refer only to the static table: decoding keeps no state, needs no
+// encoder or decoder stream, and never blocks a stream. Requests are encoded the same way, with static references
+// and literals: a request's fields are few, and most of their bytes are values no table would hold (a path, a
+// token).
+import cosmohttp;
+
+/// Appends the two-byte prefix of a field section that uses no dynamic entries (§4.5.1): Required Insert Count 0,
+/// Base 0.
+public fn qpackPrefix(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.push(0)?;
+    return out.push(0);
+}
+
+/// Appends a reference to static entry `index`, name and value (§4.5.2).
+public fn qpackIndexed(out: borrow mut Vector<u8>, index: usize) -> Result<void, AllocError> =>
+    hpackInteger(mut out, 0xC0, 6, index);
+
+/// Appends a field whose name is static entry `nameIndex`'s, with `value` as it is (§4.5.4). `never`: the field
+/// must not enter a table at anyone who forwards it (credentials).
+public fn qpackNamed(
+    out: borrow mut Vector<u8>,
+    nameIndex: usize,
+    value: Slice<u8>,
+    never: bool,
+) -> Result<void, AllocError> {
+    hpackInteger(mut out, if (never) 0x70 else 0x50, 4, nameIndex)?;
+    hpackInteger(mut out, 0, 7, value.length)?;
+    return out.extend(value);
+}
+
+/// Appends a field with its name written, lowercased, and `value` as it is (§4.5.6).
+public fn qpackLiteral(
+    out: borrow mut Vector<u8>,
+    name: Slice<u8>,
+    value: Slice<u8>,
+    never: bool,
+) -> Result<void, AllocError> {
+    hpackInteger(mut out, if (never) 0x30 else 0x20, 3, name.length)?;
+    for (b in name) {
+        out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+    }
+    hpackInteger(mut out, 0, 7, value.length)?;
+    return out.extend(value);
+}
+
+/// The first static entry named `name` (ASCII case ignored), or null.
+public fn qpackNameIndex(name: Slice<u8>) -> usize? {
+    for (i in 0..QPACK_STATIC_COUNT) {
+        if (qpackStaticName(i).bytes().equalsIgnoreAsciiCase(name)) {
+            return Some(i);
+        }
+    }
+    return null;
+}
+
+/// Appends a field in its shortest form: a static entry if one has the name and the value, else the static name
+/// with the value, else both written. Credentials (`authorization`, `cookie`, `proxy-authorization`) are marked
+/// never to be indexed.
+public fn qpackField(out: borrow mut Vector<u8>, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+    let never = name.equalsIgnoreAsciiCase("authorization".bytes()) || name.equalsIgnoreAsciiCase("cookie".bytes()) ||
+        name.equalsIgnoreAsciiCase("proxy-authorization".bytes());
+    let first = match (qpackNameIndex(name)) {
+        Some(i) => i,
+        null => { return qpackLiteral(mut out, name, value, never); },
+    };
+    if (!never) {
+        // Entries with one name are next to each other.
+        var i = first;
+        while (i < QPACK_STATIC_COUNT && qpackStaticName(i).bytes().equalsIgnoreAsciiCase(name)) {
+            if (qpackStaticValue(i).bytes() == value) {
+                return qpackIndexed(mut out, i);
+            }
+            i += 1;
+        }
+    }
+    return qpackNamed(mut out, first, value, never);
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, Fault> {
+    return match (r) {
+        Ok() => Ok(),
+        Err(_) => Err(Fault.HeadTooLarge),
+    };
+}
+
+/// An integer with a prefix of `bits` bits (RFC 7541 §5.1, which QPACK uses), at `block[*at]`.
+fn prefixed(block: Slice<u8>, at: borrow mut usize, bits: u8) -> Result<usize, Fault> {
+    if (*at >= block.length) {
+        return Err(Fault.BadCompression);
+    }
+    let mask = ((1 as usize) << (bits as usize)) - 1;
+    var value = block[*at] as usize & mask;
+    *at += 1;
+    if (value < mask) {
+        return Ok(value);
+    }
+    var shift: usize = 0;
+    loop {
+        if (*at >= block.length || shift > 28) {
+            return Err(Fault.BadCompression);
+        }
+        let b = block[*at];
+        *at += 1;
+        value += ((b & 127) as usize) << shift;
+        shift += 7;
+        if ((b & 128) == 0) {
+            return Ok(value);
+        }
+    }
+}
+
+/// A string whose length has a prefix of `bits` bits and whose Huffman flag is the bit above them, appended to
+/// `out`.
+fn text(block: Slice<u8>, at: borrow mut usize, bits: u8, out: borrow mut Vector<u8>) -> Result<void, Fault> {
+    if (*at >= block.length) {
+        return Err(Fault.BadCompression);
+    }
+    let coded = (block[*at] & ((1 as u8) << bits)) != 0;
+    let length = prefixed(block, mut at, bits)?;
+    if (block.length - *at < length) {
+        return Err(Fault.BadCompression);
+    }
+    let raw = block[*at..*at + length];
+    *at += length;
+    if (coded) {
+        return huffmanDecode(raw, mut out);
+    }
+    return grown(out.extend(raw));
+}
+
+fn span(
+    out: borrow Vector<u8>,
+    spans: borrow mut Vector<HeaderSpan>,
+    nameStart: usize,
+    nameEnd: usize,
+    maxBytes: usize,
+    maxFields: usize,
+) -> Result<void, Fault> {
+    if (out.length > maxBytes) {
+        return Err(Fault.HeadTooLarge);
+    }
+    if (spans.length >= maxFields) {
+        return Err(Fault.TooManyHeaders);
+    }
+    return grown(
+        spans.push(HeaderSpan { nameStart: nameStart, nameEnd: nameEnd, valueStart: nameEnd, valueEnd: out.length }),
+    );
+}
+
+/// Decodes `block`, a complete field section, appending each field's name and value to `out` and a span for it to
+/// `spans`. `out` may hold at most `maxBytes` and `spans` at most `maxFields` afterwards. A reference to a dynamic
+/// entry is `BadCompression`: this decoder has no table, and has said so.
+public fn qpackDecode(
+    block: Slice<u8>,
+    out: borrow mut Vector<u8>,
+    spans: borrow mut Vector<HeaderSpan>,
+    maxBytes: usize,
+    maxFields: usize,
+) -> Result<void, Fault> {
+    var at: usize = 0;
+    // Required Insert Count must be 0 (§4.5.1.1); the Base then means nothing, but it must be there.
+    if (prefixed(block, mut at, 8)? != 0) {
+        return Err(Fault.BadCompression);
+    }
+    let _ = prefixed(block, mut at, 7)?;
+    while (at < block.length) {
+        let b = block[at];
+        let nameStart = out.length;
+        if ((b & 0x80) != 0) {
+            // Indexed (§4.5.2): 1 T index.
+            if ((b & 0x40) == 0) {
+                return Err(Fault.BadCompression);
+            }
+            let index = prefixed(block, mut at, 6)?;
+            if (index >= QPACK_STATIC_COUNT) {
+                return Err(Fault.BadCompression);
+            }
+            grown(out.extend(qpackStaticName(index).bytes()))?;
+            let nameEnd = out.length;
+            grown(out.extend(qpackStaticValue(index).bytes()))?;
+            span(out, mut spans, nameStart, nameEnd, maxBytes, maxFields)?;
+        } else if ((b & 0x40) != 0) {
+            // A literal with a name reference (§4.5.4): 0 1 N T index, then the value.
+            if ((b & 0x10) == 0) {
+                return Err(Fault.BadCompression);
+            }
+            let index = prefixed(block, mut at, 4)?;
+            if (index >= QPACK_STATIC_COUNT) {
+                return Err(Fault.BadCompression);
+            }
+            grown(out.extend(qpackStaticName(index).bytes()))?;
+            let nameEnd = out.length;
+            text(block, mut at, 7, mut out)?;
+            span(out, mut spans, nameStart, nameEnd, maxBytes, maxFields)?;
+        } else if ((b & 0x20) != 0) {
+            // A literal with a literal name (§4.5.6): 0 0 1 N H length, the name, then the value.
+            text(block, mut at, 3, mut out)?;
+            let nameEnd = out.length;
+            text(block, mut at, 7, mut out)?;
+            span(out, mut spans, nameStart, nameEnd, maxBytes, maxFields)?;
+        } else {
+            // Post-base forms (§4.5.3, §4.5.5) refer to dynamic entries.
+            return Err(Fault.BadCompression);
+        }
+    }
+    return Ok();
+}

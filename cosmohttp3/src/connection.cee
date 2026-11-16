@@ -1,0 +1,1456 @@
+// One HTTP/3 connection (RFC 9114) over QUIC (web_quic: ngtcp2).
+//
+// There is no connection task. As in cosmohttp's HTTP/2 session, the task that waits for a response does the
+// connection's work (the "leader"): it turns what requests have queued into stream writes, sends the datagrams QUIC
+// has, receives datagrams, runs QUIC's timers and hands what arrived to the streams. Other tasks sleep on their
+// stream's signal until the leader wakes them, and one of them leads when the leader has what it came for. So a
+// connection with nothing in flight is not driven: what the server sends then waits in the socket for the next
+// request, and a connection left alone for longer than the idle timeout is gone.
+//
+// HTTP/3's frames and QPACK are this package's own (frames here, qpack.cee). The client's QPACK table holds
+// nothing, so a response's fields refer only to the static table and no stream ever waits for another.
+import web_core;
+import web_tls;
+import web_quic;
+import cosmohttp;
+
+const FRAME_DATA: u64 = 0;
+const FRAME_HEADERS: u64 = 1;
+const FRAME_SETTINGS: u64 = 4;
+const FRAME_GOAWAY: u64 = 7;
+
+/// HTTP/3's error codes (RFC 9114 §8.1) that this client sends or acts on.
+const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
+const H3_REQUEST_REJECTED: u64 = 0x10b;
+const H3_REQUEST_CANCELLED: u64 = 0x10c;
+
+const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 6;
+
+/// A slot's stream has not been opened yet (the handshake is not done, or the server allows no more now).
+const NO_STREAM: i64 = -1;
+
+const WANT_HEAD: u8 = 1;
+const WANT_END: u8 = 2;
+const WANT_DATA: u8 = 3;
+
+/// The limits of an HTTP/3 connection.
+public struct H3Options {
+    /// For a response's head (`open`) or the whole of it (`send`), the handshake included when the request is the
+    /// connection's first; 0 for no limit.
+    public responseMs: u64;
+    /// Requests the connection carries at once (the server may allow fewer at a time).
+    public streams: usize;
+    /// The largest response head, in bytes of names and values, and the most fields.
+    public maxHeadBytes: usize;
+    public maxHeaders: usize;
+    /// The largest body `send` buffers.
+    public maxBodyBytes: u64;
+
+    /// 30 s for a response, 100 requests at once, heads up to 64 KiB and 128 fields, bodies up to 256 MiB.
+    public fn defaults() -> H3Options =>
+        H3Options { responseMs: 30000, streams: 100, maxHeadBytes: 65536, maxHeaders: 128, maxBodyBytes: 268435456 };
+}
+
+/// A request's place on the connection.
+struct H3Stream {
+    used: bool;
+    /// The QUIC stream, once the leader has opened it.
+    id: i64;
+    /// The request as it goes on the stream (HEADERS, then DATA): `out[outAt..]` is still to be handed to QUIC.
+    out: Vector<u8>;
+    outAt: usize;
+    outDone: bool;
+    /// QUIC took less than was offered: nothing more until it says the stream is writable.
+    blocked: bool;
+    /// A frame header that has arrived in part.
+    partial: Vector<u8>;
+    inFrame: bool;
+    frameType: u64;
+    frameLeft: u64;
+    /// A HEADERS frame's field section, until it is whole.
+    block: Vector<u8>;
+    /// The response's fields (`:status` first), then its trailers.
+    head: Vector<u8>;
+    spans: Vector<HeaderSpan>;
+    /// The body received and not yet taken: all of it for a buffered response, `body[taken..]` for a streamed one.
+    body: Vector<u8>;
+    taken: usize;
+    status: u16;
+    headDone: bool;
+    /// Nothing more will arrive: the server ended the stream, or it failed.
+    ended: bool;
+    failed: bool;
+    failure: HttpError;
+    /// The server did not act on the request (H3_REQUEST_REJECTED, a GOAWAY that leaves it out, or it never left).
+    refused: bool;
+    buffered: bool;
+    headOnly: bool;
+    hasDeclared: bool;
+    declared: u64;
+    received: u64;
+    maxBody: u64;
+    hasTrailers: bool;
+    trailersAt: usize;
+    /// Bytes of a streamed body the reader has taken, for which the server has not been given room back.
+    credit: u64;
+    waiting: bool;
+    want: u8;
+
+    fn empty() -> H3Stream => H3Stream {
+        used: false,
+        id: NO_STREAM,
+        out: Vector<u8>.create(),
+        outAt: 0,
+        outDone: false,
+        blocked: false,
+        partial: Vector<u8>.create(),
+        inFrame: false,
+        frameType: 0,
+        frameLeft: 0,
+        block: Vector<u8>.create(),
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+        body: Vector<u8>.create(),
+        taken: 0,
+        status: 0,
+        headDone: false,
+        ended: false,
+        failed: false,
+        failure: HttpError.Closed,
+        refused: false,
+        buffered: true,
+        headOnly: false,
+        hasDeclared: false,
+        declared: 0,
+        received: 0,
+        maxBody: 0,
+        hasTrailers: false,
+        trailersAt: 0,
+        credit: 0,
+        waiting: false,
+        want: 0,
+    };
+}
+
+/// A stream the server opened: its control stream, or one whose bytes are read and dropped.
+struct H3Uni {
+    id: i64;
+    /// The stream's type once its first bytes have said it (RFC 9114 §6.2).
+    typed: bool;
+    kind: u64;
+    /// The control stream's bytes that are not yet a whole frame; the type's bytes before that.
+    pending: Vector<u8>;
+}
+
+struct H3State {
+    streams: Vector<H3Stream>;
+    free: Vector<usize>;
+    /// Streams whose responses were dropped before they ended: the leader resets them.
+    cancels: Vector<i64>;
+    unis: Vector<H3Uni>;
+    /// A task is doing the connection's I/O.
+    leading: bool;
+    /// Our control stream is open and carries our SETTINGS.
+    opened: bool;
+    /// The server's SETTINGS have arrived.
+    settled: bool;
+    broken: bool;
+    failure: HttpError;
+    /// The server sent GOAWAY: no new requests.
+    draining: bool;
+    held: usize;
+}
+
+/// What the leader holds while it leads.
+struct H3Io {
+    socket: AsyncUdpSocket;
+    conn: QuicConnection;
+    peer: SocketAddress;
+    /// A received datagram, an event's data, and a datagram to send.
+    inbuf: Vector<u8>;
+    events: Vector<u8>;
+    out: Vector<u8>;
+}
+
+enum Wake {
+    Datagram(Datagram),
+    Timer,
+    Signal,
+}
+
+/// The HttpError for a QUIC failure.
+fn quicError(e: QuicError) -> HttpError => match (e) {
+    QuicError.NoMemory => HttpErrors.noMemory(),
+    QuicError.StreamsBlocked => HttpError.Net(NetError.LimitExceeded),
+    QuicError.IdleTimeout => HttpError.Net(NetError.TimedOut),
+    QuicError.Failed(_) => HttpError.Net(NetError.Reset),
+    _ => HttpError.Net(NetError.Closed),
+};
+
+fn noRoom<T>(r: Result<T, AllocError>) -> Result<T, HttpError> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+}
+
+/// An HTTP/3 connection to one server.
+@noncopy
+public struct H3Connection {
+    /// With the leader while it leads, here otherwise.
+    private io: RefCell<H3Io?>;
+    private state: RefCell<H3State>;
+    /// A signal for each slot's waiting task.
+    private signals: Vector<AsyncSignal>;
+    /// Raised when a task that is not the leader has something for the connection: a request, room to give back,
+    /// a stream to cancel.
+    private outSignal: AsyncSignal;
+    private options: H3Options;
+
+    /// A connection to the server at `address`, whose certificate is verified for `host` with `tls` (a client's,
+    /// with ALPN `h3`). Nothing is sent yet: the handshake goes out with the first request.
+    public fn connectTo(
+        tls: borrow QuicTls,
+        host: StringView,
+        address: SocketAddress,
+        options: H3Options,
+    ) -> Result<H3Connection, HttpError> {
+        let any = match (address) {
+            SocketAddress.V4(_, _) => SocketAddress.V4([0u8, 0, 0, 0], 0),
+            SocketAddress.V6(_, _, _) => SocketAddress.V6([0u8; 16], 0, 0),
+        };
+        let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+            Ok(s) => s,
+            Err(e) => { return Err(HttpError.Net(NetErrors.fromIo(e))); },
+        };
+        let local = match (socket.localAddress()) {
+            Ok(a) => a,
+            Err(e) => { return Err(HttpError.Net(NetErrors.fromIo(e))); },
+        };
+        let ids = match (QuicIds.random()) {
+            Ok(i) => i,
+            Err(e) => { return Err(quicError(e)); },
+        };
+        var conn = match (QuicConnection.client(
+            tls,
+            host,
+            QuicAddress.of(local),
+            QuicAddress.of(address),
+            ids,
+            Clock.monotonicNanos(),
+        )) {
+            Ok(c) => c,
+            Err(e) => { return Err(quicError(e)); },
+        };
+        // The server gets room back as responses are read, not as their bytes arrive.
+        conn.creditOnConsume();
+        let slots = if (options.streams == 0) 1 else options.streams;
+        var streams = noRoom(Vector<H3Stream>.withCapacity(slots))?;
+        var signals = noRoom(Vector<AsyncSignal>.withCapacity(slots))?;
+        var free = noRoom(Vector<usize>.withCapacity(slots))?;
+        for (i in 0..slots) {
+            noRoom(streams.push(H3Stream.empty()))?;
+            noRoom(signals.push(AsyncSignal.create()))?;
+            noRoom(free.push(slots - 1 - i))?;
+        }
+        var inbuf = Vector<u8>.create();
+        var events = Vector<u8>.create();
+        var out = Vector<u8>.create();
+        noRoom(inbuf.resize(65536, 0))?;
+        noRoom(events.resize(quicEventBufferSize(), 0))?;
+        noRoom(out.resize(quicDatagramSize(), 0))?;
+        let state = H3State {
+            streams: streams,
+            free: free,
+            cancels: Vector<i64>.create(),
+            unis: Vector<H3Uni>.create(),
+            leading: false,
+            opened: false,
+            settled: false,
+            broken: false,
+            failure: HttpError.Closed,
+            draining: false,
+            held: 0,
+        };
+        let io = H3Io { socket: socket, conn: conn, peer: address, inbuf: inbuf, events: events, out: out };
+        return Ok(H3Connection {
+            io: RefCell<H3Io?>.create(Some(io)),
+            state: RefCell<H3State>.create(state),
+            signals: signals,
+            outSignal: AsyncSignal.create(),
+            options: options,
+        });
+    }
+
+    /// As `connectTo`, for the server named `host` (a name, or an IP address) at `port`: the first address the name
+    /// has.
+    public async fn connect(
+        tls: borrow QuicTls,
+        host: StringView,
+        port: u16,
+        options: H3Options,
+    ) -> Result<H3Connection, HttpError> {
+        match (SocketAddresses.parseIp(host, port)) {
+            Some(a) => { return H3Connection.connectTo(tls, host, a, options); }
+            null => {}
+        }
+        let found = match (await AsyncDns.resolve(host, port)) {
+            Ok(f) => f,
+            Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); },
+        };
+        if (found.length == 0) {
+            return Err(HttpError.NoAddress);
+        }
+        return H3Connection.connectTo(tls, host, found[0], options);
+    }
+
+    /// Whether the connection takes new requests: it has not failed, and the server has not said it is going away.
+    public fn isUsable(borrow this) -> bool {
+        let guard = this.state.read();
+        let st = guard.data();
+        return !st.broken && !st.draining;
+    }
+
+    /// How many requests are in flight.
+    public fn inFlight(borrow this) -> usize {
+        let guard = this.state.read();
+        return guard.data().held;
+    }
+
+    /// Sends `request` with `body` (empty for none); the whole response is read before this returns.
+    public async fn send(borrow this, request: borrow Request, body: Slice<u8>) -> Result<H3Response, HttpError> =>
+        await exchange(this, request.method(), request.url(), request.urlParts(), request.fieldLines(), body, true);
+
+    /// Sends `request` with `body`; this returns once the response's head has arrived, and the body is read with
+    /// `response.read`.
+    public async fn open(borrow this, request: borrow Request, body: Slice<u8>) -> Result<H3Response, HttpError> =>
+        await exchange(this, request.method(), request.url(), request.urlParts(), request.fieldLines(), body, false);
+
+    /// Tells the server the connection is closing, and closes it. Responses still in flight fail.
+    public async fn close(borrow this) {
+        var io = match (this.io.take()) {
+            Some(i) => i,
+            null => { return; },
+        };
+        {
+            var guard = this.state.write();
+            let st = guard.data();
+            if (!st.broken) {
+                this.failAll(st, HttpError.Closed);
+            }
+        }
+        match (io.conn.closeDatagram(Some(0x100), io.out.viewMut(), Clock.monotonicNanos())) {
+            Ok(n) => {
+                if (n > 0) {
+                    let sent = await io.socket.sendTo(io.out[0..n], io.peer);
+                }
+            }
+            Err(_) => {}
+        }
+        let none = this.io.replace(Some(io));
+    }
+
+    /// Takes a slot for a request and queues it: the slot, or the reason there is none.
+    fn reserve(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: borrow UrlParts,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        buffered: bool,
+    ) -> Result<usize, HttpError> {
+        var guard = this.state.write();
+        let st = guard.data();
+        if (st.broken) {
+            return Err(st.failure);
+        }
+        if (st.draining) {
+            return Err(HttpError.Closed);
+        }
+        let slot = match (st.free.pop()) {
+            Some(s) => s,
+            null => { return Err(HttpError.Net(NetError.LimitExceeded)); },
+        };
+        let s = borrow mut st.streams[slot];
+        s.out.clear();
+        let length: u64? = if (body.length > 0 || Methods.sendsLength(method)) Some(body.length as u64) else null;
+        var built = requestHead(mut s.out, mut s.block, method, url, parts, fields, length);
+        if (built.isOk() && body.length > 0) {
+            built = putVarint(mut s.out, FRAME_DATA);
+            if (built.isOk()) {
+                built = putVarint(mut s.out, body.length as u64);
+            }
+            if (built.isOk()) {
+                built = s.out.extend(body);
+            }
+        }
+        match (built) {
+            Ok() => {}
+            Err(_) => {
+                let back = st.free.push(slot);
+                return Err(HttpErrors.noMemory());
+            }
+        }
+        s.used = true;
+        s.id = NO_STREAM;
+        s.outAt = 0;
+        s.outDone = false;
+        s.blocked = false;
+        s.partial.clear();
+        s.inFrame = false;
+        s.block.clear();
+        s.head.clear();
+        s.spans.clear();
+        s.body.clear();
+        s.taken = 0;
+        s.status = 0;
+        s.headDone = false;
+        s.ended = false;
+        s.failed = false;
+        s.refused = false;
+        s.buffered = buffered;
+        s.headOnly = method is Method.Head;
+        s.hasDeclared = false;
+        s.declared = 0;
+        s.received = 0;
+        s.maxBody = this.options.maxBodyBytes;
+        s.hasTrailers = false;
+        s.trailersAt = 0;
+        s.credit = 0;
+        s.waiting = false;
+        s.want = 0;
+        st.held += 1;
+        if (st.leading) {
+            this.outSignal.raise();
+        }
+        return Ok(slot);
+    }
+
+    /// Whether the stream in `slot` has what `want` names. A failed stream's failure is the error.
+    fn satisfied(borrow this, st: borrow H3State, slot: usize, want: u8) -> Result<bool, HttpError> {
+        let s = borrow st.streams[slot];
+        if (s.failed) {
+            return Err(s.failure);
+        }
+        if (want == WANT_HEAD) {
+            return Ok(s.headDone || s.ended);
+        }
+        if (want == WANT_END) {
+            return Ok(s.ended);
+        }
+        return Ok(s.body.length > s.taken || s.ended);
+    }
+
+    /// Waits until the stream in `slot` has what `want` names, leading the connection if nobody does.
+    async fn progress(borrow this, slot: usize, want: u8) -> Result<void, HttpError> {
+        loop {
+            var lead = false;
+            {
+                var guard = this.state.write();
+                let st = guard.data();
+                if (this.satisfied(st, slot, want)?) {
+                    return Ok();
+                }
+                if (st.leading) {
+                    st.streams[slot].waiting = true;
+                    st.streams[slot].want = want;
+                } else {
+                    st.leading = true;
+                    lead = true;
+                }
+            }
+            if (lead) {
+                let led = await this.lead(slot, want);
+                {
+                    var guard = this.state.write();
+                    let st = guard.data();
+                    st.leading = false;
+                    // Someone else leads now: the first task found waiting.
+                    for (i in 0..st.streams.length) {
+                        if (st.streams[i].waiting) {
+                            st.streams[i].waiting = false;
+                            this.signals[i].raise();
+                            break;
+                        }
+                    }
+                }
+                led?;
+            } else {
+                match (await this.signals[slot].wait()) {
+                    Ok() => {}
+                    Err(e) => {
+                        var guard = this.state.write();
+                        let st = guard.data();
+                        st.streams[slot].waiting = false;
+                        return Err(HttpError.Net(NetErrors.fromAsync(e)));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn lead(borrow this, slot: usize, want: u8) -> Result<void, HttpError> {
+        var io = match (this.io.take()) {
+            Some(i) => i,
+            null => { return Err(HttpError.Closed); },
+        };
+        let led = await this.leadWith(mut io, slot, want);
+        let none = this.io.replace(Some(io));
+        return led;
+    }
+
+    /// The connection's work, until the stream in `slot` has what `want` names. A failure of the connection fails
+    /// every stream on it; a cancelled leader just stops, and the next one goes on.
+    async fn leadWith(borrow this, io: borrow mut H3Io, slot: usize, want: u8) -> Result<void, HttpError> {
+        loop {
+            // What arrived goes to the streams, what the requests queued goes to QUIC.
+            {
+                var guard = this.state.write();
+                let st = guard.data();
+                if (!st.broken) {
+                    match (this.turn(st, io)) {
+                        Ok() => {}
+                        Err(e) => { this.failAll(st, e); }
+                    }
+                }
+            }
+            // QUIC's datagrams go out.
+            loop {
+                let made = io.conn.datagram(io.out.viewMut(), Clock.monotonicNanos());
+                match (made) {
+                    Ok(Some(d)) => {
+                        let to = d.to.socketAddress() ?? io.peer;
+                        match (await io.socket.sendTo(io.out[0..d.length], to)) {
+                            Ok() => {}
+                            Err(AsyncError.Cancelled) => { return Err(HttpError.Net(NetError.Cancelled)); }
+                            Err(_) => { break; } // a datagram the socket would not take is one lost on the way
+                        }
+                    }
+                    Ok(null) => { break; }
+                    Err(e) => {
+                        var guard = this.state.write();
+                        let st = guard.data();
+                        if (!st.broken) {
+                            this.failAll(st, quicError(e));
+                        }
+                        break;
+                    }
+                }
+            }
+            {
+                var guard = this.state.write();
+                let st = guard.data();
+                if (this.satisfied(st, slot, want)?) {
+                    return Ok();
+                }
+                if (st.broken) {
+                    return Err(st.failure);
+                }
+            }
+            // Wait: a datagram, QUIC's next timer, or another task's word.
+            let now = Clock.monotonicNanos();
+            let waitMs: u64 = match (io.conn.nextTimeout()) {
+                Some(t) => if (t <= now) 0 else (t - now + 999999) / 1000000,
+                null => 60000,
+            };
+            var fed: Result<void, QuicError> = Ok();
+            if (waitMs == 0) {
+                fed = io.conn.onTimeout(now);
+            } else {
+                match (await waitFor(io.socket, this.outSignal, io.inbuf.viewMut(), waitMs)) {
+                    Ok(Wake.Datagram(d)) => {
+                        fed = io.conn.feed(QuicAddress.of(d.from), 0, io.inbuf[0..d.length], Clock.monotonicNanos());
+                    }
+                    Ok(Wake.Timer) => {
+                        let t = Clock.monotonicNanos();
+                        match (io.conn.nextTimeout()) {
+                            Some(due) => {
+                                if (due <= t) {
+                                    fed = io.conn.onTimeout(t);
+                                }
+                            }
+                            null => {}
+                        }
+                    }
+                    Ok(Wake.Signal) => {}
+                    Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); }
+                }
+            }
+            match (fed) {
+                Ok() => {}
+                Err(e) => {
+                    var guard = this.state.write();
+                    let st = guard.data();
+                    if (!st.broken) {
+                        this.failAll(st, quicError(e));
+                    }
+                }
+            }
+        }
+    }
+
+    /// One turn of the connection's work that needs no waiting: QUIC's events to the streams, then the streams'
+    /// output, credit and cancellations to QUIC.
+    fn turn(borrow this, st: borrow mut H3State, io: borrow mut H3Io) -> Result<void, HttpError> {
+        loop {
+            let event = match (io.conn.nextEvent(io.events.viewMut())) {
+                Ok(Some(e)) => e,
+                Ok(null) => { break; },
+                Err(e) => { return Err(quicError(e)); },
+            };
+            this.dispatch(st, mut io.conn, io.events.view(), event)?;
+        }
+        if (!io.conn.handshakeDone()) {
+            return Ok();
+        }
+        if (!st.opened) {
+            // Our control stream, with our SETTINGS (RFC 9114 §6.2.1, §7.2.4): how large a response's head may be.
+            var first = Vector<u8>.create();
+            var settings = Vector<u8>.create();
+            noRoom(putVarint(mut settings, SETTINGS_MAX_FIELD_SECTION_SIZE))?;
+            noRoom(putVarint(mut settings, this.options.maxHeadBytes as u64))?;
+            noRoom(first.push(0))?;
+            noRoom(putVarint(mut first, FRAME_SETTINGS))?;
+            noRoom(putVarint(mut first, settings.length as u64))?;
+            noRoom(first.extend(settings.view()))?;
+            let control = match (io.conn.openUniStream()) {
+                Ok(id) => id,
+                Err(e) => { return Err(quicError(e)); },
+            };
+            match (io.conn.writeStream(control, first.view(), false)) {
+                Ok(n) => {
+                    if (n != first.length) {
+                        return Err(HttpError.Net(NetError.Reset));
+                    }
+                }
+                Err(e) => { return Err(quicError(e)); }
+            }
+            st.opened = true;
+        }
+        for (i in 0..st.cancels.length) {
+            let gone = io.conn.resetStream(st.cancels[i], H3_REQUEST_CANCELLED);
+        }
+        st.cancels.clear();
+        var mayOpen = true;
+        for (i in 0..st.streams.length) {
+            let s = borrow mut st.streams[i];
+            if (!s.used) {
+                continue;
+            }
+            if (s.id == NO_STREAM) {
+                if (s.ended || !mayOpen) {
+                    continue;
+                }
+                match (io.conn.openStream()) {
+                    Ok(id) => { s.id = id; }
+                    Err(QuicError.StreamsBlocked) => {
+                        mayOpen = false; // the server allows no more at once: when one of ours ends
+                        continue;
+                    }
+                    Err(e) => { return Err(quicError(e)); }
+                }
+            }
+            if (!s.outDone && !s.blocked && !s.ended) {
+                match (io.conn.writeStream(s.id, s.out[s.outAt..], true)) {
+                    Ok(n) => {
+                        s.outAt += n;
+                        if (s.outAt == s.out.length) {
+                            s.outDone = true;
+                        } else {
+                            s.blocked = true;
+                        }
+                    }
+                    Err(e) => { return Err(quicError(e)); }
+                }
+            }
+            if (s.credit > 0) {
+                io.conn.consume(s.id, s.credit);
+                s.credit = 0;
+            }
+        }
+        return Ok();
+    }
+
+    /// The slot of the request on QUIC stream `id`, or null.
+    fn find(borrow this, st: borrow H3State, id: i64) -> usize? {
+        for (i in 0..st.streams.length) {
+            if (st.streams[i].used && st.streams[i].id == id) {
+                return Some(i);
+            }
+        }
+        return null;
+    }
+
+    /// One QUIC event. An error is the connection's.
+    fn dispatch(
+        borrow this,
+        st: borrow mut H3State,
+        conn: borrow mut QuicConnection,
+        data: Slice<u8>,
+        event: QuicEvent,
+    ) -> Result<void, HttpError> {
+        match (event) {
+            QuicEvent.StreamData(id, n, fin) => {
+                let side = truncate<u8>(id) & 3; // who opened it, and whether it goes both ways
+                if (side == 3) {
+                    conn.consume(id, n as u64);
+                    return this.uniData(st, id, data[0..n], fin);
+                }
+                if (side != 0) {
+                    // A bidirectional stream the server opened: HTTP/3 has none (RFC 9114 §6.1).
+                    return Err(HttpError.Response(Fault.BadFrame));
+                }
+                let slot = match (this.find(st, id)) {
+                    Some(s) => s,
+                    null => {
+                        conn.consume(id, n as u64); // a response nobody waits for any more
+                        return Ok();
+                    },
+                };
+                let s = borrow mut st.streams[slot];
+                if (s.ended) {
+                    conn.consume(id, n as u64);
+                    return Ok();
+                }
+                match (streamData(s, data[0..n], fin, this.options.maxHeadBytes, this.options.maxHeaders)) {
+                    Ok(kept) => {
+                        // Room goes back at once for what nobody has to read: frame headers, fields, and a
+                        // buffered body, which is bounded by `maxBodyBytes`.
+                        let now = if (s.buffered) n else n - kept;
+                        if (now > 0) {
+                            conn.consume(id, now as u64);
+                        }
+                    }
+                    Err(f) => {
+                        conn.consume(id, n as u64);
+                        s.failed = true;
+                        s.failure = HttpError.Response(f);
+                        s.ended = true;
+                        let gone = conn.resetStream(id, H3_GENERAL_PROTOCOL_ERROR);
+                    }
+                }
+                this.wake(st, slot);
+            }
+            QuicEvent.StreamReset(id, code) => {
+                match (this.find(st, id)) {
+                    Some(slot) => {
+                        this.failStream(st, slot, HttpError.Reset(truncate<u32>(code)), code == H3_REQUEST_REJECTED);
+                    }
+                    null => {}
+                }
+            }
+            QuicEvent.StreamClosed(id, code) => {
+                match (this.find(st, id)) {
+                    Some(slot) => {
+                        // Closed without its end having arrived: it was reset.
+                        this.failStream(st, slot, HttpError.Reset(truncate<u32>(code ?? 0)), false);
+                    }
+                    null => {}
+                }
+            }
+            QuicEvent.StopSending(id, code) => {
+                // The server will not read the rest of the request (it may have answered already, §4.1).
+                match (this.find(st, id)) {
+                    Some(slot) => {
+                        if (!st.streams[slot].outDone) {
+                            st.streams[slot].outDone = true;
+                            let stopped = conn.resetSending(id, code);
+                        }
+                    }
+                    null => {}
+                }
+            }
+            QuicEvent.StreamWritable(id) => {
+                match (this.find(st, id)) {
+                    Some(slot) => { st.streams[slot].blocked = false; }
+                    null => {}
+                }
+            }
+            _ => {}
+        }
+        return Ok();
+    }
+
+    /// Bytes of a stream the server opened in its one direction (RFC 9114 §6.2).
+    fn uniData(borrow this, st: borrow mut H3State, id: i64, bytes: Slice<u8>, fin: bool) -> Result<void, HttpError> {
+        var index = st.unis.length;
+        for (i in 0..st.unis.length) {
+            if (st.unis[i].id == id) {
+                index = i;
+            }
+        }
+        if (index == st.unis.length) {
+            noRoom(st.unis.push(H3Uni { id: id, typed: false, kind: 0, pending: Vector<u8>.create() }))?;
+        }
+        var goAway = false;
+        {
+            let u = borrow mut st.unis[index];
+            if (u.typed && u.kind != 0) {
+                return Ok(); // QPACK's streams, which carry nothing when no table is used, and unknown ones
+            }
+            noRoom(u.pending.extend(bytes))?;
+            if (!u.typed) {
+                var at: usize = 0;
+                match (getVarint(u.pending.view(), mut at)) {
+                    Some(kind) => {
+                        u.typed = true;
+                        u.kind = kind;
+                        let rest = u.pending.length - at;
+                        u.pending.copyWithin(at, 0, rest);
+                        u.pending.truncate(rest);
+                    }
+                    null => { return Ok(); }
+                }
+                if (u.kind == 1) {
+                    return Err(HttpError.Response(Fault.BadFrame)); // a push stream: none was allowed (§4.6)
+                }
+                if (u.kind != 0) {
+                    u.pending.clear();
+                    return Ok();
+                }
+            }
+            // The control stream: whole frames.
+            if (fin) {
+                return Err(HttpError.Response(Fault.BadFrame)); // it must stay open (§6.2.1)
+            }
+            var used: usize = 0;
+            loop {
+                var at = used;
+                let kind = match (getVarint(u.pending.view(), mut at)) {
+                    Some(k) => k,
+                    null => { break; },
+                };
+                let length = match (getVarint(u.pending.view(), mut at)) {
+                    Some(l) => l,
+                    null => { break; },
+                };
+                if (length > 65536) {
+                    return Err(HttpError.Response(Fault.BadFrame));
+                }
+                if ((u.pending.length - at) as u64 < length) {
+                    break;
+                }
+                if (!st.settled) {
+                    if (kind != FRAME_SETTINGS) {
+                        return Err(HttpError.Response(Fault.BadFrame)); // SETTINGS comes first (§6.2.1)
+                    }
+                    st.settled = true;
+                } else if (kind == FRAME_SETTINGS || kind == FRAME_DATA || kind == FRAME_HEADERS) {
+                    return Err(HttpError.Response(Fault.BadFrame));
+                } else if (kind == FRAME_GOAWAY) {
+                    goAway = true;
+                }
+                used = at + truncate<usize>(length);
+            }
+            if (used > 0) {
+                let rest = u.pending.length - used;
+                u.pending.copyWithin(used, 0, rest);
+                u.pending.truncate(rest);
+            }
+        }
+        if (goAway && !st.draining) {
+            // The server takes no more requests. Those it has not seen were not acted on.
+            st.draining = true;
+            for (i in 0..st.streams.length) {
+                if (st.streams[i].used && st.streams[i].id == NO_STREAM && !st.streams[i].ended) {
+                    this.failStream(st, i, HttpError.Closed, true);
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Fails every request in flight: the connection is gone.
+    fn failAll(borrow this, st: borrow mut H3State, e: HttpError) {
+        st.broken = true;
+        st.failure = e;
+        for (i in 0..st.streams.length) {
+            if (st.streams[i].used && !st.streams[i].ended) {
+                let unsent = st.streams[i].id == NO_STREAM;
+                this.failStream(st, i, e, unsent);
+            }
+        }
+    }
+
+    fn failStream(borrow this, st: borrow mut H3State, slot: usize, e: HttpError, refused: bool) {
+        let s = borrow mut st.streams[slot];
+        if (s.ended) {
+            return;
+        }
+        s.failed = true;
+        s.failure = e;
+        s.refused = refused;
+        s.ended = true;
+        this.wake(st, slot);
+    }
+
+    fn wake(borrow this, st: borrow mut H3State, slot: usize) {
+        if (st.streams[slot].waiting) {
+            st.streams[slot].waiting = false;
+            this.signals[slot].raise();
+        }
+    }
+
+    /// Moves the response's head, and its body if it is buffered, out of the slot.
+    fn take(
+        borrow this,
+        slot: usize,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+        body: borrow mut Vector<u8>,
+    ) -> H3Taken {
+        var guard = this.state.write();
+        let st = guard.data();
+        let s = borrow mut st.streams[slot];
+        let trailers = if (s.hasTrailers) s.spans.length - s.trailersAt else 0;
+        s.hasTrailers = false;
+        swap(mut s.head, mut head);
+        swap(mut s.spans, mut spans);
+        if (s.buffered) {
+            swap(mut s.body, mut body);
+        }
+        return H3Taken { status: s.status, trailers: trailers };
+    }
+
+    /// Appends the trailers that arrived after `take` to the response's fields: how many.
+    fn takeTrailers(
+        borrow this,
+        slot: usize,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+    ) -> Result<usize, AllocError> {
+        var guard = this.state.write();
+        let st = guard.data();
+        let s = borrow mut st.streams[slot];
+        if (!s.hasTrailers) {
+            return Ok(0);
+        }
+        let base = head.length;
+        head.extend(s.head.view())?;
+        var count: usize = 0;
+        for (i in s.trailersAt..s.spans.length) {
+            let f = s.spans[i];
+            spans.push(HeaderSpan {
+                nameStart: f.nameStart + base,
+                nameEnd: f.nameEnd + base,
+                valueStart: f.valueStart + base,
+                valueEnd: f.valueEnd + base,
+            })?;
+            count += 1;
+        }
+        s.hasTrailers = false;
+        return Ok(count);
+    }
+
+    /// The next bytes of the streamed body in `slot` into `buffer`: at least one, or 0 at its end.
+    async fn read(borrow this, slot: usize, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
+        if (buffer.length == 0) {
+            return Ok(0);
+        }
+        loop {
+            {
+                var guard = this.state.write();
+                let st = guard.data();
+                let s = borrow mut st.streams[slot];
+                if (s.body.length > s.taken) {
+                    var n = s.body.length - s.taken;
+                    if (n > buffer.length) {
+                        n = buffer.length;
+                    }
+                    buffer[0..n].copyFrom(s.body[s.taken..s.taken + n]);
+                    s.taken += n;
+                    s.credit += n as u64;
+                    if (s.taken == s.body.length) {
+                        s.body.clear();
+                        s.taken = 0;
+                    }
+                    if (st.leading) {
+                        this.outSignal.raise(); // the leader gives the server the room back
+                    }
+                    return Ok(n);
+                }
+                if (s.failed) {
+                    return Err(s.failure);
+                }
+                if (s.ended) {
+                    return Ok(0);
+                }
+            }
+            await this.progress(slot, WANT_DATA)?;
+        }
+    }
+
+    fn isComplete(borrow this, slot: usize) -> bool {
+        let guard = this.state.read();
+        let st = guard.data();
+        let s = borrow st.streams[slot];
+        return s.ended && s.body.length == s.taken;
+    }
+
+    /// Whether the request in `slot`, which failed, may be sent again: the server did not act on it.
+    fn wasRefused(borrow this, slot: usize) -> bool {
+        let guard = this.state.read();
+        let st = guard.data();
+        return st.streams[slot].failed && st.streams[slot].refused;
+    }
+
+    /// Gives a slot back, with the buffers its response held. A stream the server has not finished is cancelled.
+    fn release(
+        borrow this,
+        slot: usize,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+        body: borrow mut Vector<u8>,
+    ) {
+        var guard = this.state.write();
+        let st = guard.data();
+        if (!st.streams[slot].used) {
+            return;
+        }
+        let id = st.streams[slot].id;
+        let unfinished = !st.streams[slot].ended || st.streams[slot].failed;
+        if (id != NO_STREAM && unfinished && !st.broken) {
+            let queued = st.cancels.push(id);
+            if (st.leading) {
+                this.outSignal.raise();
+            }
+        }
+        let s = borrow mut st.streams[slot];
+        if (head.capacity > 0) {
+            swap(mut s.head, mut head);
+        }
+        if (spans.capacity > 0) {
+            swap(mut s.spans, mut spans);
+        }
+        if (body.capacity > 0) {
+            swap(mut s.body, mut body);
+        }
+        s.used = false;
+        s.id = NO_STREAM;
+        s.ended = true;
+        s.waiting = false;
+        st.held -= 1;
+        let back = st.free.push(slot);
+    }
+}
+
+struct H3Taken {
+    status: u16;
+    trailers: usize;
+}
+
+/// A datagram into `buffer`, or `waitMs` passed, or `signal` raised: whichever is first. A datagram that arrived as
+/// another won is the answer: it is never dropped.
+async fn waitFor(
+    socket: borrow AsyncUdpSocket,
+    signal: borrow AsyncSignal,
+    buffer: SliceMut<u8>,
+    waitMs: u64,
+) -> Result<Wake, AsyncError> {
+    let raced: Result<Raced<Wake>, AsyncError> = await Async.race(
+        async () => {
+            let d = await socket.recvFrom(buffer)?;
+            return Ok(Wake.Datagram(d));
+        },
+        async () => {
+            let inner: Result<Raced<Wake>, AsyncError> = await Async.race(
+                async () => {
+                    await Timer.sleep(waitMs)?;
+                    return Ok(Wake.Timer);
+                },
+                async () => {
+                    await signal.wait()?;
+                    return Ok(Wake.Signal);
+                },
+            );
+            let w = inner?;
+            return Ok(w.value);
+        },
+    );
+    let won = raced?;
+    if (won.winner == 0) {
+        return Ok(won.value);
+    }
+    return match (won.other) {
+        Some(d) => Ok(d),
+        null => Ok(won.value),
+    };
+}
+
+/// Appends a request's HEADERS frame to `out`; `block` is room for the field section.
+fn requestHead(
+    out: borrow mut Vector<u8>,
+    block: borrow mut Vector<u8>,
+    method: Method,
+    url: Slice<u8>,
+    parts: borrow UrlParts,
+    fields: Slice<u8>,
+    length: u64?,
+) -> Result<void, AllocError> {
+    block.clear();
+    qpackPrefix(mut block)?;
+    qpackField(mut block, ":method".bytes(), Methods.token(method).bytes())?;
+    qpackField(mut block, ":scheme".bytes(), (if (parts.secure) "https" else "http").bytes())?;
+    qpackNamed(mut block, 0, parts.authority(url), false)?;
+    let target = parts.target(url);
+    if (target.length == 0) {
+        qpackIndexed(mut block, 1)?; // `:path: /`
+    } else if (target[0] == '?') {
+        var path = Vector<u8>.create();
+        path.push('/')?;
+        path.extend(target)?;
+        qpackNamed(mut block, 1, path.view(), false)?;
+    } else {
+        qpackField(mut block, ":path".bytes(), target)?;
+    }
+    var at: usize = 0;
+    while (at < fields.length) {
+        let rest = fields[at..];
+        let end = rest.indexOfByte('\n') ?? rest.length;
+        var line = rest[0..end];
+        at += end + 1;
+        if (line.length > 0 && line[line.length - 1] == '\r') {
+            line = line[0..line.length - 1];
+        }
+        let colon = match (line.indexOfByte(':')) {
+            Some(c) => c,
+            null => { continue; },
+        };
+        let name = line[0..colon];
+        let value = line[colon + 1..].trim();
+        // Fields about an HTTP/1.1 connection do not go over HTTP/3 (RFC 9114 §4.2); `te` only as `trailers`.
+        if (name.equalsIgnoreAsciiCase("connection".bytes()) || name.equalsIgnoreAsciiCase("keep-alive".bytes()) ||
+            name.equalsIgnoreAsciiCase("proxy-connection".bytes()) || name.equalsIgnoreAsciiCase("upgrade".bytes()) ||
+            name.equalsIgnoreAsciiCase("transfer-encoding".bytes()) || name.equalsIgnoreAsciiCase("host".bytes())) {
+            continue;
+        }
+        if (name.equalsIgnoreAsciiCase("te".bytes()) && !value.equalsIgnoreAsciiCase("trailers".bytes())) {
+            continue;
+        }
+        qpackField(mut block, name, value)?;
+    }
+    match (length) {
+        Some(n) => {
+            var digits = [0u8; 20];
+            var k: usize = 20;
+            var v = n;
+            loop {
+                k -= 1;
+                digits[k] = '0' + truncate<u8>(v % 10);
+                v = v / 10;
+                if (v == 0) {
+                    break;
+                }
+            }
+            qpackField(mut block, "content-length".bytes(), digits[k..])?;
+        }
+        null => {}
+    }
+    putVarint(mut out, FRAME_HEADERS)?;
+    putVarint(mut out, block.length as u64)?;
+    return out.extend(block.view());
+}
+
+/// Bytes of a response's stream: frames, cut anywhere. How many of the bytes were kept as body. A fault is the
+/// stream's.
+fn streamData(
+    s: borrow mut H3Stream,
+    bytes: Slice<u8>,
+    fin: bool,
+    maxHead: usize,
+    maxHeaders: usize,
+) -> Result<usize, Fault> {
+    var at: usize = 0;
+    var kept: usize = 0;
+    while (at < bytes.length) {
+        if (!s.inFrame) {
+            // A frame's header: its type and its length, each a variable-length integer.
+            var kind: u64 = 0;
+            var length: u64 = 0;
+            var whole = false;
+            if (s.partial.length == 0) {
+                var p = at;
+                match (getVarint(bytes, mut p)) {
+                    Some(k) => {
+                        match (getVarint(bytes, mut p)) {
+                            Some(l) => {
+                                kind = k;
+                                length = l;
+                                whole = true;
+                                at = p;
+                            }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+                if (!whole) {
+                    match (s.partial.extend(bytes[at..])) {
+                        Ok() => {}
+                        Err(_) => { return Err(Fault.HeadTooLarge); }
+                    }
+                    at = bytes.length;
+                }
+            } else {
+                match (s.partial.push(bytes[at])) {
+                    Ok() => {}
+                    Err(_) => { return Err(Fault.HeadTooLarge); }
+                }
+                at += 1;
+                var p: usize = 0;
+                match (getVarint(s.partial.view(), mut p)) {
+                    Some(k) => {
+                        match (getVarint(s.partial.view(), mut p)) {
+                            Some(l) => {
+                                kind = k;
+                                length = l;
+                                whole = true;
+                            }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+                if (whole) {
+                    s.partial.clear();
+                }
+            }
+            if (!whole) {
+                continue;
+            }
+            if (kind == FRAME_HEADERS) {
+                if (length > maxHead as u64 * 2 + 1024) {
+                    return Err(Fault.HeadTooLarge);
+                }
+                s.block.clear();
+            } else if (kind == FRAME_DATA) {
+                if (!s.headDone || s.hasTrailers) {
+                    return Err(Fault.BadFrame); // a body before its head, or after its trailers (RFC 9114 §4.1)
+                }
+            } else if (kind == FRAME_SETTINGS || kind == FRAME_GOAWAY || kind == 3 || kind == 5 || kind == 13) {
+                return Err(Fault.BadFrame); // frames of the control stream, or of server push
+            }
+            s.inFrame = true;
+            s.frameType = kind;
+            s.frameLeft = length;
+        } else {
+            var n = bytes.length - at;
+            if (n as u64 > s.frameLeft) {
+                n = truncate<usize>(s.frameLeft);
+            }
+            let chunk = bytes[at..at + n];
+            if (s.frameType == FRAME_DATA) {
+                s.received += n as u64;
+                if (s.headOnly || s.received > s.maxBody) {
+                    return Err(if (s.headOnly) Fault.BadFrame else Fault.BodyTooLarge);
+                }
+                if (s.hasDeclared && s.received > s.declared) {
+                    return Err(Fault.BadContentLength);
+                }
+                match (s.body.extend(chunk)) {
+                    Ok() => {}
+                    Err(_) => { return Err(Fault.BodyTooLarge); }
+                }
+                kept += n;
+            } else if (s.frameType == FRAME_HEADERS) {
+                match (s.block.extend(chunk)) {
+                    Ok() => {}
+                    Err(_) => { return Err(Fault.HeadTooLarge); }
+                }
+            }
+            at += n;
+            s.frameLeft -= n as u64;
+        }
+        if (s.inFrame && s.frameLeft == 0) {
+            s.inFrame = false;
+            if (s.frameType == FRAME_HEADERS) {
+                streamFields(s, maxHead, maxHeaders)?;
+            }
+        }
+    }
+    if (fin) {
+        if (s.inFrame || s.partial.length > 0 || !s.headDone) {
+            return Err(Fault.Truncated);
+        }
+        if (s.hasDeclared && !s.headOnly && s.status != 304 && s.received != s.declared) {
+            return Err(Fault.Truncated);
+        }
+        s.ended = true;
+    }
+    return Ok(kept);
+}
+
+/// A whole field section in `s.block`: the response's head, an interim response's, or the trailers.
+fn streamFields(s: borrow mut H3Stream, maxHead: usize, maxHeaders: usize) -> Result<void, Fault> {
+    if (s.headDone) {
+        if (s.hasTrailers) {
+            return Err(Fault.BadFrame);
+        }
+        let at = s.spans.length;
+        qpackDecode(s.block.view(), mut s.head, mut s.spans, maxHead * 2, maxHeaders * 2)?;
+        s.hasTrailers = true;
+        s.trailersAt = at;
+        return Ok();
+    }
+    s.head.clear();
+    s.spans.clear();
+    qpackDecode(s.block.view(), mut s.head, mut s.spans, maxHead, maxHeaders)?;
+    // `:status` comes first, three digits (RFC 9114 §4.3.2).
+    var status: u16 = 0;
+    if (s.spans.length > 0) {
+        let first = s.spans[0];
+        if (first.valueEnd - first.valueStart == 3 && s.head[first.nameStart..first.nameEnd] == ":status".bytes()) {
+            for (k in first.valueStart..first.valueEnd) {
+                let d = s.head[k];
+                if (d < '0' || d > '9') {
+                    status = 1000;
+                    break;
+                }
+                status = status * 10 + (d - '0') as u16;
+            }
+        }
+    }
+    if (status < 100 || status > 999) {
+        return Err(Fault.BadStatusLine);
+    }
+    if (status < 200) {
+        return Ok(); // an interim response: the next field section replaces it
+    }
+    s.status = status;
+    for (i in 1..s.spans.length) {
+        let f = s.spans[i];
+        if (s.head[f.nameStart..f.nameEnd] == "content-length".bytes()) {
+            match (s.head[f.valueStart..f.valueEnd].parseInt<u64>()) {
+                Some(n) => {
+                    s.hasDeclared = true;
+                    s.declared = n;
+                }
+                null => { return Err(Fault.BadContentLength); }
+            }
+        }
+    }
+    s.headDone = true;
+    return Ok();
+}
+
+/// A request sent and its response awaited: to its end for a buffered response, to its head for a streamed one.
+async fn exchange<region c>(
+    conn: borrow(c) H3Connection,
+    method: Method,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    body: Slice<u8>,
+    buffered: bool,
+) -> Result<H3Response<c>, HttpError> {
+    let slot = conn.reserve(method, url, parts, fields, body, buffered)?;
+    var response = H3Response {
+        conn: conn,
+        slot: slot,
+        code: 0,
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+        data: Vector<u8>.create(),
+        streamed: !buffered,
+        trailers: 0,
+        refused: false,
+    };
+    let want = if (buffered) WANT_END else WANT_HEAD;
+    let limit = conn.options.responseMs;
+    let done = if (limit == 0) await conn.progress(slot, want) else await Async.timeout(
+        limit,
+        HttpError.Net(NetError.TimedOut),
+        async () => await conn.progress(slot, want),
+    );
+    match (done) {
+        Ok() => {}
+        Err(e) => {
+            // Dropping the response gives the slot back and cancels the stream.
+            return Err(if (conn.wasRefused(slot)) HttpError.Net(NetError.Closed) else e);
+        }
+    }
+    let taken = conn.take(slot, mut response.head, mut response.spans, mut response.data);
+    response.code = taken.status;
+    response.trailers = taken.trailers;
+    return Ok(response);
+}
+
+/// A response over HTTP/3. It holds its place on the connection until it is dropped.
+@noncopy
+public struct H3Response<region c> {
+    private conn: borrow(c) H3Connection;
+    private slot: usize;
+    private code: u16;
+    /// The fields (`:status` first), then the trailers.
+    private head: Vector<u8>;
+    private spans: Vector<HeaderSpan>;
+    private data: Vector<u8>;
+    private streamed: bool;
+    private trailers: usize;
+    private refused: bool;
+
+    /// The status code.
+    public fn status(borrow this) -> u16 => this.code;
+
+    /// The whole body of a buffered response (`send`); empty for a streamed one.
+    public fn body(borrow this) -> Slice<u8> => this.data.view();
+
+    /// How many fields the response has, `:status` not counted.
+    public fn headerCount(borrow this) -> usize =>
+        if (this.spans.length > 0) this.spans.length - 1 - this.trailers else 0;
+
+    /// Field `i`'s name (lowercase) and value.
+    public fn name(borrow this, i: usize) -> Slice<u8> =>
+        this.head[this.spans[i + 1].nameStart..this.spans[i + 1].nameEnd];
+
+    public fn value(borrow this, i: usize) -> Slice<u8> =>
+        this.head[this.spans[i + 1].valueStart..this.spans[i + 1].valueEnd];
+
+    /// The value of the first field named `name` (ASCII case ignored).
+    public fn header(borrow this, name: StringView) -> Slice<u8>? {
+        for (i in 0..this.headerCount()) {
+            if (this.name(i).equalsIgnoreAsciiCase(name.bytes())) {
+                return Some(this.value(i));
+            }
+        }
+        return null;
+    }
+
+    /// How many trailers the response has; a streamed response has them once `read` has given 0.
+    public fn trailerCount(borrow this) -> usize => this.trailers;
+
+    /// The value of the first trailer named `name` (ASCII case ignored).
+    public fn trailer(borrow this, name: StringView) -> Slice<u8>? {
+        let from = this.spans.length - this.trailers;
+        for (i in from..this.spans.length) {
+            let s = this.spans[i];
+            if (this.head[s.nameStart..s.nameEnd].equalsIgnoreAsciiCase(name.bytes())) {
+                return Some(this.head[s.valueStart..s.valueEnd]);
+            }
+        }
+        return null;
+    }
+
+    /// The next bytes of a streamed response's body (`open`) into `buffer`: at least one, or 0 at its end.
+    public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
+        if (!this.streamed) {
+            return Ok(0);
+        }
+        let n = await this.conn.read(this.slot, buffer)?;
+        if (n == 0 && this.trailers == 0) {
+            match (this.conn.takeTrailers(this.slot, mut this.head, mut this.spans)) {
+                Ok(count) => { this.trailers = count; }
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+        }
+        return Ok(n);
+    }
+
+    /// Whether the whole response has been read.
+    public fn isComplete(borrow this) -> bool => !this.streamed || this.conn.isComplete(this.slot);
+
+    drop {
+        this.conn.release(this.slot, mut this.head, mut this.spans, mut this.data);
+    }
+}

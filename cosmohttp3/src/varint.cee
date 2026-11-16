@@ -1,0 +1,45 @@
+// QUIC's variable-length integers (RFC 9000 §16): 1, 2, 4 or 8 bytes, the first two bits saying which, for values
+// up to 2^62 - 1. HTTP/3 writes its frame types, lengths, stream types and settings with them.
+
+/// The largest value a variable-length integer holds.
+public const VARINT_MAX: u64 = 0x3FFFFFFFFFFFFFFF;
+
+/// Appends `value` in the fewest bytes. A value above `VARINT_MAX` loses its top two bits: callers pass lengths
+/// and small constants.
+public fn putVarint(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    if (value < 64) {
+        return out.push(truncate<u8>(value));
+    }
+    if (value < 16384) {
+        out.push(0x40 | truncate<u8>(value >> 8))?;
+        return out.push(truncate<u8>(value));
+    }
+    var bytes = [0u8; 8];
+    if (value < 1073741824) {
+        bytes.writeBE(0, truncate<u32>(value) | 0x80000000);
+        return out.extend(bytes[0..4]);
+    }
+    bytes.writeBE(0, (value & VARINT_MAX) | 0xC000000000000000);
+    return out.extend(bytes[..]);
+}
+
+/// How many bytes the variable-length integer that starts with `first` takes.
+public fn varintLength(first: u8) -> usize => (1 as usize) << ((first >> 6) as usize);
+
+/// The variable-length integer at `bytes[*at]`, `*at` moved past it; null if it is not all there (`*at` stays).
+public fn getVarint(bytes: Slice<u8>, at: borrow mut usize) -> u64? {
+    let from = *at;
+    if (from >= bytes.length) {
+        return null;
+    }
+    let size = varintLength(bytes[from]);
+    if (bytes.length - from < size) {
+        return null;
+    }
+    var value = (bytes[from] & 0x3F) as u64;
+    for (i in 1..size) {
+        value = (value << 8) | bytes[from + i] as u64;
+    }
+    *at = from + size;
+    return Some(value);
+}

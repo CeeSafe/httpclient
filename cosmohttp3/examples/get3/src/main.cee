@@ -1,0 +1,103 @@
+// GET a URL over HTTP/3 and print the status, the fields and the size of the body:
+//
+//   get3 https://example.com/ [count]
+//
+// With a count, the request is sent that many times over the one connection.
+import web_core;
+import web_tls;
+import web_quic;
+import cosmohttp;
+import cosmohttp3;
+
+async fn fetch(tls: borrow QuicTls, request: borrow Request, count: u64) -> Result<void, AsyncError> {
+    let parts = request.urlParts();
+    let host = StringView.fromUtf8(parts.host(request.url())) ?? "";
+    let conn = match (await H3Connection.connect(tls, host, parts.port, H3Options.defaults())) {
+        Ok(c) => c,
+        Err(e) => {
+            await AsyncConsole.writeLine(HttpErrors.describe(e))?;
+            return Ok();
+        },
+    };
+    for (k in 0..count) {
+        let started = Clock.monotonicNanos();
+        let response = match (await conn.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => {
+                await AsyncConsole.writeLine(HttpErrors.describe(e))?;
+                return Ok();
+            },
+        };
+        var line = String.create();
+        line.append("HTTP/3 ")!;
+        line.appendNumber(response.status() as u64)!;
+        line.append(", ")!;
+        line.appendNumber(response.body().length as u64)!;
+        line.append(" bytes, ")!;
+        line.appendNumber((Clock.monotonicNanos() - started) / 1000)!;
+        line.append(" us")!;
+        await AsyncConsole.writeLine(line.view())?;
+        if (k == 0) {
+            for (i in 0..response.headerCount()) {
+                var field = String.create();
+                let named = field.appendUtf8(response.name(i))!;
+                field.append(": ")!;
+                let valued = field.appendUtf8(response.value(i))!;
+                await AsyncConsole.writeLine(field.view())?;
+            }
+        }
+    }
+    await conn.close();
+    return Ok();
+}
+
+fn context() -> Result<TlsConfig, TlsSetupError> {
+    var config = TlsConfig.client()?;
+    config.trustSystem()?;
+    let h3 = [Alpn.Http3];
+    config.setAlpn(h3[..])?;
+    return Ok(config);
+}
+
+fn main() {
+    let url = match (Process.argument(1)) {
+        Some(u) => u,
+        null => {
+            Console.writeLine("usage: get3 <https url> [count]");
+            return;
+        },
+    };
+    let count = match (Process.argument(2)) {
+        Some(c) => c.parseInt<u64>() ?? 1,
+        null => 1,
+    };
+    let request = match (Request.create(Method.Get, url)) {
+        Ok(r) => r,
+        Err(_) => {
+            Console.writeLine("get3: not a URL");
+            return;
+        },
+    };
+    if (!QuicLibrary.initialise()) {
+        Console.writeLine("get3: the QUIC library did not start (OpenSSL 3.5 or later is needed)");
+        return;
+    }
+    let config = match (context()) {
+        Ok(c) => c,
+        Err(_) => {
+            Console.writeLine("get3: could not set up TLS");
+            return;
+        },
+    };
+    let tls = match (QuicTls.of(config)) {
+        Ok(t) => t,
+        Err(_) => {
+            Console.writeLine("get3: could not set up QUIC's TLS");
+            return;
+        },
+    };
+    match (Async.run(fetch(tls, request, count))) {
+        Ok() => {}
+        Err(_) => { Console.writeLine("get3: failed"); }
+    }
+}

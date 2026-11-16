@@ -246,7 +246,8 @@ not the same measurement.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
+Of CosmoHttpClient's surface: HTTP/3 inside this client (it is a package of its own, [cosmohttp3](cosmohttp3), one
+connection at a time for now) and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache. A name
 with several addresses is tried one address at a time, not raced. In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests

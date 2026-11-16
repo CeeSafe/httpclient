@@ -1,0 +1,475 @@
+// The HTTP/3 connection against a server in the same process: web_quic's server over UDP on the loopback, with an
+// HTTP/3 responder written here from this package's own frames and QPACK encoder.
+import web_core;
+import web_tls;
+import web_quic;
+import cosmohttp;
+
+fn failed(e: HttpError) -> TestFailure => TestFailure.create(HttpErrors.describe(e));
+
+fn pattern(i: usize) -> u8 => 97 + truncate<u8>(i % 26);
+
+/// A request the test server is answering.
+struct Asked {
+    stream: i64;
+    input: Vector<u8>;
+    out: Vector<u8>;
+    outAt: usize;
+    started: bool;
+    done: bool;
+}
+
+/// The test server's application: one HTTP/3 connection.
+struct Responder {
+    unused: u8;
+}
+
+fn quicMade<T>(r: Result<T, AllocError>) -> Result<T, QuicError> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(QuicError.NoMemory); }
+    }
+}
+
+/// A HEADERS frame with `status` and `fields` (name, value, name, value...).
+fn headersFrame(out: borrow mut Vector<u8>, status: StringView, fields: Slice<StringView>) -> Result<void, AllocError> {
+    var block = Vector<u8>.create();
+    qpackPrefix(mut block)?;
+    if (status.length > 0) {
+        qpackField(mut block, ":status".bytes(), status.bytes())?;
+    }
+    var i: usize = 0;
+    while (i < fields.length) {
+        qpackField(mut block, fields[i].bytes(), fields[i + 1].bytes())?;
+        i += 2;
+    }
+    putVarint(mut out, 1)?;
+    putVarint(mut out, block.length as u64)?;
+    return out.extend(block.view());
+}
+
+fn dataFrame(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    putVarint(mut out, 0)?;
+    putVarint(mut out, bytes.length as u64)?;
+    return out.extend(bytes);
+}
+
+/// The answer to the request in `input` into `out`; false if the stream is to be reset instead.
+fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    var head = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    var body = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < input.length) {
+        let kind = getVarint(input, mut at) ?? 0;
+        let length = truncate<usize>(getVarint(input, mut at) ?? 0);
+        if (input.length - at < length) {
+            break;
+        }
+        if (kind == 1) {
+            let decoded = qpackDecode(input[at..at + length], mut head, mut spans, 65536, 100);
+        } else if (kind == 0) {
+            body.extend(input[at..at + length])?;
+        }
+        at += length;
+    }
+    var path = "".bytes();
+    var method = "".bytes();
+    var agent = "".bytes();
+    var authority = "".bytes();
+    for (i in 0..spans.length) {
+        let name = head[spans[i].nameStart..spans[i].nameEnd];
+        let value = head[spans[i].valueStart..spans[i].valueEnd];
+        if (name == ":path".bytes()) {
+            path = value;
+        } else if (name == ":method".bytes()) {
+            method = value;
+        } else if (name == "user-agent".bytes()) {
+            agent = value;
+        } else if (name == ":authority".bytes()) {
+            authority = value;
+        }
+    }
+    if (path == "/hello".bytes()) {
+        headersFrame(mut out, "200", ["content-type", "text/plain", "content-length", "13"][..])?;
+        dataFrame(mut out, "hello over h3".bytes())?;
+    } else if (path == "/echo?x=1".bytes()) {
+        let m = StringView.fromUtf8(method) ?? "";
+        let a = StringView.fromUtf8(agent) ?? "";
+        let h = StringView.fromUtf8(authority) ?? "";
+        headersFrame(mut out, "200", ["x-method", m, "x-agent", a, "x-authority", h][..])?;
+        dataFrame(mut out, body.view())?;
+    } else if (path == "/big".bytes()) {
+        headersFrame(mut out, "200", ["content-type", "application/octet-stream"][..])?;
+        var piece = Vector<u8>.create();
+        var sent: usize = 0;
+        while (sent < 3145728) {
+            piece.clear();
+            var n: usize = 100000;
+            if (n > 3145728 - sent) {
+                n = 3145728 - sent;
+            }
+            for (k in 0..n) {
+                piece.push(pattern(sent + k))?;
+            }
+            dataFrame(mut out, piece.view())?;
+            sent += n;
+        }
+    } else if (path == "/trailers".bytes()) {
+        headersFrame(mut out, "200", ["trailer", "x-checksum"][..])?;
+        dataFrame(mut out, "body".bytes())?;
+        headersFrame(mut out, "", ["x-checksum", "abc"][..])?;
+    } else if (path == "/interim".bytes()) {
+        headersFrame(mut out, "103", ["link", "</s.css>; rel=preload"][..])?;
+        headersFrame(mut out, "200", ["content-length", "5"][..])?;
+        dataFrame(mut out, "final".bytes())?;
+    } else if (path == "/split".bytes()) {
+        headersFrame(mut out, "200", [])?;
+        dataFrame(mut out, "ab".bytes())?;
+        dataFrame(mut out, "".bytes())?;
+        // A frame of a type nobody knows (RFC 9114 §7.2.8): skipped.
+        putVarint(mut out, 0x21)?;
+        putVarint(mut out, 3)?;
+        out.extend("xyz".bytes())?;
+        dataFrame(mut out, "cd".bytes())?;
+    } else if (path == "/short".bytes()) {
+        headersFrame(mut out, "200", ["content-length", "10"][..])?;
+        dataFrame(mut out, "four".bytes())?;
+    } else if (path == "/nothing".bytes()) {
+        headersFrame(mut out, "204", [])?;
+    } else if (path == "/reset".bytes()) {
+        return Ok(false);
+    } else {
+        headersFrame(mut out, "404", ["content-length", "0"][..])?;
+    }
+    return Ok(true);
+}
+
+impl QuicApplication for Responder {
+    async fn connection(borrow this, link: borrow mut QuicLink) -> Result<void, QuicError> {
+        var buffer = Vector<u8>.create();
+        quicMade(buffer.resize(quicEventBufferSize(), 0))?;
+        var asked = Vector<Asked>.create();
+        var control = false;
+        loop {
+            let event = match (await link.next(buffer.viewMut())) {
+                Ok(e) => e,
+                Err(QuicError.Draining) => { return Ok(); },
+                Err(QuicError.IdleTimeout) => { return Ok(); },
+                Err(e) => { return Err(e); },
+            };
+            if (!control && link.handshakeDone()) {
+                // The control stream, with empty SETTINGS.
+                let id = link.openUniStream()?;
+                let first = [0u8, 4, 0];
+                let _ = link.writeStream(id, first[..], false)?;
+                control = true;
+            }
+            match (event) {
+                QuicEvent.StreamData(stream, n, fin) => {
+                    if ((truncate<u8>(stream) & 3) == 0) {
+                        var k = asked.length;
+                        for (i in 0..asked.length) {
+                            if (asked[i].stream == stream) {
+                                k = i;
+                            }
+                        }
+                        if (k == asked.length) {
+                            quicMade(asked.push(Asked {
+                                stream: stream,
+                                input: Vector<u8>.create(),
+                                out: Vector<u8>.create(),
+                                outAt: 0,
+                                started: false,
+                                done: false,
+                            }))?;
+                        }
+                        quicMade(asked[k].input.extend(buffer.view()[0..n]))?;
+                        if (fin && !asked[k].started) {
+                            asked[k].started = true;
+                            var out = Vector<u8>.create();
+                            let answered = quicMade(answer(asked[k].input.view(), mut out))?;
+                            if (answered) {
+                                asked[k].out = out;
+                            } else {
+                                asked[k].done = true;
+                                link.resetStream(stream, 0x10b)?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for (i in 0..asked.length) {
+                if (asked[i].started && !asked[i].done) {
+                    let n = link.writeStream(asked[i].stream, asked[i].out[asked[i].outAt..], true)?;
+                    asked[i].outAt += n;
+                    if (asked[i].outAt == asked[i].out.length) {
+                        asked[i].done = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Pair {
+    server: QuicTls;
+    client: QuicTls;
+    serverConfig: TlsConfig;
+    clientConfig: TlsConfig;
+}
+
+fn configs() -> Result<Pair, TestFailure> {
+    var serverConfig = match (TlsConfig.server(serverPem().bytes(), serverKey().bytes())) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("the server configuration")); },
+    };
+    let alpn = [Alpn.Http3];
+    var clientConfig = match (TlsConfig.client()) {
+        Ok(c) => c,
+        Err(_) => { return Err(TestFailure.create("the client configuration")); },
+    };
+    if (serverConfig.setAlpn(alpn[..]).isErr() || clientConfig.trustPem(caPem().bytes()).isErr() ||
+        clientConfig.setAlpn(alpn[..]).isErr()) {
+        return Err(TestFailure.create("the TLS settings"));
+    }
+    let server = match (QuicTls.of(serverConfig)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("the server's QUIC context")); },
+    };
+    let client = match (QuicTls.of(clientConfig)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("the client's QUIC context")); },
+    };
+    return Ok(Pair { server: server, client: client, serverConfig: serverConfig, clientConfig: clientConfig });
+}
+
+fn asking(method: Method, url: StringView) -> Result<Request, TestFailure> {
+    return match (Request.create(method, url)) {
+        Ok(r) => Ok(r),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+async fn getOne(conn: borrow H3Connection, url: StringView, status: u64, body: StringView) -> Result<void, TestFailure> {
+    let request = asking(Method.Get, url)?;
+    let response = match (await conn.send(request, "".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(status, response.status() as u64)?;
+    return Check.equalBytes(body.bytes(), response.body());
+}
+
+/// What the client does, against the server at `server`.
+async fn scenarios(tls: borrow QuicTls, server: SocketAddress) -> Result<void, TestFailure> {
+    let conn = match (H3Connection.connectTo(tls, "localhost", server, H3Options.defaults())) {
+        Ok(c) => c,
+        Err(e) => { return Err(failed(e)); },
+    };
+    // The first request carries the handshake.
+    {
+        let request = asking(Method.Get, "https://localhost/hello")?;
+        let response = match (await conn.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("hello over h3".bytes(), response.body())?;
+        Check.equalU64(2, response.headerCount() as u64)?;
+        Check.equalBytes("content-type".bytes(), response.name(0))?;
+        match (response.header("Content-Type")) {
+            Some(v) => { Check.equalBytes("text/plain".bytes(), v)?; }
+            null => { return Check.fail("a field"); }
+        }
+        Check.isTrue(response.header("x-none") == null, "no such field")?;
+        Check.equalU64(1, conn.inFlight() as u64)?;
+    }
+    Check.equalU64(0, conn.inFlight() as u64)?;
+    // A body up and back, the request's fields, a query without a path's rest.
+    {
+        var request = asking(Method.Post, "https://localhost:4433/echo?x=1")?;
+        match (request.header("User-Agent", "cosmohttp3-test")) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+        match (request.header("Connection", "close")) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+        var upload = Vector<u8>.create();
+        var filled: usize = 0;
+        while (filled < 300000) {
+            filled += 1;
+            if (upload.push(pattern(filled * 7)).isErr()) {
+                return Err(TestFailure.create("out of memory"));
+            }
+        }
+        let response = match (await conn.send(request, upload.view())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes(upload.view(), response.body())?;
+        Check.equalBytes("POST".bytes(), response.header("x-method") ?? "".bytes())?;
+        Check.equalBytes("cosmohttp3-test".bytes(), response.header("x-agent") ?? "".bytes())?;
+        Check.equalBytes("localhost:4433".bytes(), response.header("x-authority") ?? "".bytes())?;
+    }
+    await getOne(conn, "https://localhost/split", 200, "abcd")?;
+    await getOne(conn, "https://localhost/interim", 200, "final")?;
+    await getOne(conn, "https://localhost/nothing", 204, "")?;
+    await getOne(conn, "https://localhost/missing", 404, "")?;
+    // Trailers.
+    {
+        let request = asking(Method.Get, "https://localhost/trailers")?;
+        let response = match (await conn.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("body".bytes(), response.body())?;
+        Check.equalU64(1, response.headerCount() as u64)?;
+        Check.equalU64(1, response.trailerCount() as u64)?;
+        Check.equalBytes("abc".bytes(), response.trailer("X-Checksum") ?? "".bytes())?;
+        Check.isTrue(response.header("x-checksum") == null, "a trailer is not a field")?;
+    }
+    // A large body, buffered: three megabytes through the flow-control window of one.
+    {
+        let request = asking(Method.Get, "https://localhost/big")?;
+        let response = match (await conn.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(3145728, response.body().length as u64)?;
+        var good = true;
+        let body = response.body();
+        for (i in 0..body.length) {
+            if (body[i] != pattern(i)) {
+                good = false;
+            }
+        }
+        Check.isTrue(good, "the large body's bytes")?;
+    }
+    // The same, streamed: the server gets room back only as the body is read.
+    {
+        let request = asking(Method.Get, "https://localhost/big")?;
+        var response = match (await conn.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.isTrue(!response.isComplete(), "the body is still to be read")?;
+        var piece = [0u8; 30000];
+        var total: usize = 0;
+        var good = true;
+        loop {
+            let n = match (await response.read(mut piece[..])) {
+                Ok(n) => n,
+                Err(e) => { return Err(failed(e)); },
+            };
+            if (n == 0) {
+                break;
+            }
+            for (i in 0..n) {
+                if (piece[i] != pattern(total + i)) {
+                    good = false;
+                }
+            }
+            total += n;
+        }
+        Check.equalU64(3145728, total as u64)?;
+        Check.isTrue(good, "the streamed body's bytes")?;
+        Check.isTrue(response.isComplete(), "read to the end")?;
+    }
+    // Responses that fail: one the server resets, one shorter than it said. The connection goes on.
+    {
+        let request = asking(Method.Get, "https://localhost/reset")?;
+        Check.isTrue((await conn.send(request, "".bytes())).isErr(), "a reset stream")?;
+        let short = asking(Method.Get, "https://localhost/short")?;
+        Check.isTrue((await conn.send(short, "".bytes())).isErr(), "a body cut short")?;
+    }
+    Check.equalU64(0, conn.inFlight() as u64)?;
+    Check.isTrue(conn.isUsable(), "the connection is still good")?;
+    // A streamed response dropped half read: its stream is cancelled, the next request is unharmed.
+    {
+        let request = asking(Method.Get, "https://localhost/big")?;
+        var response = match (await conn.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var piece = [0u8; 1000];
+        let n = match (await response.read(mut piece[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(n > 0, "some of the body")?;
+    }
+    await getOne(conn, "https://localhost/hello", 200, "hello over h3")?;
+    // Many at once on the one connection.
+    await Async.scope(TestFailure.create("out of memory"), (s) => {
+        s.spawn(async () => await getOne(conn, "https://localhost/hello", 200, "hello over h3"));
+        s.spawn(async () => await getOne(conn, "https://localhost/split", 200, "abcd"));
+        s.spawn(async () => await getOne(conn, "https://localhost/interim", 200, "final"));
+        s.spawn(async () => await getOne(conn, "https://localhost/missing", 404, ""));
+        s.spawn(async () => await getOne(conn, "https://localhost/hello", 200, "hello over h3"));
+        s.spawn(async () => await getOne(conn, "https://localhost/nothing", 204, ""));
+    })?;
+    Check.equalU64(0, conn.inFlight() as u64)?;
+    await conn.close();
+    let late = asking(Method.Get, "https://localhost/hello")?;
+    Check.isTrue((await conn.send(late, "".bytes())).isErr(), "nothing after close")?;
+    return Ok();
+}
+
+enum Ended {
+    Server,
+    Client,
+    ClientFailed(TestFailure),
+}
+
+@test
+async fn requestsOverHttp3() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "the QUIC library")?;
+    let p = configs()?;
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    let tls = match (Arc<QuicTls>.create(p.server)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { unused: 0 })) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await QuicServer.serve(socket, local, tls, app, QuicServerOptions.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await scenarios(p.client, local)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return match (raced) {
+        Ok(won) => match (won.value) {
+            Ended.Client => Ok(),
+            Ended.ClientFailed(e) => Err(e),
+            Ended.Server => Err(TestFailure.create("the server ended before the client")),
+        },
+        Err(_) => Err(TestFailure.create("the race")),
+    };
+}

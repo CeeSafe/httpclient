@@ -1,0 +1,29 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "cosmohttp"
+source = "path+../../.."
+
+[[package]]
+name = "cosmohttp3"
+source = "path+../.."
+
+[[package]]
+name = "encoding"
+source = "path+../../../../../CeeSafeLibs/encoding"
+
+[[package]]
+name = "web_core"
+source = "path+../../../../../CeeSafe.Web/packages/web_core"
+
+[[package]]
+name = "web_quic"
+source = "path+../../../../../CeeSafe.Web/packages/web_quic"
+
+[[package]]
+name = "web_tls"
+source = "path+../../../../../CeeSafe.Web/packages/web_tls"
+
+[[package]]
+name = "web_transport"
+source = "path+../../../../../CeeSafe.Web/packages/web_transport"

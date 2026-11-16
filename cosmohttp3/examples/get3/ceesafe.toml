@@ -1,0 +1,11 @@
+[package]
+name = "get3"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+cosmohttp3 = { path = "../.." }
+cosmohttp = { path = "../../.." }
+web_core = { path = "../../../../../CeeSafe.Web/packages/web_core" }
+web_tls = { path = "../../../../../CeeSafe.Web/packages/web_tls" }
+web_quic = { path = "../../../../../CeeSafe.Web/packages/web_quic" }

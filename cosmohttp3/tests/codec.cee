@@ -1,0 +1,150 @@
+// Variable-length integers and QPACK, against the RFCs' own examples.
+import cosmohttp;
+
+fn made<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// The bytes written as hex digits; spaces are skipped.
+fn raw(hex: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    var high: u8 = 0;
+    var half = false;
+    for (c in hex.bytes()) {
+        if (c == ' ') {
+            continue;
+        }
+        let d: u8 = if (c >= '0' && c <= '9') c - '0' else c - 'a' + 10;
+        if (half) {
+            made(out.push(high * 16 + d))?;
+        } else {
+            high = d;
+        }
+        half = !half;
+    }
+    return Ok(out);
+}
+
+fn varintIs(hex: StringView, value: u64, shortest: bool) -> Result<void, TestFailure> {
+    let bytes = raw(hex)?;
+    var at: usize = 0;
+    match (getVarint(bytes.view(), mut at)) {
+        Some(v) => { Check.equalU64(value, v)?; }
+        null => { return Check.fail("a whole integer"); }
+    }
+    Check.equalU64(bytes.length as u64, at as u64)?;
+    if (shortest) {
+        var out = Vector<u8>.create();
+        made(putVarint(mut out, value))?;
+        Check.equalBytes(bytes.view(), out.view())?;
+    }
+    // Cut short, it is not there, and the place does not move.
+    at = 0;
+    Check.isTrue(getVarint(bytes[0..bytes.length - 1], mut at) == null, "cut short")?;
+    return Check.equalU64(0, at as u64);
+}
+
+@test
+fn varints() -> Result<void, TestFailure> {
+    // RFC 9000, Appendix A.1.
+    varintIs("c2197c5eff14e88c", 151288809941952652, true)?;
+    varintIs("9d7f3e7d", 494878333, true)?;
+    varintIs("7bbd", 15293, true)?;
+    varintIs("25", 37, true)?;
+    varintIs("4025", 37, false)?; // two bytes where one would do: still 37
+    varintIs("00", 0, true)?;
+    varintIs("3f", 63, true)?;
+    varintIs("4040", 64, true)?;
+    varintIs("7fff", 16383, true)?;
+    varintIs("80004000", 16384, true)?;
+    varintIs("bfffffff", 1073741823, true)?;
+    varintIs("c000000040000000", 1073741824, true)?;
+    varintIs("ffffffffffffffff", VARINT_MAX, true)?;
+    return Ok();
+}
+
+fn decoded(hex: StringView) -> Result<Vector<u8>, TestFailure> {
+    let block = raw(hex)?;
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    match (qpackDecode(block.view(), mut out, mut spans, 4096, 16)) {
+        Ok() => {}
+        Err(f) => { return Err(TestFailure.create(HttpErrors.fault(f))); }
+    }
+    // As lines, `name: value\n` each.
+    var lines = Vector<u8>.create();
+    for (i in 0..spans.length) {
+        made(lines.extend(out[spans[i].nameStart..spans[i].nameEnd]))?;
+        made(lines.extend(": ".bytes()))?;
+        made(lines.extend(out[spans[i].valueStart..spans[i].valueEnd]))?;
+        made(lines.push('\n'))?;
+    }
+    return Ok(lines);
+}
+
+fn refused(hex: StringView) -> Result<bool, TestFailure> {
+    let block = raw(hex)?;
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    return Ok(qpackDecode(block.view(), mut out, mut spans, 64, 4).isErr());
+}
+
+@test
+fn qpackDecoding() -> Result<void, TestFailure> {
+    // RFC 9204, Appendix B.1: a literal with a static name reference.
+    Check.equalBytes(":path: /index.html\n".bytes(), decoded("0000 510b 2f69 6e64 6578 2e68 746d 6c")?.view())?;
+    // Static entries whole: `:method GET` (17), `:scheme https` (23), `:path /` (1), `:status 200` (25), and 98.
+    Check.equalBytes(
+        ":method: GET\n:scheme: https\n:path: /\n:status: 200\nx-frame-options: sameorigin\n".bytes(),
+        decoded("0000 d1 d7 c1 d9 ff23")?.view(),
+    )?;
+    // A Huffman-coded value (RFC 7541 C.4.1's `www.example.com`) for `:authority`, then a literal name, itself
+    // Huffman-coded (`custom-key`, C.4.3) with a plain value.
+    Check.equalBytes(
+        ":authority: www.example.com\ncustom-key: v\n".bytes(),
+        decoded("0000 50 8c f1e3c2e5f23a6ba0ab90f4ff 2f01 25a849e95ba97d7f 01 76")?.view(),
+    )?;
+    // A name of seven bytes or more needs a second length byte: `x-custom` is 8.
+    Check.equalBytes("x-custom: 1\n".bytes(), decoded("0000 27 01 782d637573746f6d 01 31")?.view())?;
+    Check.equalBytes("".bytes(), decoded("0000")?.view())?;
+    Check.isTrue(refused("0100 d1")?, "a field section that needs dynamic entries")?;
+    Check.isTrue(refused("0000 80")?, "a dynamic entry")?;
+    Check.isTrue(refused("0000 40 01 61")?, "a dynamic name")?;
+    Check.isTrue(refused("0000 10")?, "a post-base entry")?;
+    Check.isTrue(refused("0000 00 01 61")?, "a post-base name")?;
+    Check.isTrue(refused("0000 ff24")?, "past the static table")?;
+    Check.isTrue(refused("0000 510b 2f69")?, "a value cut short")?;
+    Check.isTrue(refused("00")?, "no base")?;
+    Check.isTrue(refused("0000 d1 d1 d1 d1 d1")?, "more fields than allowed")?;
+    Check.isTrue(refused("0000 5f50 30 3132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930")?, "more bytes than allowed")?;
+    return Ok();
+}
+
+@test
+fn qpackEncoding() -> Result<void, TestFailure> {
+    var block = Vector<u8>.create();
+    made(qpackPrefix(mut block))?;
+    made(qpackField(mut block, ":method".bytes(), "GET".bytes()))?;
+    made(qpackField(mut block, ":scheme".bytes(), "https".bytes()))?;
+    made(qpackField(mut block, ":authority".bytes(), "example.com".bytes()))?;
+    made(qpackField(mut block, ":path".bytes(), "/index.html".bytes()))?;
+    made(qpackField(mut block, "Accept-Encoding".bytes(), "gzip, deflate, br".bytes()))?;
+    made(qpackField(mut block, "Authorization".bytes(), "Bearer t".bytes()))?;
+    made(qpackField(mut block, "X-Request-Id".bytes(), "7".bytes()))?;
+    made(qpackField(mut block, "user-agent".bytes(), "".bytes()))?;
+    let expected = raw(
+        "0000 d1 d7 500b 6578616d706c652e636f6d 510b 2f696e6465782e68746d6c df 7f45 08 4265617265722074 27 05 782d726571756573742d6964 01 37 ff20",
+    )?;
+    Check.equalBytes(expected.view(), block.view())?;
+    // And back.
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    Check.isTrue(qpackDecode(block.view(), mut out, mut spans, 4096, 16).isOk(), "what was encoded decodes")?;
+    Check.equalU64(8, spans.length as u64)?;
+    Check.equalBytes("x-request-id".bytes(), out[spans[6].nameStart..spans[6].nameEnd])?;
+    Check.equalBytes("Bearer t".bytes(), out[spans[5].valueStart..spans[5].valueEnd])?;
+    return Ok();
+}

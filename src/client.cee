@@ -18,6 +18,12 @@ public struct Request {
     /// The same fields as an HPACK block for HTTP/2, encoded when they were added.
     private packed: Vector<u8>;
 
+    /// The URL's parts, and the request's fields as lines (`name: value\r\n` each): what another transport
+    /// (cosmohttp3) needs to send it.
+    public fn urlParts(borrow this) -> UrlParts => this.parts;
+
+    public fn fieldLines(borrow this) -> Slice<u8> => this.fields.view();
+
     /// A request for `url`, an absolute `http://` or `https://` URL.
     public fn create(method: Method, url: StringView) -> Result<Request, HttpError> {
         let parts = match (UrlParts.parse(url.bytes())) {

@@ -1,0 +1,209 @@
+# CeeSafe findings
+
+Bugs and gaps in CeeSafe (and CeeSafe.Web) met while writing this client, for the CeeSafe repositories. Each has
+what was tried, what the compiler said, and what this package does instead. Found with ceesafec 0.57.1 on macOS
+arm64 unless an entry says otherwise.
+
+| | What | Where | State |
+|---|---|---|---|
+| F1 | a method's result cannot borrow from `this` beside another scoped parameter | CeeSafe | fixed in ceesafec 0.61.0 (ADR 0160 §2) |
+| F2 | diagnostics printed twice | — | withdrawn: not a bug |
+| F3 | web_client times out when 64 connections are dialed at once | CeeSafe (runtime), see F7 | fixed in ceesafec 0.61.0 |
+| F3b | a request waiting for a slot does not take a connection given back | CeeSafe.Web | fixed on branch `fix/web-client-findings` |
+| F4 | web_client copies bodies a byte at a time | CeeSafe.Web | fixed on `fix/web-client-findings` |
+| F5 | web_client allocates 32 to 35 times for each request | CeeSafe.Web | 10 now, on `fix/web-client-findings`; the rest needs another API |
+| F6 | a loop's local cannot lend to a `drop` type made through `?` | CeeSafe | fixed in ceesafec 0.61.0 (ADR 0160 §3) |
+| F7 | a wait blocks after a full kqueue change queue's early send readied tasks | CeeSafe (runtime) | fixed in ceesafec 0.61.0 |
+
+The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
+worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
+
+## F1. A method cannot say its result borrows from `this` when it has another scoped parameter
+
+**Fixed** in ceesafec 0.61.0 (ADR 0160 §2): in a method with several scoped parameters, a result with no
+source written borrows from the receiver, so `fn a` below checks as written. This package uses it since: `client.get(url)`,
+`client.send(request, body)` and `response.header(name)` are methods, and its manifest asks for ceesafec 0.61.0.
+
+**Kind:** language gap. **Cost here, until 0.61.0:** the client's entry points were static functions, and a
+response's field lookup was two calls or a static function.
+
+A method whose result is a view or a struct with a region (`Slice<u8>`, `StringView`, `Lease<c>`) and which takes
+`borrow this` plus any other scoped parameter (a `StringView` name, a `Slice<u8>`, a `borrow T`) is N0245: "this
+function has several reference parameters: name the ones the result is borrowed from". For a `borrow T` result the
+answer is `-> borrow(this) T`. For a view or a region-carrying struct there is no way to write it:
+
+```ceesafe
+struct Table {
+    bytes: Vector<u8>;
+
+    // N0245: several reference parameters
+    fn a(borrow this, name: StringView) -> Slice<u8>? => Some(this.bytes[0..name.length]);
+
+    // N0246: references to references are not supported
+    fn b(borrow this, name: StringView) -> borrow(this) Slice<u8>? => Some(this.bytes[0..name.length]);
+
+    // N0100: expected identifier, found 'borrow'
+    fn c<region r>(borrow(r) this, name: StringView) -> Slice<r, u8>? => Some(this.bytes[0..name.length]);
+
+    // N0105: expected type, found 'this'
+    fn d(borrow this, name: StringView) -> Slice<this, u8>? => Some(this.bytes[0..name.length]);
+}
+```
+
+The spec (type-system.md §25.6) shows how to name another parameter's region
+(`fn first<region a>(borrow this, other: borrow(a) Vector<u8>) -> Slice<a, u8>`), but nothing names the receiver's.
+What does work is a static function, where the receiver is an ordinary parameter:
+
+```ceesafe
+fn find<region r>(table: borrow(r) Table, name: StringView) -> Slice<r, u8>? => Some(table.bytes[0..name.length]);
+```
+
+This is the most common shape of a lookup (`map.get(key)`, `headers.value(name)`, `client.get(url)`), so it is
+probably why web_client's `ClientResponse.header(name)` returns a copied `Vector<u8>` instead of a view.
+
+**Wanted:** either `borrow(r) this` in a method's receiver, or a result form that names the receiver
+(`Slice<this, u8>`, or `borrow(this)` accepted in front of a scoped type as "the result's regions are `this`'s").
+
+**Here, until 0.61.0:** `Client.get(client, url)`, `Client.send(client, request, body)` and
+`Response.header(response, name)` were static functions; `response.find(name)` and `response.value(i)` were the
+method form.
+
+## F3. web_client: a request sometimes times out when 64 connections are dialed at once
+
+**Cause found, and it is not web_client's:** CeeSafe's runtime, F7 below. With the runtime fixed, web_client at 64
+connections passed 30 runs of 30 (11 of 30 timed out without it). The second thing this entry suspected, from reading
+the code, was real too, and is fixed in CeeSafe.Web (F3b): a request that waited for a slot did not take a connection
+given back to the pool; with `maxPerOrigin` 1 the second of two requests waited until `totalMs`. What follows is the
+entry as first written.
+
+**Kind:** CeeSafe.Web bug, or a runtime one under it; cause not found. **Seen:** 2026-11-16, macOS arm64,
+ceesafec 0.57.1, CeeSafe.Web main (b3fbc75).
+
+`bench/` runs web_client and this client against the same loopback server. With 64 tasks each sending requests
+through one `web_client.Client` (`maxPerOrigin` and `maxIdlePerOrigin` 64, no TLS, HTTP/1.1), 2 runs of 6 ended
+with `ClientError` "timed out" after exactly 10.00 s of wall time and 0.00 s of CPU: the process waited idle for one
+of web_client's 10 s timeouts (`connectMs`). The other 4 runs finished in 0.3 to 0.5 s. At 16, 32 and 48 tasks no run
+failed. This client, dialing the same 64 connections at once against the same server, passed 12 runs of 12.
+
+```sh
+cd bench && ceesafec build
+./out/bench server 18290 &
+for i in 1 2 3 4 5 6; do ./out/bench web http://127.0.0.1:18290/1k 20000 64; done
+```
+
+Not established: whether a connection attempt is lost (Happy Eyeballs' race, `dial.cee`), a wake-up is missed, or
+the listener's backlog drops a SYN that only web_client's path fails to recover from. The two clients differ in
+that web_client dials through `happyEyeballs` and a `Box<dyn DialJob>`, and this one awaits
+`TcpTransport.connectTo` directly.
+
+A second thing to check in the same code, from reading it only (not reproduced): a request that finds no idle
+connection waits for a token on the origin's slot channel (`pool.cee`, `freshConnection`), and a connection given
+back to the idle list sends no token. So with more concurrent requests than `maxPerOrigin`, a waiter may sleep
+until a connection closes rather than until one is free.
+
+## F4. web_client copies bodies a byte at a time (`copyBytes`)
+
+**Fixed** on CeeSafe.Web's `fix/web-client-findings` (Web ADR 0009 amendment 2): whole-slice appends in `copyBytes`,
+`Url` and `RequestWriter`, `readToEnd` into the vector's own room, and direct reads into a caller's buffer. For a
+64 KiB body: 51 µs of user CPU a request before, 7.5 µs after.
+
+**Kind:** CeeSafe.Web performance. **Measured:** 2026-11-16, `bench/run.py`, Apple M1, ceesafec 0.57.1.
+
+`web_client/src/client.cee`'s `copyBytes` appends with one `Vector.push` for each byte, and `readToEnd`,
+`ClientRequest.header`, `BytesBody.of` and the request writer all go through it. For a 64 KiB response body
+web_client takes 46 µs of user CPU a request where this client takes 2 µs (the `64k` rows of
+`bench/results/2026-11-16-m1.json`); `readToEnd` also reads through a fixed 8 KiB stack buffer, so every body byte
+is copied twice. `to.extend(bytes)` is one capacity check and one `memcpy`.
+
+**Wanted:** `copyBytes` as `to.extend(bytes)`, and `readToEnd` reading into the vector's own spare room
+(`reserve`, then `read` into it) instead of through a stack buffer.
+
+## F5. web_client allocates 32 to 35 times for each request
+
+**Reduced to 10** on `fix/web-client-findings` (Web ADR 0009 amendment 2): F4's whole-slice appends alone brought it
+to 17 (a vector grown a byte at a time reallocates as it goes); then the request's URL no longer copied for each
+send, the request head reserved once, the connection held as an optional, and the read buffer kept with the pooled
+connection. The 10 that are left (the URL parsed and copied for the response, the authority, the two heads) need a
+response that borrows its connection's buffers, which is a different API from web_client's.
+
+**Kind:** CeeSafe.Web performance. **Measured:** as F4 (`CEESAFE_ALLOC_REPORT`, the difference between runs of
+2,000 and 12,000 requests): 32 allocations for a GET of 1 KiB on a pooled connection, 33 for 64 KiB, 35 chunked.
+From reading `Client.attempt` and `send`: the head's `Vector`, a 16 KiB `OwnedBuffer` for each attempt, two copies of
+the URL, a vector for every field name and value, a one-element vector to hold the connection, two `HeaderBlock`s
+and the trailer vector, and a channel clone for each of three pool lookups. A connection that owned its buffers,
+and a response that borrowed them, would need none of these (this client's count is 0).
+
+## F6. In a loop, a local cannot lend to a value with a `drop` block that is made through `?`
+
+**Fixed** in ceesafec 0.61.0 (ADR 0160 §3). **Kind:** borrow checker, a correct program rejected.
+
+First reported here as "in an async fn": that was wrong. `async` has nothing to do with it; the first reduction
+happened to have the other two ingredients only in its async form. The trigger is a loop, a borrower whose type
+has a `drop` block, and the borrower coming out of a `Result` by `?` (or a `match` with a `return`):
+
+```ceesafe
+struct Owner {
+    count: u32;
+}
+
+struct Lease<region c> {
+    owner: borrow(c) Owner;
+
+    drop {}
+}
+
+enum Bad {
+    No,
+}
+
+fn lease<region c>(owner: borrow(c) Owner) -> Result<Lease<c>, Bad> => Ok(Lease { owner: owner });
+
+fn run() -> Result<void, Bad> {
+    for (k in 0..3) {
+        let owner = Owner { count: 0 };   // N0240: cannot assign to 'owner' while 'owner' is borrowed
+        let held = lease(owner)?;
+    }                                     // N0243: 'owner' goes out of scope while still borrowed
+    return Ok();
+}
+
+fn main() {
+    let r = run();
+}
+```
+
+Without the loop, without the `drop` block, or without the `?`, it is accepted.
+
+**Cause** (`src/nir/borrow.cee`, liveness): destroying a value whose drop may read its loans is a use of them
+(type-system.md §25.7 rule 6), and every `StorageDead` of such a local was taken as that use. On the path where `?`
+returns, `held` was never assigned and the temporaries of `lease(owner)?` have been moved out of, so nothing is
+destroyed there; taken as a use, that `StorageDead` kept the local live from the top of the loop's body, where it
+still held the last turn's loan of `owner`.
+
+**Fix:** a `StorageDead` of a local that the move analysis shows certainly not initialised there is no use. A local
+that is, or may be, initialised is as before (two cases in the corpus's `adr0160-drop-reads-loans`).
+
+**Here:** the loop's body is a function of its own (`streamedOnce` in `tests/h2.cee`).
+
+## F7. A wait blocks after a full kqueue change queue's early send readied tasks
+
+**Fixed** in ceesafec 0.61.0. **Kind:** CeeSafe runtime bug (macOS and the BSDs: kqueue), the cause of F3.
+
+With exactly 64 descriptors armed at once (or a multiple), the wake pipe's own registration in `cee_wait_reactor` is
+the 65th change, so `cee_kqueue_change` sends the first 64 early, without blocking. That call takes the events of
+the connects that have already finished (one-shot: they do not come again) and readies their tasks, and its result
+was dropped; `cee_wait_reactor` then blocked in `kevent` until the next deadline with those tasks ready. The earlier
+fix of the same place (CeeSafe.Web's B16, `pipe_drained`) covered a drained wake, not readied tasks.
+
+Reduced to lib/std alone (`async-early-send-ready.cee` in CeeSafe's corpus): tasks that each race a task set whose
+child connects and reports on a channel against that channel's receive. It hangs about one run in seven at 64 and
+128 tasks, and never at 8, 32, 60, 63, 65 or 70 (30 runs each). Plain `await connectTo(…)` in 64 tasks does not meet
+it, because no wake pipe is opened; that is why this client never did.
+
+**Fix:** the early send's result is kept (`early_ready`), and the wait that follows does not block when it readied a
+task or drained a wake. 180 runs of the reduction at 64, 128 and 192 tasks: none hung.
+
+## F2. Withdrawn: diagnostics were not printed twice
+
+Reported as "`ceesafec check <file>` prints each diagnostic twice". It does not. The commands that showed it ran
+`ceesafec check` and then `ceesafec run --interp` (or `ceesafec test`) on the same file in one line, and each printed
+the error once. Checked again with 0.57.1 and 0.60.0: one diagnostic for each error.

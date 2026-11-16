@@ -1,0 +1,476 @@
+// One HTTP/1.1 connection: the wire, and the buffers every exchange on it reuses. A request is one write; the
+// response head is parsed where it was read, and a buffered body is read (and dechunked) in the same buffer, so a
+// connection that has served one exchange allocates nothing for the next.
+import web_core;
+import web_transport;
+import web_tls;
+
+/// The bytes' way out: TCP (or a test's mock), or TLS over it. An enum, so no call goes through `dyn`.
+enum Wire {
+    Plain(PlainStream),
+    Tls(TlsTransport),
+}
+
+/// The protocol the TLS handshake chose, if any.
+fn wireAlpn(wire: borrow Wire) -> Alpn => match (wire) {
+    Wire.Plain(p) => p.alpn(),
+    Wire.Tls(t) => t.alpn(),
+};
+
+struct Link {
+    wire: Wire;
+
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, NetError> {
+        match (borrow mut this.wire) {
+            Wire.Plain(p) => { return await p.read(buffer); }
+            Wire.Tls(t) => { return await t.read(buffer); }
+        }
+    }
+
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, NetError> {
+        match (borrow mut this.wire) {
+            Wire.Plain(p) => { return await p.write(bytes); }
+            Wire.Tls(t) => { return await t.write(bytes); }
+        }
+    }
+
+    /// Every byte of `first` then `second`, in as few steps as the wire takes them.
+    async fn writeBoth(borrow mut this, first: Slice<u8>, second: Slice<u8>) -> Result<void, NetError> {
+        var parts = match (IoParts.of(first).then(second)) {
+            Some(p) => p,
+            null => { return Err(NetError.LimitExceeded); },
+        };
+        while (parts.totalLength() > 0) {
+            let n = match (borrow mut this.wire) {
+                Wire.Plain(p) => await p.writeVectored(parts),
+                Wire.Tls(t) => await t.writeVectored(parts),
+            }?;
+            if (n == 0) {
+                return Err(NetError.Closed);
+            }
+            parts = parts.after(n);
+        }
+        return Ok();
+    }
+
+    fn alpn(borrow this) -> Alpn => match (borrow this.wire) {
+        Wire.Plain(p) => p.alpn(),
+        Wire.Tls(t) => t.alpn(),
+    };
+}
+
+/// A body up to this size is copied behind the head and sent in the same write; a larger one goes beside the head in
+/// one vectored write, uncopied.
+const INLINE_BODY: usize = 4096;
+
+struct Connection {
+    link: Link;
+    /// What has been read: `buffer[0..filled]`. The vector's length is the room there is.
+    buffer: Vector<u8>;
+    filled: usize;
+    /// The request head (and a small body), built here for each request.
+    out: Vector<u8>;
+    headers: Vector<HeaderSpan>;
+    parser: HeadParser;
+    framing: Framing;
+    chunks: ChunkDecoder;
+    /// Where the body starts in `buffer`, and for a buffered response where it ends.
+    bodyStart: usize;
+    bodyEnd: usize;
+    /// A streamed body: the next unread byte in `buffer`, and for a `Length` body the bytes still to come.
+    consumed: usize;
+    remaining: u64;
+    /// The whole response has been read.
+    complete: bool;
+    /// The connection may carry another request once the response is complete.
+    reusable: bool;
+    /// It came from the pool: the server may have closed it meanwhile.
+    reused: bool;
+    /// A byte of the current response has arrived.
+    received: bool;
+    /// The request's write failed, so the server cannot have the whole request.
+    unsent: bool;
+    idleSince: u64;
+
+    fn create(wire: Wire, bufferSize: usize) -> Result<Connection, AllocError> {
+        var buffer = Vector<u8>.create();
+        buffer.resize(bufferSize, 0)?;
+        return Ok(Connection {
+            link: Link { wire: wire },
+            buffer: buffer,
+            filled: 0,
+            out: Vector<u8>.withCapacity(512)?,
+            headers: Vector<HeaderSpan>.withCapacity(32)?,
+            parser: HeadParser.create(),
+            framing: Framing.None,
+            chunks: ChunkDecoder.create(),
+            bodyStart: 0,
+            bodyEnd: 0,
+            consumed: 0,
+            remaining: 0,
+            complete: true,
+            reusable: true,
+            reused: false,
+            received: false,
+            unsent: false,
+            idleSince: 0,
+        });
+    }
+
+    /// Sends the request whose head is in `out`, with `body`, then reads the response's head.
+    async fn exchange(
+        borrow mut this,
+        body: Slice<u8>,
+        head: bool,
+        options: borrow ClientOptions,
+    ) -> Result<void, HttpError> {
+        this.filled = 0;
+        this.received = false;
+        this.unsent = false;
+        this.complete = false;
+        this.reusable = false;
+        var sent: Result<void, NetError> = Ok();
+        if (body.length == 0) {
+            sent = await this.link.write(this.out.view());
+        } else if (body.length <= INLINE_BODY) {
+            match (this.out.extend(body)) {
+                Ok() => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+            sent = await this.link.write(this.out.view());
+        } else {
+            sent = await this.link.writeBoth(this.out.view(), body);
+        }
+        match (sent) {
+            Ok() => {}
+            Err(e) => {
+                this.unsent = true;
+                return Err(HttpError.Net(e));
+            }
+        }
+        return await this.readHead(head, options);
+    }
+
+    /// Reads and parses the response's head; interim responses (1xx other than 101) are skipped.
+    async fn readHead(borrow mut this, head: bool, options: borrow ClientOptions) -> Result<void, HttpError> {
+        this.headers.clear();
+        this.parser.reset(0);
+        loop {
+            if (this.filled > this.parser.cursor) {
+                let done = match (this.parser.feed(this.buffer[0..this.filled], mut this.headers, options.maxHeaders)) {
+                    Ok(d) => d,
+                    Err(f) => { return Err(HttpError.Response(f)); },
+                };
+                if (done) {
+                    let status = this.parser.status;
+                    if (status >= 200 || status == 101) {
+                        break;
+                    }
+                    this.headers.clear();
+                    this.parser.reset(this.parser.cursor);
+                    continue;
+                }
+            }
+            if (this.filled == this.buffer.length) {
+                this.grow(options.maxHeadBytes, Fault.HeadTooLarge)?;
+            }
+            let n = match (await this.link.read(mut this.buffer[this.filled..])) {
+                Ok(n) => n,
+                Err(e) => { return Err(HttpError.Net(e)); },
+            };
+            if (n == 0) {
+                if (this.received) {
+                    return Err(HttpError.Response(Fault.Truncated));
+                }
+                return Err(HttpError.Net(NetError.Closed));
+            }
+            this.received = true;
+            this.filled += n;
+        }
+        this.framing = this.parser.framing(head);
+        this.reusable = this.parser.reusable(head) && this.parser.status != 101;
+        this.bodyStart = this.parser.cursor;
+        this.bodyEnd = this.bodyStart;
+        this.consumed = this.bodyStart;
+        this.chunks = ChunkDecoder.create();
+        this.remaining = 0;
+        match (this.framing) {
+            Framing.None => { this.finish(this.bodyStart); }
+            Framing.Length(n) => {
+                this.remaining = n;
+                if (n == 0) {
+                    this.finish(this.bodyStart);
+                }
+            }
+            _ => {}
+        }
+        return Ok();
+    }
+
+    /// The response is complete, its last byte before `end`. Bytes after it belong to no response: the connection
+    /// is not used again.
+    fn finish(borrow mut this, end: usize) {
+        this.complete = true;
+        if (this.filled > end) {
+            this.reusable = false;
+        }
+    }
+
+    /// Makes the buffer larger, up to `limit` bytes; `fault` if it is that large already.
+    fn grow(borrow mut this, limit: usize, fault: Fault) -> Result<void, HttpError> {
+        let have = this.buffer.length;
+        if (have >= limit) {
+            return Err(HttpError.Response(fault));
+        }
+        var want = if (have < 8192) 16384 else have * 2;
+        if (want > limit) {
+            want = limit;
+        }
+        match (this.buffer.resize(want, 0)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+    }
+
+    /// One read into the buffer's free room, which there must be.
+    async fn fill(borrow mut this) -> Result<usize, HttpError> {
+        match (await this.link.read(mut this.buffer[this.filled..])) {
+            Ok(n) => {
+                this.filled += n;
+                return Ok(n);
+            }
+            Err(e) => { return Err(HttpError.Net(e)); }
+        }
+    }
+
+    /// Reads the whole body into the buffer: afterwards it is `buffer[bodyStart..bodyEnd]`.
+    async fn readBody(borrow mut this, maxBody: u64) -> Result<void, HttpError> {
+        if (this.complete) {
+            return Ok();
+        }
+        let roof = this.bodyStart as u64 + maxBody;
+        let limit: usize = checkedTruncate<usize>(roof) ?? 0xFFFFFFFF;
+        match (this.framing) {
+            Framing.None => {}
+            Framing.Length(n) => {
+                if (n > maxBody) {
+                    return Err(HttpError.Response(Fault.BodyTooLarge));
+                }
+                let end = this.bodyStart + truncate<usize>(n);
+                if (end > this.buffer.length) {
+                    match (this.buffer.resize(end, 0)) {
+                        Ok() => {}
+                        Err(_) => { return Err(HttpErrors.noMemory()); }
+                    }
+                }
+                while (this.filled < end) {
+                    if (await this.fill()? == 0) {
+                        return Err(HttpError.Response(Fault.Truncated));
+                    }
+                }
+                this.bodyEnd = end;
+                this.remaining = 0;
+                this.finish(end);
+            }
+            Framing.Chunked => {
+                var read = this.bodyStart;
+                var write = this.bodyStart;
+                loop {
+                    let step = match (this.chunks.next(this.buffer[read..this.filled])) {
+                        Ok(s) => s,
+                        Err(f) => { return Err(HttpError.Response(f)); },
+                    };
+                    match (step) {
+                        ChunkStep.Data(skip, n) => {
+                            read += skip;
+                            if (read != write) {
+                                this.buffer.copyWithin(read, write, n);
+                            }
+                            read += n;
+                            write += n;
+                            if ((write - this.bodyStart) as u64 > maxBody) {
+                                return Err(HttpError.Response(Fault.BodyTooLarge));
+                            }
+                        }
+                        ChunkStep.Done(skip) => {
+                            read += skip;
+                            this.bodyEnd = write;
+                            this.finish(read);
+                            return Ok();
+                        }
+                        ChunkStep.Need(skip) => {
+                            read += skip;
+                            // The undecoded rest moves down behind the decoded body, and reading goes on after it.
+                            let rest = this.filled - read;
+                            if (rest > 0 && read != write) {
+                                this.buffer.copyWithin(read, write, rest);
+                            }
+                            read = write;
+                            this.filled = write + rest;
+                            if (this.filled == this.buffer.length) {
+                                this.grow(limit.saturatingAdd(8192), Fault.BodyTooLarge)?;
+                            }
+                            if (await this.fill()? == 0) {
+                                return Err(HttpError.Response(Fault.Truncated));
+                            }
+                        }
+                    }
+                }
+            }
+            Framing.UntilClose => {
+                loop {
+                    if (this.filled == this.buffer.length) {
+                        this.grow(limit, Fault.BodyTooLarge)?;
+                    }
+                    if (await this.fill()? == 0) {
+                        break;
+                    }
+                }
+                this.bodyEnd = this.filled;
+                this.complete = true;
+            }
+        }
+        return Ok();
+    }
+
+    /// The next bytes of a streamed body into `into`: at least one, or 0 at its end.
+    async fn readSome(borrow mut this, into: SliceMut<u8>) -> Result<usize, HttpError> {
+        if (this.complete || into.length == 0) {
+            return Ok(0);
+        }
+        match (this.framing) {
+            Framing.None => { return Ok(0); }
+            Framing.Length(_) => {
+                var want = into.length;
+                if (want as u64 > this.remaining) {
+                    want = truncate<usize>(this.remaining);
+                }
+                let n = await this.take(mut into[0..want])?;
+                if (n == 0) {
+                    return Err(HttpError.Response(Fault.Truncated));
+                }
+                this.remaining -= n as u64;
+                if (this.remaining == 0) {
+                    this.finish(this.consumed);
+                }
+                return Ok(n);
+            }
+            Framing.UntilClose => {
+                let n = await this.take(into)?;
+                if (n == 0) {
+                    this.complete = true;
+                }
+                return Ok(n);
+            }
+            Framing.Chunked => {
+                loop {
+                    // A chunk's data with nothing buffered goes straight from the wire to the caller.
+                    let direct = this.chunks.dataLeft();
+                    if (direct > 0 && this.consumed == this.filled) {
+                        var want = into.length;
+                        if (want as u64 > direct) {
+                            want = truncate<usize>(direct);
+                        }
+                        let n = match (await this.link.read(mut into[0..want])) {
+                            Ok(n) => n,
+                            Err(e) => { return Err(HttpError.Net(e)); },
+                        };
+                        if (n == 0) {
+                            return Err(HttpError.Response(Fault.Truncated));
+                        }
+                        this.chunks.took(n);
+                        return Ok(n);
+                    }
+                    let step = match (this.chunks.next(this.buffer[this.consumed..this.filled])) {
+                        Ok(s) => s,
+                        Err(f) => { return Err(HttpError.Response(f)); },
+                    };
+                    match (step) {
+                        ChunkStep.Data(skip, n) => {
+                            this.consumed += skip;
+                            var count = n;
+                            if (count > into.length) {
+                                count = into.length;
+                                this.chunks.putBack(n - count);
+                            }
+                            into[0..count].copyFrom(this.buffer[this.consumed..this.consumed + count]);
+                            this.consumed += count;
+                            return Ok(count);
+                        }
+                        ChunkStep.Done(skip) => {
+                            this.consumed += skip;
+                            this.finish(this.consumed);
+                            return Ok(0);
+                        }
+                        ChunkStep.Need(skip) => {
+                            this.consumed += skip;
+                            // The head stays where it is (its fields are still read); the rest moves behind it.
+                            let rest = this.filled - this.consumed;
+                            if (rest > 0 && this.consumed != this.bodyStart) {
+                                this.buffer.copyWithin(this.consumed, this.bodyStart, rest);
+                            }
+                            this.consumed = this.bodyStart;
+                            this.filled = this.bodyStart + rest;
+                            if (this.filled == this.buffer.length) {
+                                this.grow(this.buffer.length + 16384, Fault.BadChunk)?;
+                            }
+                            if (await this.fill()? == 0) {
+                                return Err(HttpError.Response(Fault.Truncated));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Body bytes into `into`: what is buffered first, else one read straight from the wire.
+    async fn take(borrow mut this, into: SliceMut<u8>) -> Result<usize, HttpError> {
+        let buffered = this.filled - this.consumed;
+        if (buffered > 0) {
+            var n = buffered;
+            if (n > into.length) {
+                n = into.length;
+            }
+            into[0..n].copyFrom(this.buffer[this.consumed..this.consumed + n]);
+            this.consumed += n;
+            return Ok(n);
+        }
+        if (into.length == 0) {
+            return Ok(0);
+        }
+        match (await this.link.read(into)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => { return Err(HttpError.Net(e)); }
+        }
+    }
+
+    /// Whether a failed exchange may be sent again on another connection: this one came from the pool and the server
+    /// had closed it. Either the request never went out whole, or nothing came back and repeating the method is safe.
+    fn stale(borrow this, method: Method) -> bool =>
+        this.reused && !this.received && (this.unsent || Methods.idempotent(method));
+
+    /// The index of the first field named `name` (ASCII case ignored).
+    fn find(borrow this, name: Slice<u8>) -> usize? {
+        for (i in 0..this.headers.length) {
+            let h = this.headers[i];
+            if (h.nameEnd - h.nameStart == name.length &&
+                this.buffer[h.nameStart..h.nameEnd].equalsIgnoreAsciiCase(name)) {
+                return Some(i);
+            }
+        }
+        return null;
+    }
+
+    /// Field `i`'s name, as the server wrote it.
+    fn name(borrow this, i: usize) -> Slice<u8> {
+        let h = this.headers[i];
+        return this.buffer[h.nameStart..h.nameEnd];
+    }
+
+    /// Field `i`'s value.
+    fn value(borrow this, i: usize) -> Slice<u8> {
+        let h = this.headers[i];
+        return this.buffer[h.valueStart..h.valueEnd];
+    }
+}

@@ -1,0 +1,156 @@
+// URLs: an absolute http(s) URL split into the parts a request needs, as offsets into the caller's text. Nothing is
+// copied or allocated.
+
+/// An absolute `http://` or `https://` URL, as offsets into its text.
+public struct UrlParts {
+    /// `https`.
+    public secure: bool;
+    /// The host as it goes to DNS and SNI: `text[hostStart..hostEnd]`, an IPv6 literal without its brackets.
+    public hostStart: usize;
+    public hostEnd: usize;
+    /// The authority as `host` sends it: `text[authorityStart..authorityEnd]`, with the port only if it is not the
+    /// scheme's default.
+    public authorityStart: usize;
+    public authorityEnd: usize;
+    /// The port: the URL's, or the scheme's default.
+    public port: u16;
+    /// The request target, `text[targetStart..targetEnd]`: the path and query, the fragment left out. Empty for a URL
+    /// without a path (sent as `/`); starts with `?` for a query without a path (sent after `/`).
+    public targetStart: usize;
+    public targetEnd: usize;
+
+    /// The parts of `text`, or null if it is not a URL a request can be sent to: another scheme, an empty host, user
+    /// information, a port that is not a number up to 65535, or a space or control character anywhere.
+    public fn parse(text: Slice<u8>) -> UrlParts? {
+        var at: usize = 0;
+        var secure = false;
+        if (text.length >= 7 && schemeIs(text, "http://".bytes())) {
+            at = 7;
+        } else if (text.length >= 8 && schemeIs(text, "https://".bytes())) {
+            at = 8;
+            secure = true;
+        } else {
+            return null;
+        }
+        let authorityStart = at;
+        var hostStart = at;
+        var hostEnd = at;
+        var portStart = at;
+        if (at < text.length && text[at] == '[') {
+            // An IPv6 literal: everything to the closing bracket.
+            hostStart = at + 1;
+            var k = hostStart;
+            while (k < text.length && text[k] != ']') {
+                let b = text[k];
+                if (!(isHex(b) || b == ':' || b == '.')) {
+                    return null;
+                }
+                k += 1;
+            }
+            if (k >= text.length || k == hostStart) {
+                return null;
+            }
+            hostEnd = k;
+            at = k + 1;
+            portStart = at;
+        } else {
+            while (at < text.length) {
+                let b = text[at];
+                if (b == ':' || b == '/' || b == '?' || b == '#') {
+                    break;
+                }
+                if (b <= 32 || b >= 127 || b == '@' || b == '[' || b == ']' || b == '\\') {
+                    return null;
+                }
+                at += 1;
+            }
+            hostEnd = at;
+            portStart = at;
+            if (hostEnd == hostStart) {
+                return null;
+            }
+        }
+        var port: u32 = if (secure) 443 else 80;
+        var authorityEnd = at;
+        if (at < text.length && text[at] == ':') {
+            at += 1;
+            var value: u32 = 0;
+            var digits: u32 = 0;
+            while (at < text.length && text[at] >= '0' && text[at] <= '9') {
+                value = value * 10 + (text[at] - '0') as u32;
+                digits += 1;
+                if (value > 65535 || digits > 5) {
+                    return null;
+                }
+                at += 1;
+            }
+            if (digits > 0) {
+                if (value == 0) {
+                    return null;
+                }
+                // The default port is left out of `host` (RFC 9110 §7.2, RFC 3986 §6.2.3).
+                if (value != port) {
+                    authorityEnd = at;
+                } else {
+                    authorityEnd = portStart;
+                }
+                port = value;
+            } else {
+                authorityEnd = portStart; // "host:" is the default port
+            }
+        }
+        if (at < text.length && text[at] != '/' && text[at] != '?' && text[at] != '#') {
+            return null;
+        }
+        let targetStart = at;
+        var targetEnd = text.length;
+        while (at < text.length) {
+            let b = text[at];
+            if (b == '#') {
+                targetEnd = at;
+                break;
+            }
+            if (b <= 32 || b == 127) {
+                return null;
+            }
+            at += 1;
+        }
+        return Some(UrlParts {
+            secure: secure,
+            hostStart: hostStart,
+            hostEnd: hostEnd,
+            authorityStart: authorityStart,
+            authorityEnd: authorityEnd,
+            port: truncate<u16>(port),
+            targetStart: targetStart,
+            targetEnd: targetEnd,
+        });
+    }
+
+    /// The host of `text`, the URL these parts were parsed from.
+    public fn host<region r>(borrow this, text: Slice<r, u8>) -> Slice<r, u8> => text[this.hostStart..this.hostEnd];
+
+    /// The authority of `text`, as `host` sends it.
+    public fn authority<region r>(borrow this, text: Slice<r, u8>) -> Slice<r, u8> =>
+        text[this.authorityStart..this.authorityEnd];
+
+    /// The request target of `text`, which may be empty or start with `?`.
+    public fn target<region r>(borrow this, text: Slice<r, u8>) -> Slice<r, u8> =>
+        text[this.targetStart..this.targetEnd];
+}
+
+/// Whether `text` starts with `scheme`, ASCII case ignored. `scheme` is lowercase.
+fn schemeIs(text: Slice<u8>, scheme: Slice<u8>) -> bool {
+    for (i in 0..scheme.length) {
+        var b = text[i];
+        if (b >= 'A' && b <= 'Z') {
+            b += 32;
+        }
+        if (b != scheme[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isHex(b: u8) -> bool => (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F');

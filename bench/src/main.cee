@@ -1,0 +1,371 @@
+// The request-rate benchmark: this client and CeeSafe.Web's web_client against the same loopback server.
+//
+//   bench server <port>                         a keep-alive HTTP/1.1 server: /1k, /64k, /chunked, /empty
+//   bench cosmo <url> <requests> <concurrency>  cosmohttp, buffered responses
+//   bench stream <url> <requests> <concurrency> cosmohttp, streamed responses read through a 16 KiB buffer
+//   bench web <url> <requests> <concurrency>    web_client, readToEnd and finish
+//   bench cosmo2 | stream2 | web2 ...           the same three over HTTP/2 by prior knowledge (h2c), against a
+//                                               server that speaks it (CeeSafe.Web's benchmarks/http)
+//
+// Each client mode prints one line: the mode, requests, concurrency, milliseconds, requests a second, body bytes.
+// The server and the client are separate processes (run.py starts both), so a client's time is its own.
+import web_core;
+import web_transport;
+import web_http;
+import web_client;
+import cosmohttp;
+
+enum BenchError {
+    Failed,
+    NoMemory,
+}
+
+fn number(text: StringView?, otherwise: u64) -> u64 {
+    match (text) {
+        Some(t) => { return t.parseInt<u64>() ?? otherwise; }
+        null => { return otherwise; }
+    }
+}
+
+/// A response with a body of `size` bytes, by `content-length` or chunked.
+fn canned(size: usize, chunked: bool) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    out.extend(
+        "HTTP/1.1 200 OK\r\nServer: bench\r\nContent-Type: text/plain\r\nDate: Mon, 16 Nov 2026 12:00:00 GMT\r\n".bytes(),
+    )?;
+    if (chunked) {
+        out.extend("Transfer-Encoding: chunked\r\n\r\n".bytes())?;
+        var left = size;
+        while (left > 0) {
+            let n = left.min(256);
+            out.appendHex(n as u64, 1, false)?;
+            out.extend("\r\n".bytes())?;
+            for (i in 0..n) {
+                out.push('a' + truncate<u8>(i % 26))?;
+            }
+            out.extend("\r\n".bytes())?;
+            left -= n;
+        }
+        out.extend("0\r\n\r\n".bytes())?;
+        return Ok(out);
+    }
+    var text = String.create();
+    text.append("Content-Length: ")?;
+    text.appendNumber(size as u64)?;
+    text.append("\r\n\r\n")?;
+    out.extend(text.view().bytes())?;
+    for (i in 0..size) {
+        out.push('a' + truncate<u8>(i % 26))?;
+    }
+    return Ok(out);
+}
+
+struct Routes {
+    small: Vector<u8>;
+    large: Vector<u8>;
+    chunked: Vector<u8>;
+    empty: Vector<u8>;
+}
+
+/// One connection: every request head that arrives (GETs, no bodies) is answered by its path.
+async fn serveOne(stream: PlainStream, routes: Arc<Routes>) -> Result<void, BenchError> {
+    var conn = stream;
+    let table = routes.get();
+    var buffer = [0u8; 16384];
+    var filled: usize = 0;
+    loop {
+        let n = match (await conn.read(mut buffer[filled..])) {
+            Ok(n) => n,
+            Err(_) => { return Ok(); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        filled += n;
+        var start: usize = 0;
+        loop {
+            let rest = buffer[start..filled];
+            let end = match (rest.indexOf("\r\n\r\n".bytes())) {
+                Some(e) => e,
+                null => { break; },
+            };
+            let head = rest[0..end];
+            let answer = if (head.startsWith("GET /64k".bytes())) table.large.view() else if (head.startsWith(
+                "GET /chunked".bytes(),
+            )) table.chunked.view() else if (head.startsWith(
+                "GET /empty".bytes(),
+            )) table.empty.view() else table.small.view();
+            match (await conn.write(answer)) {
+                Ok() => {}
+                Err(_) => { return Ok(); }
+            }
+            start += end + 4;
+        }
+        if (start > 0) {
+            buffer.copyWithin(start, 0, filled - start);
+            filled -= start;
+        }
+        if (filled == buffer.length) {
+            return Ok();
+        }
+    }
+}
+
+async fn acceptLoop(
+    listener: borrow Listener,
+    routes: borrow Arc<Routes>,
+    set: borrow TaskSet<BenchError>,
+) -> Result<void, BenchError> {
+    loop {
+        let stream = match (await listener.accept()) {
+            Ok(s) => s,
+            Err(_) => { return Err(BenchError.Failed); },
+        };
+        let shared = routes.clone();
+        await set.spawn(async move () => await serveOne(stream, shared))?;
+    }
+}
+
+async fn server(port: u16) -> Result<void, BenchError> {
+    let routes = Arc<Routes>.create(Routes {
+        small: canned(1024, false)!,
+        large: canned(65536, false)!,
+        chunked: canned(1024, true)!,
+        empty: canned(0, false)!,
+    })!;
+    let listener = match (Listener.bind("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(_) => { return Err(BenchError.Failed); },
+    };
+    return await Async.tasks(4096, BenchError.NoMemory, async (set) => await acceptLoop(listener, routes, set));
+}
+
+async fn cosmoWorker(
+    client: borrow cosmohttp.Client,
+    request: borrow cosmohttp.Request,
+    count: u64,
+    bytes: borrow Cell<u64>,
+) -> Result<void, BenchError> {
+    var total: u64 = 0;
+    for (i in 0..count) {
+        let response = match (await client.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => {
+                let said = await AsyncConsole.writeLine(HttpErrors.describe(e));
+                return Err(BenchError.Failed);
+            },
+        };
+        if (response.status() != 200) {
+            return Err(BenchError.Failed);
+        }
+        total += response.body().length as u64;
+    }
+    bytes.set(bytes.get() + total);
+    return Ok();
+}
+
+async fn streamWorker(
+    client: borrow cosmohttp.Client,
+    request: borrow cosmohttp.Request,
+    count: u64,
+    bytes: borrow Cell<u64>,
+) -> Result<void, BenchError> {
+    var total: u64 = 0;
+    var piece = Vector<u8>.create();
+    piece.resize(16384, 0)!;
+    for (i in 0..count) {
+        var response = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(_) => { return Err(BenchError.Failed); },
+        };
+        loop {
+            let n = match (await response.read(piece.viewMut())) {
+                Ok(n) => n,
+                Err(_) => { return Err(BenchError.Failed); },
+            };
+            if (n == 0) {
+                break;
+            }
+            total += n as u64;
+        }
+    }
+    bytes.set(bytes.get() + total);
+    return Ok();
+}
+
+async fn webWorker(
+    client: borrow web_client.Client,
+    url: StringView,
+    count: u64,
+    bytes: borrow Cell<u64>,
+) -> Result<void, BenchError> {
+    var total: u64 = 0;
+    var content = Vector<u8>.create();
+    for (i in 0..count) {
+        var response = match (await client.get(url)) {
+            Ok(r) => r,
+            Err(e) => {
+                let said = await AsyncConsole.writeLine(ClientErrors.describe(e));
+                return Err(BenchError.Failed);
+            },
+        };
+        if (response.status() != 200) {
+            return Err(BenchError.Failed);
+        }
+        content.clear();
+        match (await response.readToEnd(mut content, 1073741824)) {
+            Ok() => {}
+            Err(_) => { return Err(BenchError.Failed); }
+        }
+        match (await response.finish(client)) {
+            Ok() => {}
+            Err(_) => { return Err(BenchError.Failed); }
+        }
+        total += content.length as u64;
+    }
+    bytes.set(bytes.get() + total);
+    return Ok();
+}
+
+async fn report(mode: StringView, requests: u64, concurrency: u64, ms: u64, bytes: u64) -> Result<void, BenchError> {
+    var line = String.create();
+    line.append(mode)!;
+    line.append(" requests=")!;
+    line.appendNumber(requests)!;
+    line.append(" concurrency=")!;
+    line.appendNumber(concurrency)!;
+    line.append(" ms=")!;
+    line.appendNumber(ms)!;
+    line.append(" rps=")!;
+    line.appendNumber(if (ms == 0) 0 else requests * 1000 / ms)!;
+    line.append(" bytes=")!;
+    line.appendNumber(bytes)!;
+    match (await AsyncConsole.writeLine(line.view())) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(BenchError.Failed); }
+    }
+}
+
+async fn client(mode: StringView, url: StringView, requests: u64, concurrency: u64) -> Result<void, BenchError> {
+    let each = requests / concurrency;
+    let bytes = Cell<u64>.create(0);
+    if (mode == "web2") {
+        var options = web_client.ClientOptions.defaults();
+        options.http2Cleartext = true;
+        let web = match (web_client.Client.create(options, null)) {
+            Ok(c) => c,
+            Err(_) => { return Err(BenchError.Failed); },
+        };
+        let drain = match (Drain.create()) {
+            Ok(d) => d,
+            Err(_) => { return Err(BenchError.Failed); },
+        };
+        // web_client's HTTP/2 connections are read and written by `run`, beside the requests.
+        let raced: Result<Raced<u64>, BenchError> = await Async.race(
+            async () => {
+                match (await web.run(drain)) {
+                    Ok() => { return Ok(0u64); }
+                    Err(_) => { return Err(BenchError.Failed); }
+                }
+            },
+            async () => {
+                await Async.scope(BenchError.NoMemory, (s) => {
+                    for (k in 0..concurrency) {
+                        s.spawn(async () => await webWorker(web, url, 20, bytes));
+                    }
+                })?;
+                bytes.set(0);
+                let started = Timer.now();
+                await Async.scope(BenchError.NoMemory, (s) => {
+                    for (k in 0..concurrency) {
+                        s.spawn(async () => await webWorker(web, url, each, bytes));
+                    }
+                })?;
+                return Ok(Timer.now() - started);
+            },
+        );
+        let r = raced?;
+        return await report(mode, each * concurrency, concurrency, r.value, bytes.get());
+    }
+    if (mode == "web") {
+        var options = web_client.ClientOptions.defaults();
+        options.maxPerOrigin = truncate<u32>(concurrency);
+        options.maxIdlePerOrigin = truncate<u32>(concurrency);
+        let web = match (web_client.Client.create(options, null)) {
+            Ok(c) => c,
+            Err(_) => { return Err(BenchError.Failed); },
+        };
+        // Warm: the connections exist before the clock starts.
+        await Async.scope(BenchError.NoMemory, (s) => {
+            for (k in 0..concurrency) {
+                s.spawn(async () => await webWorker(web, url, 20, bytes));
+            }
+        })?;
+        bytes.set(0);
+        let started = Timer.now();
+        await Async.scope(BenchError.NoMemory, (s) => {
+            for (k in 0..concurrency) {
+                s.spawn(async () => await webWorker(web, url, each, bytes));
+            }
+        })?;
+        return await report(mode, each * concurrency, concurrency, Timer.now() - started, bytes.get());
+    }
+    var options = cosmohttp.ClientOptions.defaults();
+    options.maxIdlePerOrigin = truncate<usize>(concurrency);
+    options.http2PriorKnowledge = mode == "cosmo2" || mode == "stream2";
+    let cosmo = cosmohttp.Client.create(options);
+    let request = match (cosmohttp.Request.create(cosmohttp.Method.Get, url)) {
+        Ok(r) => r,
+        Err(_) => { return Err(BenchError.Failed); },
+    };
+    let streamed = mode == "stream" || mode == "stream2";
+    await Async.scope(BenchError.NoMemory, (s) => {
+        for (k in 0..concurrency) {
+            s.spawn(async () => await cosmoWorker(cosmo, request, 20, bytes));
+        }
+    })?;
+    bytes.set(0);
+    let started = Timer.now();
+    await Async.scope(BenchError.NoMemory, (s) => {
+        for (k in 0..concurrency) {
+            if (streamed) {
+                s.spawn(async () => await streamWorker(cosmo, request, each, bytes));
+            } else {
+                s.spawn(async () => await cosmoWorker(cosmo, request, each, bytes));
+            }
+        }
+    })?;
+    return await report(mode, each * concurrency, concurrency, Timer.now() - started, bytes.get());
+}
+
+fn main() {
+    let mode = Process.argument(1) ?? "";
+    if (mode == "server") {
+        let port = truncate<u16>(number(Process.argument(2), 18290));
+        match (Async.run(server(port))) {
+            Ok() => {}
+            Err(_) => {
+                Console.writeLine("bench: the server failed");
+                Process.exit(1);
+            }
+        }
+        return;
+    }
+    if (mode != "cosmo" &&
+        mode != "stream" && mode != "web" && mode != "cosmo2" && mode != "stream2" && mode != "web2") {
+        Console.writeLine(
+            "usage: bench server <port> | bench cosmo|stream|web|cosmo2|stream2|web2 <url> <requests> <concurrency>",
+        );
+        Process.exit(2);
+    }
+    let url = Process.argument(2) ?? "http://127.0.0.1:18290/1k";
+    let requests = number(Process.argument(3), 100000);
+    let concurrency = number(Process.argument(4), 1).max(1);
+    match (Async.run(client(mode, url, requests, concurrency))) {
+        Ok() => {}
+        Err(_) => {
+            Console.writeLine("bench: a request failed");
+            Process.exit(1);
+        }
+    }
+}

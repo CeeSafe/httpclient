@@ -1,0 +1,551 @@
+// The HTTP/1.1 codec (RFC 9112), without I/O: the request head written into a buffer, the response head parsed in
+// place as offsets into the bytes that hold it, and the chunked coding decoded a step at a time. Nothing here
+// allocates once the header table has grown to a response's field count.
+
+/// A response field, as offsets into the buffer that holds the head.
+public struct HeaderSpan {
+    public nameStart: usize;
+    public nameEnd: usize;
+    public valueStart: usize;
+    public valueEnd: usize;
+}
+
+/// How a response's body is delimited (RFC 9112 §6.3).
+public enum Framing {
+    /// No body: a HEAD's answer, 1xx, 204, 304.
+    None,
+    /// `content-length` bytes.
+    Length(u64),
+    /// The chunked coding.
+    Chunked,
+    /// Everything until the server closes the connection.
+    UntilClose,
+}
+
+/// Parses a response head a line at a time, as the bytes arrive. `feed` is called with the whole buffer after every
+/// read; it remembers where it stopped, so no byte is scanned twice.
+public struct HeadParser {
+    /// Where the next line starts; once `feed` returns true, where the body starts.
+    public cursor: usize;
+    public status: u16;
+    /// The minor version: 1 for HTTP/1.1, 0 for HTTP/1.0.
+    public minor: u8;
+    private sawStatus: bool;
+    private hasLength: bool;
+    private length: u64;
+    private hasCoding: bool;
+    private chunked: bool;
+    private close: bool;
+    private keepAlive: bool;
+
+    public fn create() -> HeadParser => HeadParser {
+        cursor: 0,
+        status: 0,
+        minor: 1,
+        sawStatus: false,
+        hasLength: false,
+        length: 0,
+        hasCoding: false,
+        chunked: false,
+        close: false,
+        keepAlive: false,
+    };
+
+    /// Starts over, for a head that begins at `from`.
+    public fn reset(borrow mut this, from: usize) {
+        this.cursor = from;
+        this.status = 0;
+        this.minor = 1;
+        this.sawStatus = false;
+        this.hasLength = false;
+        this.length = 0;
+        this.hasCoding = false;
+        this.chunked = false;
+        this.close = false;
+        this.keepAlive = false;
+    }
+
+    /// Parses the complete lines of `buffer` from where the last call stopped, adding each field to `headers`. True
+    /// once the empty line that ends the head has been seen; false if more bytes are needed.
+    public fn feed(
+        borrow mut this,
+        buffer: Slice<u8>,
+        headers: borrow mut Vector<HeaderSpan>,
+        maxHeaders: usize,
+    ) -> Result<bool, Fault> {
+        loop {
+            let start = this.cursor;
+            let rest = buffer[start..];
+            let found = rest.indexOfByte('\n');
+            if (found == null) {
+                return Ok(false);
+            }
+            var end = start + found!;
+            this.cursor = end + 1;
+            if (end > start && buffer[end - 1] == '\r') {
+                end -= 1;
+            }
+            if (!this.sawStatus) {
+                this.statusLine(buffer[start..end])?;
+                this.sawStatus = true;
+                continue;
+            }
+            if (end == start) {
+                return Ok(true);
+            }
+            if (headers.length >= maxHeaders) {
+                return Err(Fault.TooManyHeaders);
+            }
+            let line = buffer[start..end];
+            let first = line[0];
+            if (first == ' ' || first == '\t') {
+                return Err(Fault.BadHeader); // a folded line (RFC 9112 §5.2)
+            }
+            let colon = line.indexOfByte(':');
+            if (colon == null) {
+                return Err(Fault.BadHeader);
+            }
+            let nameLength = colon!;
+            if (nameLength == 0) {
+                return Err(Fault.BadHeader);
+            }
+            for (i in 0..nameLength) {
+                let b = line[i];
+                if (b <= 32 || b >= 127) {
+                    return Err(Fault.BadHeader); // no whitespace before the colon (§5.1)
+                }
+            }
+            var valueStart = nameLength + 1;
+            var valueEnd = line.length;
+            while (valueStart < valueEnd && (line[valueStart] == ' ' || line[valueStart] == '\t')) {
+                valueStart += 1;
+            }
+            while (valueEnd > valueStart && (line[valueEnd - 1] == ' ' || line[valueEnd - 1] == '\t')) {
+                valueEnd -= 1;
+            }
+            let value = line[valueStart..valueEnd];
+            if (value.indexOfByte('\r') != null || value.indexOfByte(0) != null) {
+                return Err(Fault.BadHeader);
+            }
+            let name = line[0..nameLength];
+            if (nameLength == 14 && name.equalsIgnoreAsciiCase("content-length".bytes())) {
+                this.contentLength(value)?;
+            } else if (nameLength == 17 && name.equalsIgnoreAsciiCase("transfer-encoding".bytes())) {
+                this.hasCoding = true;
+                this.chunked = lastToken(value).equalsIgnoreAsciiCase("chunked".bytes());
+            } else if (nameLength == 10 && name.equalsIgnoreAsciiCase("connection".bytes())) {
+                this.connection(value);
+            }
+            let span = HeaderSpan {
+                nameStart: start,
+                nameEnd: start + nameLength,
+                valueStart: start + valueStart,
+                valueEnd: start + valueEnd,
+            };
+            match (headers.push(span)) {
+                Ok() => {}
+                Err(_) => { return Err(Fault.TooManyHeaders); }
+            }
+        }
+    }
+
+    /// How the body of the parsed head is delimited, for a request whose method was HEAD or not.
+    public fn framing(borrow this, head: bool) -> Framing {
+        if (head || this.status < 200 || this.status == 204 || this.status == 304) {
+            return Framing.None;
+        }
+        if (this.hasCoding) {
+            return if (this.chunked) Framing.Chunked else Framing.UntilClose;
+        }
+        if (this.hasLength) {
+            return Framing.Length(this.length);
+        }
+        return Framing.UntilClose;
+    }
+
+    /// Whether the connection may carry another request once this response's body has been read (RFC 9112 §9.3). A
+    /// response with both `transfer-encoding` and `content-length` never does (§6.1: a smuggling attempt or a broken
+    /// server), nor one whose body ends at the close.
+    public fn reusable(borrow this, head: bool) -> bool {
+        if (this.close || (this.minor == 0 && !this.keepAlive)) {
+            return false;
+        }
+        if (this.hasCoding && (this.hasLength || this.minor == 0)) {
+            return false;
+        }
+        return match (this.framing(head)) {
+            Framing.UntilClose => false,
+            _ => true,
+        };
+    }
+
+    /// `HTTP/1.x NNN[ reason]`.
+    fn statusLine(borrow mut this, line: Slice<u8>) -> Result<void, Fault> {
+        if (line.length < 12 || !line.startsWith("HTTP/1.".bytes()) || line[8] != ' ') {
+            return Err(Fault.BadStatusLine);
+        }
+        let minor = line[7];
+        if (minor != '0' && minor != '1') {
+            return Err(Fault.BadStatusLine);
+        }
+        var status: u16 = 0;
+        for (i in 9..12) {
+            let d = line[i];
+            if (d < '0' || d > '9') {
+                return Err(Fault.BadStatusLine);
+            }
+            status = status * 10 + (d - '0') as u16;
+        }
+        if (status < 100 || (line.length > 12 && line[12] != ' ')) {
+            return Err(Fault.BadStatusLine);
+        }
+        this.minor = minor - '0';
+        this.status = status;
+        return Ok();
+    }
+
+    /// One `content-length` line: a number, or the same number repeated (RFC 9110 §8.6). A second line must agree.
+    fn contentLength(borrow mut this, value: Slice<u8>) -> Result<void, Fault> {
+        var at: usize = 0;
+        var any = false;
+        while (true) {
+            var n: u64 = 0;
+            var digits: u32 = 0;
+            while (at < value.length && value[at] >= '0' && value[at] <= '9') {
+                if (digits >= 19) {
+                    return Err(Fault.BadContentLength);
+                }
+                n = n * 10 + (value[at] - '0') as u64;
+                digits += 1;
+                at += 1;
+            }
+            if (digits == 0) {
+                return Err(Fault.BadContentLength);
+            }
+            if ((any || this.hasLength) && n != this.length) {
+                return Err(Fault.BadContentLength);
+            }
+            this.length = n;
+            any = true;
+            while (at < value.length && (value[at] == ' ' || value[at] == '\t')) {
+                at += 1;
+            }
+            if (at >= value.length) {
+                break;
+            }
+            if (value[at] != ',') {
+                return Err(Fault.BadContentLength);
+            }
+            at += 1;
+            while (at < value.length && (value[at] == ' ' || value[at] == '\t')) {
+                at += 1;
+            }
+        }
+        this.hasLength = true;
+        return Ok();
+    }
+
+    /// The `connection` options that matter: `close` and `keep-alive`.
+    fn connection(borrow mut this, value: Slice<u8>) {
+        var at: usize = 0;
+        while (at < value.length) {
+            var end = at;
+            while (end < value.length && value[end] != ',') {
+                end += 1;
+            }
+            let token = value[at..end].trim();
+            if (token.length == 5 && token.equalsIgnoreAsciiCase("close".bytes())) {
+                this.close = true;
+            } else if (token.length == 10 && token.equalsIgnoreAsciiCase("keep-alive".bytes())) {
+                this.keepAlive = true;
+            }
+            at = end + 1;
+        }
+    }
+}
+
+/// The last element of a comma-separated list, trimmed.
+fn lastToken<region r>(value: Slice<r, u8>) -> Slice<r, u8> {
+    var start: usize = 0;
+    for (i in 0..value.length) {
+        if (value[i] == ',') {
+            start = i + 1;
+        }
+    }
+    return value[start..].trim();
+}
+
+/// What `ChunkDecoder.next` found at the front of the raw bytes.
+public enum ChunkStep {
+    /// Skip this many framing bytes, then read more: the next piece of framing is not complete yet.
+    Need(usize),
+    /// Skip this many framing bytes; the next `length` bytes are body data.
+    Data(usize, usize),
+    /// Skip this many bytes: the body is complete, trailer section included.
+    Done(usize),
+}
+
+/// The chunked coding (RFC 9112 §7.1), decoded a step at a time from the bytes that have arrived. Chunk extensions
+/// and trailer fields are skipped.
+public struct ChunkDecoder {
+    /// 0 a size line, 1 data, 2 the CRLF after data, 3 the trailer section, 4 done.
+    private phase: u8;
+    private remaining: u64;
+    private trailerBytes: usize;
+
+    public fn create() -> ChunkDecoder => ChunkDecoder { phase: 0, remaining: 0, trailerBytes: 0 };
+
+    public fn isDone(borrow this) -> bool => this.phase == 4;
+
+    /// The data bytes left in the chunk being read; 0 between chunks.
+    public fn dataLeft(borrow this) -> u64 => if (this.phase == 1) this.remaining else 0;
+
+    /// `n` of the chunk's data bytes were read from somewhere else (`n <= dataLeft()`).
+    public fn took(borrow mut this, n: usize) {
+        this.remaining -= n as u64;
+        if (this.remaining == 0) {
+            this.phase = 2;
+        }
+    }
+
+    /// The last `n` bytes of the `Data` step just returned were not taken: they are data still to come.
+    public fn putBack(borrow mut this, n: usize) {
+        this.remaining += n as u64;
+        this.phase = 1;
+    }
+
+    /// The next step over `raw`, the undecoded bytes in hand. The caller drops the bytes a step says to skip (and the
+    /// data bytes it took) before the next call.
+    public fn next(borrow mut this, raw: Slice<u8>) -> Result<ChunkStep, Fault> {
+        var at: usize = 0;
+        loop {
+            if (this.phase == 1) {
+                let available = raw.length - at;
+                if (available == 0) {
+                    return Ok(ChunkStep.Need(at));
+                }
+                var take = available;
+                if (take as u64 > this.remaining) {
+                    take = truncate<usize>(this.remaining);
+                }
+                this.remaining -= take as u64;
+                if (this.remaining == 0) {
+                    this.phase = 2;
+                }
+                return Ok(ChunkStep.Data(at, take));
+            }
+            if (this.phase == 2) {
+                if (at >= raw.length) {
+                    return Ok(ChunkStep.Need(at));
+                }
+                if (raw[at] == '\n') {
+                    at += 1;
+                } else {
+                    if (raw[at] != '\r') {
+                        return Err(Fault.BadChunk);
+                    }
+                    if (at + 1 >= raw.length) {
+                        return Ok(ChunkStep.Need(at));
+                    }
+                    if (raw[at + 1] != '\n') {
+                        return Err(Fault.BadChunk);
+                    }
+                    at += 2;
+                }
+                this.phase = 0;
+                continue;
+            }
+            if (this.phase == 4) {
+                return Ok(ChunkStep.Done(at));
+            }
+            // A line: a chunk's size, or a trailer field.
+            let rest = raw[at..];
+            let found = rest.indexOfByte('\n');
+            if (found == null) {
+                if (rest.length > 8192) {
+                    return Err(Fault.BadChunk);
+                }
+                return Ok(ChunkStep.Need(at));
+            }
+            var end = found!;
+            let after = at + end + 1;
+            if (end > 0 && rest[end - 1] == '\r') {
+                end -= 1;
+            }
+            let line = rest[0..end];
+            at = after;
+            if (this.phase == 3) {
+                if (line.length == 0) {
+                    this.phase = 4;
+                    return Ok(ChunkStep.Done(at));
+                }
+                this.trailerBytes += line.length;
+                if (this.trailerBytes > 65536) {
+                    return Err(Fault.BadChunk);
+                }
+                continue;
+            }
+            var size: u64 = 0;
+            var digits: usize = 0;
+            while (digits < line.length) {
+                let b = line[digits];
+                var d: u8 = 0;
+                if (b >= '0' && b <= '9') {
+                    d = b - '0';
+                } else if (b >= 'a' && b <= 'f') {
+                    d = b - 'a' + 10;
+                } else if (b >= 'A' && b <= 'F') {
+                    d = b - 'A' + 10;
+                } else {
+                    break;
+                }
+                if (digits >= 16) {
+                    return Err(Fault.BadChunk);
+                }
+                size = (size << 4) | d as u64;
+                digits += 1;
+            }
+            if (digits == 0) {
+                return Err(Fault.BadChunk);
+            }
+            // After the size: nothing, or whitespace and a chunk extension, which is ignored (§7.1.1).
+            if (digits < line.length) {
+                let b = line[digits];
+                if (b != ';' && b != ' ' && b != '\t') {
+                    return Err(Fault.BadChunk);
+                }
+            }
+            if (size == 0) {
+                this.phase = 3;
+            } else {
+                this.remaining = size;
+                this.phase = 1;
+            }
+        }
+    }
+}
+
+/// The methods a request can have.
+public enum Method {
+    Get,
+    Head,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Options,
+    Trace,
+}
+
+/// Method names.
+public struct Methods {
+    /// The method's token.
+    public fn token(m: Method) -> StringView => match (m) {
+        Method.Get => "GET",
+        Method.Head => "HEAD",
+        Method.Post => "POST",
+        Method.Put => "PUT",
+        Method.Delete => "DELETE",
+        Method.Patch => "PATCH",
+        Method.Options => "OPTIONS",
+        Method.Trace => "TRACE",
+    };
+
+    /// Whether a request with this method says `content-length: 0` when it has no body (RFC 9110 §8.6: a method
+    /// that defines a meaning for content).
+    public fn sendsLength(m: Method) -> bool => match (m) {
+        Method.Post => true,
+        Method.Put => true,
+        Method.Patch => true,
+        _ => false,
+    };
+
+    /// Whether repeating the request is safe by the method's definition (RFC 9110 §9.2.2).
+    public fn idempotent(m: Method) -> bool => match (m) {
+        Method.Post => false,
+        Method.Patch => false,
+        _ => true,
+    };
+}
+
+/// Appends a request head to `out`: the request line, `Host`, the caller's `fields` (complete `name: value\r\n`
+/// lines), `Content-Length` when `length` is given, and the empty line.
+public fn writeRequestHead(
+    out: borrow mut Vector<u8>,
+    method: Method,
+    url: Slice<u8>,
+    parts: borrow UrlParts,
+    fields: Slice<u8>,
+    length: u64?,
+) -> Result<void, AllocError> {
+    let token = Methods.token(method).bytes();
+    let target = parts.target(url);
+    let authority = parts.authority(url);
+    out.reserve(token.length + target.length + authority.length + fields.length + 64)?;
+    out.extend(token)?;
+    if (target.length == 0 || target[0] != '/') {
+        out.extend(" /".bytes())?;
+    } else {
+        out.extend(" ".bytes())?;
+    }
+    out.extend(target)?;
+    out.extend(" HTTP/1.1\r\nHost: ".bytes())?;
+    out.extend(authority)?;
+    out.extend("\r\n".bytes())?;
+    out.extend(fields)?;
+    match (length) {
+        Some(n) => {
+            out.extend("Content-Length: ".bytes())?;
+            var digits = [0u8; 20];
+            var at: usize = 20;
+            var v = n;
+            loop {
+                at -= 1;
+                digits[at] = '0' + truncate<u8>(v % 10);
+                v /= 10;
+                if (v == 0) {
+                    break;
+                }
+            }
+            out.extend(digits[at..])?;
+            out.extend("\r\n\r\n".bytes())?;
+        }
+        null => {
+            out.extend("\r\n".bytes())?;
+        }
+    }
+    return Ok();
+}
+
+/// Whether `name` is a field name (RFC 9110 §5.1: a token).
+public fn isFieldName(name: Slice<u8>) -> bool {
+    if (name.length == 0) {
+        return false;
+    }
+    for (b in name) {
+        let ok = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' ||
+            b == '.' || b == '!' || b == '#' || b == '$' || b == '%' || b == '&' || b == '\'' || b == '*' || b == '+' ||
+            b == '^' || b == '`' || b == '|' || b == 126;
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether `value` can be a field's value: no CR, LF or NUL (RFC 9110 §5.5), and no whitespace at either end.
+public fn isFieldValue(value: Slice<u8>) -> bool {
+    for (b in value) {
+        if (b == '\r' || b == '\n' || b == 0) {
+            return false;
+        }
+    }
+    if (value.length > 0) {
+        let first = value[0];
+        let last = value[value.length - 1];
+        if (first == ' ' || first == '\t' || last == ' ' || last == '\t') {
+            return false;
+        }
+    }
+    return true;
+}

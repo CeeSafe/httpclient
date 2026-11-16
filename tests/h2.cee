@@ -1,0 +1,652 @@
+// HTTP/2 over scripted connections: the server's frames are written by hand here, and what the client wrote is
+// read back frame by frame.
+import web_core;
+import web_transport;
+
+/// Appends a frame.
+fn frame(out: borrow mut Vector<u8>, kind: u8, flags: u8, id: u32, payload: Slice<u8>) -> Result<void, TestFailure> {
+    made(frameHeader(mut out, payload.length, kind, flags, id))?;
+    return made(out.extend(payload));
+}
+
+/// Appends a HEADERS frame for stream `id` whose block is `:status` and `fields` (name, value, ...).
+fn headers(out: borrow mut Vector<u8>, id: u32, status: StringView, fields: Slice<StringView>, flags: u8) -> Result<void, TestFailure> {
+    var block = Vector<u8>.create();
+    made(hpackLiteral(mut block, 8, "".bytes(), status.bytes(), false))?;
+    var i: usize = 0;
+    while (i < fields.length) {
+        made(hpackLiteral(mut block, 0, fields[i].bytes(), fields[i + 1].bytes(), false))?;
+        i += 2;
+    }
+    return frame(mut out, 1, flags, id, block.view());
+}
+
+fn data(out: borrow mut Vector<u8>, id: u32, text: StringView, end: bool) -> Result<void, TestFailure> =>
+    frame(mut out, 0, if (end) 1 else 0, id, text.bytes());
+
+/// The server's first frame: its (empty) SETTINGS.
+fn settings(out: borrow mut Vector<u8>) -> Result<void, TestFailure> => frame(mut out, 4, 0, 0, "".bytes());
+
+/// The next dial of `client` gets a connection whose server sends `bytes`, at most `chunk` a read (0: as much as
+/// fits), every read and write pausing `pauseMs` first (so other tasks run), its writes copied to `copies`.
+fn scriptBytes(
+    client: borrow Client,
+    bytes: Slice<u8>,
+    chunk: usize,
+    pauseMs: u64,
+    copies: borrow Channel<u8>,
+) -> Result<void, TestFailure> {
+    var mock = made(MockTransport.create(bytes))?.withCopiesTo(copies);
+    if (chunk > 0) {
+        mock = mock.withChunk(chunk);
+    }
+    if (pauseMs > 0) {
+        mock = mock.withPause(pauseMs);
+    }
+    return made(client.script(mock));
+}
+
+/// A client that speaks HTTP/2 to http URLs.
+fn h2Client() -> Client {
+    var options = ClientOptions.defaults();
+    options.http2PriorKnowledge = true;
+    return Client.create(options);
+}
+
+/// One frame the client wrote.
+struct Sent {
+    kind: u8;
+    flags: u8;
+    id: u32;
+    start: usize;
+    end: usize;
+}
+
+/// The frames in `wire`, which begins with the connection preface if `preface`.
+fn sentFrames(wire: Slice<u8>, preface: bool) -> Result<Vector<Sent>, TestFailure> {
+    var out = Vector<Sent>.create();
+    var at: usize = 0;
+    if (preface) {
+        Check.isTrue(wire.length >= 24, "the preface was written")?;
+        Check.equalBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".bytes(), wire[0..24])?;
+        at = 24;
+    }
+    while (at < wire.length) {
+        Check.isTrue(wire.length - at >= 9, "a whole frame header")?;
+        let length = ((wire[at] as usize) << 16) | ((wire[at + 1] as usize) << 8) | wire[at + 2] as usize;
+        let sent = Sent {
+            kind: wire[at + 3],
+            flags: wire[at + 4],
+            id: wire.readBE<u32>(at + 5),
+            start: at + 9,
+            end: at + 9 + length,
+        };
+        Check.isTrue(sent.end <= wire.length, "a whole frame")?;
+        made(out.push(sent))?;
+        at = sent.end;
+    }
+    return Ok(out);
+}
+
+/// Checks that the HEADERS frame `sent` in `wire` holds exactly `expected` (name, value, ...).
+fn expectRequest(
+    decoder: borrow mut HpackDecoder,
+    wire: Slice<u8>,
+    sent: Sent,
+    expected: Slice<StringView>,
+) -> Result<void, TestFailure> {
+    Check.equalU64(1, sent.kind as u64)?;
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    match (decoder.decode(wire[sent.start..sent.end], mut out, mut spans, 65536, 100)) {
+        Ok() => {}
+        Err(f) => { return Err(TestFailure.create(HttpErrors.fault(f))); }
+    }
+    Check.equalU64((expected.length / 2) as u64, spans.length as u64)?;
+    for (i in 0..spans.length) {
+        Check.equalBytes(expected[i * 2].bytes(), out[spans[i].nameStart..spans[i].nameEnd])?;
+        Check.equalBytes(expected[i * 2 + 1].bytes(), out[spans[i].valueStart..spans[i].valueEnd])?;
+    }
+    return Ok();
+}
+
+@test
+async fn h2Get() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    let fields = ["content-type", "text/plain", "x-two", "2"];
+    headers(mut server, 1, "200", fields[..], 4)?;
+    data(mut server, 1, "hello", true)?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/greeting?x=1")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.isHttp2(), "over HTTP/2")?;
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("hello".bytes(), response.body())?;
+        Check.equalU64(2, response.headerCount() as u64)?;
+        Check.equalBytes("content-type".bytes(), response.name(0))?;
+        match (response.header("Content-Type")) {
+            Some(v) => { Check.equalBytes("text/plain".bytes(), v)?; }
+            null => { return Check.fail("content-type"); }
+        }
+        Check.isTrue(response.header(":status") == null, "the pseudo-field is not a field")?;
+        Check.isTrue(response.isComplete(), "complete")?;
+    }
+    // What went out: the preface, SETTINGS (push off, the stream window), the connection's window, the request,
+    // and the acknowledgement of the server's SETTINGS.
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    Check.equalU64(4, sent.length as u64)?;
+    Check.equalU64(4, sent[0].kind as u64)?;
+    let ours = hex("0002 00000000 0004 00200000")?;
+    Check.equalBytes(ours.view(), wire[sent[0].start..sent[0].end])?;
+    Check.equalU64(8, sent[1].kind as u64)?;
+    Check.equalU64(16777216 - 65535, wire.readBE<u32>(sent[1].start) as u64)?;
+    Check.equalU64(1, sent[2].id as u64)?;
+    Check.equalU64(5, sent[2].flags as u64)?; // END_HEADERS and END_STREAM
+    var decoder = HpackDecoder.create(4096);
+    let expected = [":method", "GET", ":scheme", "http", ":authority", "example.com", ":path", "/greeting?x=1"];
+    expectRequest(mut decoder, wire.view(), sent[2], expected[..])?;
+    Check.equalU64(4, sent[3].kind as u64)?;
+    Check.equalU64(1, sent[3].flags as u64)?;
+    return Ok();
+}
+
+@test
+async fn h2PostAndReuse() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // Two responses of the same size, a read giving one at a time; the first read also carries the SETTINGS.
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 1, "201", [], 4)?;
+    data(mut server, 1, "one", true)?;
+    let first = server.length;
+    headers(mut server, 3, "202", [], 4)?;
+    data(mut server, 3, "three3three3", true)?;
+    Check.equalU64(first as u64, (server.length - first) as u64)?;
+    scriptBytes(client, server.view(), first, 0, copies)?;
+    var request = match (Request.create(Method.Post, "http://example.com:8080/orders")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    for (pair in [["Content-Type", "application/json"], ["Authorization", "Bearer s"], ["Connection", "keep-alive"], ["X-Trace", "abc"]]) {
+        match (request.header(pair[0], pair[1])) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+    }
+    {
+        let response = match (await client.send(request, "{\"n\":1}".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(201, response.status() as u64)?;
+        Check.equalBytes("one".bytes(), response.body())?;
+    }
+    {
+        let response = match (await client.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(202, response.status() as u64)?;
+        Check.equalBytes("three3three3".bytes(), response.body())?;
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    // SETTINGS, WINDOW_UPDATE, HEADERS 1, DATA 1, the SETTINGS acknowledgement, HEADERS 3.
+    Check.equalU64(6, sent.length as u64)?;
+    var decoder = HpackDecoder.create(4096);
+    let one = [
+        ":method", "POST", ":scheme", "http", ":authority", "example.com:8080", ":path", "/orders", "content-type",
+        "application/json", "authorization", "Bearer s", "x-trace", "abc", "content-length", "7",
+    ];
+    expectRequest(mut decoder, wire.view(), sent[2], one[..])?;
+    Check.equalU64(4, sent[2].flags as u64)?; // END_HEADERS only: the body follows
+    Check.equalU64(0, sent[3].kind as u64)?;
+    Check.equalU64(1, sent[3].flags as u64)?;
+    Check.equalBytes("{\"n\":1}".bytes(), wire[sent[3].start..sent[3].end])?;
+    let three = [
+        ":method", "POST", ":scheme", "http", ":authority", "example.com:8080", ":path", "/orders", "content-type",
+        "application/json", "authorization", "Bearer s", "x-trace", "abc", "content-length", "0",
+    ];
+    Check.equalU64(3, sent[5].id as u64)?;
+    expectRequest(mut decoder, wire.view(), sent[5], three[..])?;
+    Check.equalU64(0, decoder.count() as u64)?; // the client's fields enter no table
+    return Ok();
+}
+
+async fn fetchOne(client: borrow Client, path: StringView, expected: StringView) -> Result<void, TestFailure> {
+    let response = match (await client.get(path)) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    return Check.equalBytes(expected.bytes(), response.body());
+}
+
+@test
+async fn h2ManyAtOnce() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = h2Client();
+    // Three requests on one connection, answered out of order and interleaved.
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    headers(mut server, 5, "200", [], 4)?;
+    headers(mut server, 1, "200", [], 4)?;
+    data(mut server, 5, "fi", false)?;
+    headers(mut server, 3, "200", [], 4)?;
+    data(mut server, 1, "one", true)?;
+    data(mut server, 5, "ve", true)?;
+    data(mut server, 3, "three", true)?;
+    // Every write and read pauses, so the three tasks have all sent their requests before any answer is read; a
+    // read gives 7 bytes, so frames are cut anywhere.
+    scriptBytes(client, server.view(), 7, 2, copies)?;
+    await Async.scope(TestFailure.create("out of memory"), (s) => {
+        s.spawn(async () => await fetchOne(client, "http://example.com/1", "one"));
+        s.spawn(async () => await fetchOne(client, "http://example.com/3", "three"));
+        s.spawn(async () => await fetchOne(client, "http://example.com/5", "five"));
+    })?;
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var requests: u64 = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 1) {
+            requests += 1;
+        }
+    }
+    Check.equalU64(3, requests)?;
+    return Ok();
+}
+
+/// One streamed response, the server's bytes arriving `chunk` at a time.
+async fn streamedOnce(request: borrow Request, chunk: usize, copies: borrow Channel<u8>) -> Result<void, TestFailure> {
+    let fresh = h2Client();
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    // An interim response, the head over two frames, a padded DATA frame, an empty one, and trailers.
+    headers(mut server, 1, "103", ["link", "</a>"][..], 4)?;
+    var block = Vector<u8>.create();
+    made(hpackLiteral(mut block, 8, "".bytes(), "200".bytes(), false))?;
+    made(hpackLiteral(mut block, 0, "x-a".bytes(), "1".bytes(), false))?;
+    frame(mut server, 1, 0, 1, block[0..3])?;
+    frame(mut server, 9, 4, 1, block[3..])?;
+    data(mut server, 1, "abcdefghij", false)?;
+    var padded = Vector<u8>.create();
+    made(padded.push(3))?;
+    made(padded.extend("klmnopqrst".bytes()))?;
+    made(padded.extend([0u8, 0, 0][..]))?;
+    frame(mut server, 0, 8, 1, padded.view())?;
+    data(mut server, 1, "", false)?;
+    data(mut server, 1, "uvwxyz", false)?;
+    var trailers = Vector<u8>.create();
+    made(hpackLiteral(mut trailers, 0, "x-checksum".bytes(), "ok".bytes(), false))?;
+    frame(mut server, 1, 5, 1, trailers.view())?;
+    scriptBytes(fresh, server.view(), chunk, 0, copies)?;
+    var response = match (await fresh.open(request, "".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalU64(200, response.status() as u64)?;
+    Check.equalU64(1, response.headerCount() as u64)?;
+    Check.equalBytes("x-a".bytes(), response.name(0))?;
+    var out = Vector<u8>.create();
+    await drain(mut response, 1 + chunk % 9, mut out)?;
+    Check.equalBytes("abcdefghijklmnopqrstuvwxyz".bytes(), out.view())?;
+    Check.isTrue(response.isComplete(), "read to the end")?;
+    return Ok();
+}
+
+@test
+async fn h2Streamed() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let request = match (Request.create(Method.Get, "http://example.com/stream")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    for (chunk in 1..40) {
+        await streamedOnce(request, chunk, copies)?;
+    }
+    return Ok();
+}
+
+@test
+async fn h2LargeBodies() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(1048576))?;
+    let client = h2Client();
+    // The request's body is longer than the peer's first window (65,535), so it waits for the WINDOW_UPDATEs, which
+    // arrive alone in the first read (9 + 13 + 13 bytes); the response's body is longer than a frame and comes in
+    // three, read 35 bytes at a time and then straight into the body.
+    var upload = Vector<u8>.create();
+    made(upload.resize(100000, 'u'))?;
+    var download = Vector<u8>.create();
+    for (i in 0..40000) {
+        made(download.push('a' + truncate<u8>(i % 26)))?;
+    }
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    let more = hex("000186a0")?;
+    frame(mut server, 8, 0, 0, more.view())?;
+    frame(mut server, 8, 0, 1, more.view())?;
+    headers(mut server, 1, "200", ["content-length", "40000"][..], 4)?;
+    frame(mut server, 0, 0, 1, download[0..16384])?;
+    frame(mut server, 0, 0, 1, download[16384..32768])?;
+    frame(mut server, 0, 1, 1, download[32768..])?;
+    scriptBytes(client, server.view(), 35, 0, copies)?;
+    let request = match (Request.create(Method.Put, "http://example.com/blob")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let response = match (await client.send(request, upload.view())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes(download.view(), response.body())?;
+        match (response.contentLength()) {
+            Some(n) => { Check.equalU64(40000, n)?; }
+            null => { return Check.fail("content-length"); }
+        }
+    }
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var body = Vector<u8>.create();
+    var last: u8 = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 0) {
+            Check.isTrue(sent[i].end - sent[i].start <= 16384, "no frame above the peer's limit")?;
+            made(body.extend(wire[sent[i].start..sent[i].end]))?;
+            last = sent[i].flags;
+        }
+    }
+    Check.equalBytes(upload.view(), body.view())?;
+    Check.equalU64(1, last as u64)?;
+    return Ok();
+}
+
+@test
+async fn h2ResetAndRefusal() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // The server refuses stream 1 (REFUSED_STREAM): the GET is sent again, as stream 3, which it answers. The
+    // SETTINGS and the reset are one read of 22 bytes.
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    let refused = hex("00000007")?;
+    frame(mut server, 3, 0, 1, refused.view())?;
+    headers(mut server, 3, "200", [], 4)?;
+    data(mut server, 3, "second try", true)?;
+    scriptBytes(client, server.view(), 22, 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("second try".bytes(), response.body())?;
+    }
+    // A reset with another code is the request's failure, and a POST is not sent again.
+    let other = h2Client();
+    var failing = Vector<u8>.create();
+    settings(mut failing)?;
+    let broken = hex("00000002")?;
+    frame(mut failing, 3, 0, 1, broken.view())?;
+    scriptBytes(other, failing.view(), 0, 0, copies)?;
+    let request = match (Request.create(Method.Post, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (await other.send(request, "x".bytes())) {
+        Err(HttpError.Reset(2)) => {}
+        Err(e) => { return Err(failed(e)); }
+        Ok(_) => { return Check.fail("a response from a reset stream"); }
+    }
+    return Ok();
+}
+
+@test
+async fn h2GoAwayMovesToANewConnection() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // The first connection says GOAWAY with no stream accepted; the request goes again on a second connection.
+    var leaving = Vector<u8>.create();
+    settings(mut leaving)?;
+    let nothing = hex("00000000 00000000")?;
+    frame(mut leaving, 7, 0, 0, nothing.view())?;
+    scriptBytes(client, leaving.view(), 0, 0, copies)?;
+    var serving = Vector<u8>.create();
+    settings(mut serving)?;
+    headers(mut serving, 1, "200", [], 4)?;
+    data(mut serving, 1, "elsewhere", true)?;
+    scriptBytes(client, serving.view(), 0, 0, copies)?;
+    let request = match (Request.create(Method.Post, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    let response = match (await client.send(request, "x".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalBytes("elsewhere".bytes(), response.body())?;
+    return Ok();
+}
+
+@test
+async fn h2Faults() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    var scripts = Vector<Vector<u8>>.create();
+    // 0: a frame longer than the limit.
+    var s0 = Vector<u8>.create();
+    settings(mut s0)?;
+    made(s0.extend(hex("004001 00 00 00000001")?.view()))?;
+    made(scripts.push(s0))?;
+    // 1: DATA before any HEADERS.
+    var s1 = Vector<u8>.create();
+    settings(mut s1)?;
+    data(mut s1, 1, "x", true)?;
+    made(scripts.push(s1))?;
+    // 2: a field block HPACK cannot decode.
+    var s2 = Vector<u8>.create();
+    settings(mut s2)?;
+    frame(mut s2, 1, 5, 1, hex("be")?.view())?;
+    made(scripts.push(s2))?;
+    // 3: a body shorter than its content-length.
+    var s3 = Vector<u8>.create();
+    settings(mut s3)?;
+    headers(mut s3, 1, "200", ["content-length", "9"][..], 4)?;
+    data(mut s3, 1, "short", true)?;
+    made(scripts.push(s3))?;
+    // 4: the connection ends inside the response.
+    var s4 = Vector<u8>.create();
+    settings(mut s4)?;
+    headers(mut s4, 1, "200", [], 4)?;
+    made(scripts.push(s4))?;
+    // 5: PUSH_PROMISE, which this client switched off.
+    var s5 = Vector<u8>.create();
+    settings(mut s5)?;
+    frame(mut s5, 5, 4, 1, hex("00000002 88")?.view())?;
+    made(scripts.push(s5))?;
+    // 6: a head without :status.
+    var s6 = Vector<u8>.create();
+    settings(mut s6)?;
+    var block = Vector<u8>.create();
+    made(hpackLiteral(mut block, 0, "x-a".bytes(), "1".bytes(), false))?;
+    frame(mut s6, 1, 5, 1, block.view())?;
+    made(scripts.push(s6))?;
+    for (i in 0..scripts.length) {
+        let client = h2Client();
+        scriptBytes(client, scripts[i].view(), 0, 0, copies)?;
+        let request = match (Request.create(Method.Post, "http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        let got = await client.send(request, "x".bytes());
+        let right = match (got) {
+            Err(HttpError.Response(Fault.BadFrame)) => i == 0 || i == 1 || i == 5,
+            Err(HttpError.Response(Fault.BadCompression)) => i == 2,
+            Err(HttpError.Response(Fault.Truncated)) => i == 3,
+            Err(HttpError.Net(NetError.Closed)) => i == 4,
+            Err(HttpError.Response(Fault.BadStatusLine)) => i == 6,
+            _ => false,
+        };
+        if (!right) {
+            var text = String.create();
+            made(text.append("fault script "))?;
+            made(text.appendNumber(i as u64))?;
+            return Err(TestFailure.create(text.view()));
+        }
+    }
+    return Ok();
+}
+
+/// How many RST_STREAM frames with the code CANCEL, and how many PING acknowledgements of `opaque`, are in `wire`.
+fn countResets(wire: Slice<u8>, opaque: Slice<u8>, pings: borrow mut u64) -> Result<u64, TestFailure> {
+    let sent = sentFrames(wire, true)?;
+    var resets: u64 = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].kind == 6) {
+            *pings += 1;
+            Check.equalU64(1, sent[i].flags as u64)?;
+            Check.equalBytes(opaque, wire[sent[i].start..sent[i].end])?;
+        }
+        if (sent[i].kind == 3) {
+            resets += 1;
+            Check.equalU64(8, wire.readBE<u32>(sent[i].start) as u64)?; // CANCEL
+        }
+    }
+    return Ok(resets);
+}
+
+@test
+async fn h2PingTimeoutAndAbandon() -> Result<void, TestFailure> {
+    var options = ClientOptions.defaults();
+    options.http2PriorKnowledge = true;
+    options.responseMs = 60;
+    let opaque = hex("0102030405060708")?;
+    // A PING to answer, then a head and no end: the buffered GET times out and its stream is reset. The reset goes
+    // out with the next request, which times out too (the server says nothing more).
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(options);
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    frame(mut server, 6, 0, 0, opaque.view())?;
+    headers(mut server, 1, "200", [], 4)?;
+    let silent = made(MockTransport.create(server.view()))?.withCopiesTo(copies).withHang();
+    made(client.script(silent))?;
+    for (k in 0..2) {
+        match (await client.get("http://example.com/slow")) {
+            Err(HttpError.Net(NetError.TimedOut)) => {}
+            Err(e) => { return Err(failed(e)); }
+            Ok(_) => { return Check.fail("a response without an end"); }
+        }
+    }
+    let wire = written(copies)?;
+    var pings: u64 = 0;
+    Check.equalU64(1, countResets(wire.view(), opaque.view(), mut pings)?)?;
+    Check.equalU64(1, pings)?;
+    // A streamed response dropped before its end is reset as well.
+    let others = made(Channel<u8>.create(8192))?;
+    let second = Client.create(options);
+    var partial = Vector<u8>.create();
+    settings(mut partial)?;
+    headers(mut partial, 1, "200", [], 4)?;
+    data(mut partial, 1, "partial", false)?;
+    let cut = made(MockTransport.create(partial.view()))?.withCopiesTo(others).withHang();
+    made(second.script(cut))?;
+    let request = match (Request.create(Method.Get, "http://example.com/stream")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        var response = match (await second.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var piece = [0u8; 4];
+        match (await response.read(mut piece[..])) {
+            Ok(n) => { Check.equalBytes("part".bytes(), piece[0..n])?; }
+            Err(e) => { return Err(failed(e)); }
+        }
+        Check.isTrue(!response.isComplete(), "more to come")?;
+    }
+    match (await second.get("http://example.com/last")) {
+        Err(HttpError.Net(NetError.TimedOut)) => {}
+        Err(e) => { return Err(failed(e)); }
+        Ok(_) => { return Check.fail("a response from a silent server"); }
+    }
+    let rest = written(others)?;
+    var none: u64 = 0;
+    Check.equalU64(1, countResets(rest.view(), opaque.view(), mut none)?)?;
+    return Ok();
+}
+
+@test
+async fn h2HuffmanResponse() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // RFC 7541 C.6.1's block as a response's head: Huffman strings, entries added to the dynamic table; then
+    // C.6.2's, which refers to them, for a second request.
+    var server = Vector<u8>.create();
+    settings(mut server)?;
+    let first = hex(
+        "4882 6402 5885 aec3 771a 4b61 96d0 7abe 9410 54d4 44a8 2005 9504 0b81 66e0 82a6 2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 e9ae 82ae 43d3",
+    )?;
+    frame(mut server, 1, 5, 1, first.view())?;
+    let cut = server.length;
+    let second = hex("4883 640e ffc1 c0bf")?;
+    frame(mut server, 1, 5, 3, second.view())?;
+    scriptBytes(client, server.view(), cut, 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(302, response.status() as u64)?;
+        match (response.header("location")) {
+            Some(v) => { Check.equalBytes("https://www.example.com".bytes(), v)?; }
+            null => { return Check.fail("location"); }
+        }
+    }
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(307, response.status() as u64)?;
+        match (response.header("date")) {
+            Some(v) => { Check.equalBytes("Mon, 21 Oct 2013 20:13:21 GMT".bytes(), v)?; }
+            null => { return Check.fail("date"); }
+        }
+    }
+    return Ok();
+}
+
+@test
+async fn h2UnsentRequestMovesOn() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // The first connection fails while the request is being written: the server cannot have it, so even a POST goes
+    // again, on a second connection.
+    let dead = made(MockTransport.create("".bytes()))?.withWriteFailureAfter(10);
+    made(client.script(dead))?;
+    var serving = Vector<u8>.create();
+    settings(mut serving)?;
+    headers(mut serving, 1, "200", [], 4)?;
+    data(mut serving, 1, "delivered", true)?;
+    scriptBytes(client, serving.view(), 0, 0, copies)?;
+    let request = match (Request.create(Method.Post, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    let response = match (await client.send(request, "x".bytes())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.equalBytes("delivered".bytes(), response.body())?;
+    return Ok();
+}

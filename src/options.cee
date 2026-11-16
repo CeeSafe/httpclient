@@ -1,0 +1,60 @@
+// A client's bounds and timeouts.
+
+/// A client's bounds and timeouts. Times are milliseconds, and 0 means no limit of that kind.
+public struct ClientOptions {
+    /// To connect one address (TCP).
+    public connectMs: u64;
+    /// For the TLS handshake.
+    public handshakeMs: u64;
+    /// From sending a request to the end of its response's head; for a buffered response, to the end of its body.
+    public responseMs: u64;
+    /// How long an idle connection is kept.
+    public idleMs: u64;
+    /// Idle connections kept for each origin.
+    public maxIdlePerOrigin: usize;
+    /// Requests in flight to one origin at a time (each has a connection); the next waits. 0: no limit.
+    public maxPerOrigin: usize;
+    /// A connection's read buffer to begin with; it grows to the largest head or buffered body it has held.
+    public bufferSize: usize;
+    /// A buffer larger than this is not kept when its connection goes back to the pool.
+    public maxKeptBuffer: usize;
+    /// The largest response head.
+    public maxHeadBytes: usize;
+    /// The most fields in a response head.
+    public maxHeaders: usize;
+    /// The largest body a buffered response may have.
+    public maxBodyBytes: u64;
+    /// Send a request again, on a new connection, when a pooled one turns out to have been closed by the server.
+    public retryStale: bool;
+    /// How many redirects a request follows; 0 returns a redirect's response as it is.
+    public maxRedirects: u32;
+    /// HTTP/2 connections the client may have at once, over all origins.
+    public http2Connections: usize;
+    /// Requests an HTTP/2 connection carries at once (the server may allow fewer); 0 switches HTTP/2 off.
+    public http2Streams: usize;
+    /// Speak HTTP/2 to `http://` origins without asking (RFC 9113 §3.3). `https://` origins choose by ALPN.
+    public http2PriorKnowledge: bool;
+
+    /// 10 s to connect and to handshake, no response timeout; 16 idle connections per origin for 60 s, no limit on
+    /// requests in flight; 16 KiB buffers, kept up to 1 MiB; heads up to 64 KiB and 128 fields; buffered bodies up to
+    /// 1 GiB; stale pooled connections retried; redirects not followed; up to 4 HTTP/2 connections of 100 requests
+    /// each, for https origins that choose it.
+    public fn defaults() -> ClientOptions => ClientOptions {
+        connectMs: 10000,
+        handshakeMs: 10000,
+        responseMs: 0,
+        idleMs: 60000,
+        maxIdlePerOrigin: 16,
+        maxPerOrigin: 0,
+        bufferSize: 16384,
+        maxKeptBuffer: 1048576,
+        maxHeadBytes: 65536,
+        maxHeaders: 128,
+        maxBodyBytes: 1073741824,
+        retryStale: true,
+        maxRedirects: 0,
+        http2Connections: 4,
+        http2Streams: 100,
+        http2PriorKnowledge: false,
+    };
+}

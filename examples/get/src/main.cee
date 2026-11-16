@@ -1,0 +1,82 @@
+// GET a URL and print the status, the fields and the body:
+//
+//   get https://example.com/ [count]
+//
+// With a count, the request is sent that many times over one client, so later ones reuse the pooled connection.
+import web_core;
+import web_tls;
+import cosmohttp;
+
+/// A client that verifies https servers against the system's roots and offers HTTP/2 and HTTP/1.1 (only
+/// HTTP/1.1 with GET_HTTP1 set).
+fn client() -> Result<Client, TlsSetupError> {
+    var config = TlsConfig.client()?;
+    config.trustSystem()?;
+    let both = [Alpn.Http2, Alpn.Http11];
+    let one = [Alpn.Http11];
+    config.setAlpn(if (Environment.variable("GET_HTTP1") == null) both[..] else one[..])?;
+    return Ok(Client.withTls(ClientOptions.defaults(), config));
+}
+
+async fn fetch(http: borrow Client, url: StringView, count: u64) -> Result<void, AsyncError> {
+    for (k in 0..count) {
+        let started = Timer.now();
+        let response = match (await http.get(url)) {
+            Ok(r) => r,
+            Err(e) => {
+                await AsyncConsole.writeLine(HttpErrors.describe(e))?;
+                return Ok();
+            },
+        };
+        var line = String.create();
+        line.append(if (response.isHttp2()) "HTTP/2 " else "HTTP/1.1 ")!;
+        line.appendNumber(response.status() as u64)!;
+        line.append(", ")!;
+        line.appendNumber(response.body().length as u64)!;
+        line.append(" bytes, ")!;
+        line.appendNumber(Timer.now() - started)!;
+        line.append(" ms")!;
+        await AsyncConsole.writeLine(line.view())?;
+        if (k == 0) {
+            for (i in 0..response.headerCount()) {
+                var field = String.create();
+                let named = field.appendUtf8(response.name(i))!;
+                field.append(": ")!;
+                let valued = field.appendUtf8(response.value(i))!;
+                await AsyncConsole.writeLine(field.view())?;
+            }
+            if (count == 1) {
+                match (StringView.fromUtf8(response.body())) {
+                    Some(text) => { await AsyncConsole.writeLine(text)?; }
+                    null => { await AsyncConsole.writeLine("(the body is not UTF-8)")?; }
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+fn main() {
+    let url = match (Process.argument(1)) {
+        Some(u) => u,
+        null => {
+            Console.writeLine("usage: get <url> [count]");
+            return;
+        },
+    };
+    let count = match (Process.argument(2)) {
+        Some(c) => c.parseInt<u64>() ?? 1,
+        null => 1,
+    };
+    let http = match (client()) {
+        Ok(c) => c,
+        Err(_) => {
+            Console.writeLine("get: could not set up TLS");
+            return;
+        },
+    };
+    match (Async.run(fetch(http, url, count))) {
+        Ok() => {}
+        Err(_) => { Console.writeLine("get: failed"); }
+    }
+}

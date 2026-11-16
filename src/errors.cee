@@ -1,0 +1,87 @@
+// Why a request failed.
+import web_core;
+
+/// What was wrong with a response's bytes (RFC 9112).
+public enum Fault {
+    /// The status line is not `HTTP/1.x NNN ...`.
+    BadStatusLine,
+    /// A field line has no colon, an empty or spaced name, or is folded.
+    BadHeader,
+    /// The head is longer than `ClientOptions.maxHeadBytes`.
+    HeadTooLarge,
+    /// More fields than `ClientOptions.maxHeaders`.
+    TooManyHeaders,
+    /// `content-length` is not a number, or two of them disagree.
+    BadContentLength,
+    /// A chunk's size line, its end or the trailer section is malformed.
+    BadChunk,
+    /// The body is longer than `ClientOptions.maxBodyBytes` allows a buffered response.
+    BodyTooLarge,
+    /// The connection ended inside the head or the body.
+    Truncated,
+    /// The server sent bytes that belong to no response.
+    Unexpected,
+    /// A field block that HPACK cannot decode (HTTP/2).
+    BadCompression,
+    /// A frame that breaks HTTP/2's rules.
+    BadFrame,
+}
+
+/// Why a request failed.
+public enum HttpError {
+    /// The URL is not an absolute `http://` or `https://` URL this client can send.
+    BadUrl,
+    /// A field name or value that cannot be sent, or one the client writes itself.
+    BadRequest,
+    /// An `https://` URL on a client made without TLS.
+    NoTls,
+    /// The name resolved to no address.
+    NoAddress,
+    /// The network: connecting, reading or writing.
+    Net(NetError),
+    /// The response broke HTTP.
+    Response(Fault),
+    /// The server reset the request's HTTP/2 stream, with this error code (RFC 9113 §7).
+    Reset(u32),
+    /// More redirects than `ClientOptions.maxRedirects`.
+    TooManyRedirects,
+    /// The client was closed.
+    Closed,
+}
+
+/// Descriptions of errors.
+public struct HttpErrors {
+    /// A short description of `e`, for logs and messages.
+    public fn describe(e: borrow HttpError) -> StringView => match (e) {
+        HttpError.BadUrl => "bad URL",
+        HttpError.BadRequest => "bad request",
+        HttpError.NoTls => "https needs a client with TLS",
+        HttpError.NoAddress => "the host has no address",
+        HttpError.Net(n) => NetErrors.describe(n),
+        HttpError.Response(f) => HttpErrors.fault(f),
+        HttpError.Reset(_) => "the server reset the stream",
+        HttpError.TooManyRedirects => "too many redirects",
+        HttpError.Closed => "the client is closed",
+    };
+
+    /// A short description of `f`.
+    public fn fault(f: borrow Fault) -> StringView => match (f) {
+        Fault.BadStatusLine => "bad status line",
+        Fault.BadHeader => "bad header field",
+        Fault.HeadTooLarge => "response head too large",
+        Fault.TooManyHeaders => "too many header fields",
+        Fault.BadContentLength => "bad content-length",
+        Fault.BadChunk => "bad chunked encoding",
+        Fault.BodyTooLarge => "response body too large",
+        Fault.Truncated => "the response was cut short",
+        Fault.Unexpected => "unexpected bytes from the server",
+        Fault.BadCompression => "bad HPACK field block",
+        Fault.BadFrame => "bad HTTP/2 frame",
+    };
+
+    /// `e` as a client error.
+    public fn net(e: NetError) -> HttpError => HttpError.Net(e);
+
+    /// An allocation failure as a client error.
+    public fn noMemory() -> HttpError => HttpError.Net(NetError.OutOfMemory);
+}

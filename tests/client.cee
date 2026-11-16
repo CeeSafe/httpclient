@@ -1,0 +1,415 @@
+// The client over scripted connections: every test is deterministic, also in the interpreter.
+import web_core;
+import web_transport;
+
+fn made<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
+    match (r) {
+        Ok(v) => { return Ok(v); }
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+}
+
+/// The next dial of `client` gets a connection whose server sends `text`, at most `chunk` bytes a read (0: as much
+/// as fits), and whose written bytes are copied to `copies`.
+fn script(client: borrow Client, text: StringView, chunk: usize, copies: borrow Channel<u8>) -> Result<void, TestFailure> {
+    var mock = made(MockTransport.create(text.bytes()))?.withCopiesTo(copies);
+    if (chunk > 0) {
+        mock = mock.withChunk(chunk);
+    }
+    return made(client.script(mock));
+}
+
+/// As `script`, the reads split at places chosen from `seed`.
+fn scriptSeeded(client: borrow Client, text: StringView, seed: u64, copies: borrow Channel<u8>) -> Result<void, TestFailure> {
+    let mock = made(MockTransport.create(text.bytes()))?.withCopiesTo(copies).withSeededSplits(seed, 7);
+    return made(client.script(mock));
+}
+
+/// Everything written so far.
+fn written(copies: borrow Channel<u8>) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    loop {
+        match (copies.tryRecv()) {
+            Some(b) => { made(out.push(b))?; }
+            null => { return Ok(out); }
+        }
+    }
+}
+
+fn failed(e: HttpError) -> TestFailure => TestFailure.create(HttpErrors.describe(e));
+
+@test
+async fn getWithLength() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello", 0, copies)?;
+    {
+        let response = match (await client.get("http://example.com/greeting?x=1")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("hello".bytes(), response.body())?;
+        Check.equalU64(2, response.headerCount() as u64)?;
+        match (response.header("content-TYPE")) {
+            Some(v) => { Check.equalBytes("text/plain".bytes(), v)?; }
+            null => { return Check.fail("content-type"); }
+        }
+        Check.isTrue(response.header("missing") == null, "no such field")?;
+        Check.equalU64(0, client.idleConnections() as u64)?;
+    }
+    Check.equalU64(1, client.idleConnections() as u64)?;
+    let sent = written(copies)?;
+    Check.equalBytes("GET /greeting?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), sent.view())?;
+    return Ok();
+}
+
+@test
+async fn chunkedAtManySplits() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = Client.create(ClientOptions.defaults());
+    let text = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n";
+    for (seed in 1u64..40) {
+        scriptSeeded(client, text, seed, copies)?;
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("hello world".bytes(), response.body())?;
+        Check.isTrue(response.isComplete(), "complete")?;
+    }
+    return Ok();
+}
+
+@test
+async fn untilClose() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.0 200 OK\r\n\r\neverything to the end", 6, copies)?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("everything to the end".bytes(), response.body())?;
+    }
+    Check.equalU64(0, client.idleConnections() as u64)?;
+    return Ok();
+}
+
+@test
+async fn connectionIsReused() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    // Two responses of 40 bytes each on one connection, a read giving one at a time.
+    script(
+        client,
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+        39,
+        copies,
+    )?;
+    for (k in 0..2) {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes(if (k == 0) "a".bytes() else "b".bytes(), response.body())?;
+    }
+    Check.equalU64(1, client.idleConnections() as u64)?;
+    return Ok();
+}
+
+@test
+async fn staleConnectionIsReplaced() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    // The first connection answers once and then ends; the second request finds it closed and goes to a new one.
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na", 0, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb", 0, copies)?;
+    for (k in 0..2) {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes(if (k == 0) "a".bytes() else "b".bytes(), response.body())?;
+    }
+    return Ok();
+}
+
+@test
+async fn postIsNotSentTwice() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na", 0, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb", 0, copies)?;
+    let request = match (Request.create(Method.Post, "http://example.com/orders")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let first = match (await client.send(request, "x=1".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("a".bytes(), first.body())?;
+    }
+    // The pooled connection has ended. The POST went out whole, so the server may have acted on it: no second send.
+    match (await client.send(request, "x=2".bytes())) {
+        Ok(_) => { return Check.fail("the POST was sent again"); }
+        Err(HttpError.Net(NetError.Closed)) => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    return Ok();
+}
+
+@test
+async fn requestBytes() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = Client.create(ClientOptions.defaults());
+    let answer = "HTTP/1.1 204 No Content\r\n\r\n";
+    script(client, answer, 0, copies)?;
+    var request = match (Request.create(Method.Put, "http://example.com:8080/items/7")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (request.header("Content-Type", "application/json")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    Check.isTrue(request.header("Host", "evil").isErr(), "host is the client's")?;
+    Check.isTrue(request.header("Content-Length", "3").isErr(), "content-length is the client's")?;
+    Check.isTrue(request.header("X-A", "b\r\nX-C: d").isErr(), "no line breaks")?;
+    Check.isTrue(request.header("X A", "b").isErr(), "a token")?;
+    {
+        let response = match (await client.send(request, "{\"a\":1}".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(204, response.status() as u64)?;
+        Check.equalU64(0, response.body().length as u64)?;
+    }
+    let small = written(copies)?;
+    Check.equalBytes(
+        "PUT /items/7 HTTP/1.1\r\nHost: example.com:8080\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}".bytes(),
+        small.view(),
+    )?;
+    // A body too large to copy behind the head goes out beside it, the same bytes on the wire.
+    var large = Vector<u8>.create();
+    made(large.resize(20000, 'z'))?;
+    // A new client: the first one's pooled connection has ended, and its retry would write the request twice.
+    let second = Client.create(ClientOptions.defaults());
+    script(second, answer, 0, copies)?;
+    {
+        let response = match (await second.send(request, large.view())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(204, response.status() as u64)?;
+    }
+    let big = written(copies)?;
+    let head = "PUT /items/7 HTTP/1.1\r\nHost: example.com:8080\r\nContent-Type: application/json\r\nContent-Length: 20000\r\n\r\n";
+    Check.equalU64((head.length + 20000) as u64, big.length as u64)?;
+    Check.equalBytes(head.bytes(), big[0..head.length])?;
+    Check.equalBytes(large.view(), big[head.length..])?;
+    return Ok();
+}
+
+@test
+async fn interimAndBodilessResponses() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    script(
+        client,
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        9,
+        copies,
+    )?;
+    {
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalU64(1, response.headerCount() as u64)?;
+        Check.equalBytes("ok".bytes(), response.body())?;
+    }
+    Check.equalU64(1, client.idleConnections() as u64)?;
+    client.close();
+    Check.equalU64(0, client.idleConnections() as u64)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Closed) => {}
+        _ => { return Check.fail("a closed client"); }
+    }
+    let other = Client.create(ClientOptions.defaults());
+    script(other, "HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n", 0, copies)?;
+    let request = match (Request.create(Method.Head, "http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        let response = match (await other.send(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(0, response.body().length as u64)?;
+        Check.isTrue(response.isComplete(), "a HEAD's answer has no body")?;
+    }
+    Check.equalU64(1, other.idleConnections() as u64)?;
+    return Ok();
+}
+
+@test
+async fn closeAndLeftoversAreNotPooled() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    let cases = [
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\na",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naEXTRA",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\nEXTRA",
+        "HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\na",
+    ];
+    for (text in cases) {
+        script(client, text, 0, copies)?;
+        {
+            let response = match (await client.get("http://example.com/")) {
+                Ok(r) => r,
+                Err(e) => { return Err(failed(e)); },
+            };
+            Check.equalBytes("a".bytes(), response.body())?;
+        }
+        Check.equalU64(0, client.idleConnections() as u64)?;
+    }
+    return Ok();
+}
+
+@test
+async fn limitsAndFaults() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    var options = ClientOptions.defaults();
+    options.bufferSize = 64;
+    options.maxHeadBytes = 128;
+    options.maxBodyBytes = 10;
+    let client = Client.create(options);
+    script(client, "HTTP/1.1 200 OK\r\nX-Long: 0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\r\n\r\n", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.HeadTooLarge)) => {}
+        _ => { return Check.fail("the head limit"); }
+    }
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n01234567890", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BodyTooLarge)) => {}
+        _ => { return Check.fail("the body limit, by length"); }
+    }
+    script(client, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n012345\r\n6\r\n012345\r\n0\r\n\r\n", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BodyTooLarge)) => {}
+        _ => { return Check.fail("the body limit, chunked"); }
+    }
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.Truncated)) => {}
+        _ => { return Check.fail("a body cut short"); }
+    }
+    script(client, "HTTP/1.1 200 OK\r\nContent-Len", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.Truncated)) => {}
+        _ => { return Check.fail("a head cut short"); }
+    }
+    script(client, "SSH-2.0-OpenSSH_9.6\r\n", 0, copies)?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Response(Fault.BadStatusLine)) => {}
+        _ => { return Check.fail("not HTTP"); }
+    }
+    match (await client.get("https://example.com/")) {
+        Err(HttpError.NoTls) => {}
+        _ => { return Check.fail("https without TLS"); }
+    }
+    match (await client.get("gopher://example.com/")) {
+        Err(HttpError.BadUrl) => {}
+        _ => { return Check.fail("a bad URL"); }
+    }
+    Check.equalU64(0, client.idleConnections() as u64)?;
+    return Ok();
+}
+
+/// Reads a streamed body to its end, `step` bytes at a time.
+async fn drain(response: borrow mut Response, step: usize, out: borrow mut Vector<u8>) -> Result<void, TestFailure> {
+    var piece = [0u8; 64];
+    loop {
+        let n = match (await response.read(mut piece[0..step])) {
+            Ok(n) => n,
+            Err(e) => { return Err(failed(e)); },
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        made(out.extend(piece[0..n]))?;
+    }
+}
+
+@test
+async fn streamedBodies() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(65536))?;
+    let client = Client.create(ClientOptions.defaults());
+    let request = match (Request.create(Method.Get, "http://example.com/stream")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    let texts = [
+        "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nabcdefghijklmnopqrstuvwxyz",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n14\r\ndefghijklmnopqrstuvw\r\n3\r\nxyz\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\nabcdefghijklmnopqrstuvwxyz",
+    ];
+    for (t in 0..texts.length) {
+        for (seed in 1u64..12) {
+            for (step in 1..9) {
+                scriptSeeded(client, texts[t], seed, copies)?;
+                var response = match (await client.open(request, "".bytes())) {
+                    Ok(r) => r,
+                    Err(e) => { return Err(failed(e)); },
+                };
+                Check.equalU64(0, response.body().length as u64)?;
+                var out = Vector<u8>.create();
+                await drain(mut response, step, mut out)?;
+                Check.equalBytes("abcdefghijklmnopqrstuvwxyz".bytes(), out.view())?;
+                Check.isTrue(response.isComplete(), "read to the end")?;
+            }
+        }
+    }
+    return Ok();
+}
+
+@test
+async fn abandonedStreamClosesItsConnection() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(4096))?;
+    let client = Client.create(ClientOptions.defaults());
+    let request = match (Request.create(Method.Get, "http://example.com/stream")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nabcdefghijklmnopqrstuvwxyz", 0, copies)?;
+    {
+        var response = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var piece = [0u8; 4];
+        match (await response.read(mut piece[..])) {
+            Ok(n) => { Check.equalU64(4, n as u64)?; }
+            Err(e) => { return Err(failed(e)); }
+        }
+        Check.isTrue(!response.isComplete(), "more to read")?;
+    }
+    Check.equalU64(0, client.idleConnections() as u64)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nabcdefghijklmnopqrstuvwxyz", 0, copies)?;
+    {
+        var response = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var out = Vector<u8>.create();
+        await drain(mut response, 64, mut out)?;
+    }
+    Check.equalU64(1, client.idleConnections() as u64)?;
+    return Ok();
+}

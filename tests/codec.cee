@@ -1,0 +1,307 @@
+// The codec without I/O: URLs, the request head, the response head and the chunked coding.
+
+fn parsedUrl(text: StringView) -> Result<UrlParts, TestFailure> {
+    match (UrlParts.parse(text.bytes())) {
+        Some(p) => { return Ok(p); }
+        null => { return Err(TestFailure.create("the URL should parse")); }
+    }
+}
+
+@test
+fn urlPlain() -> Result<void, TestFailure> {
+    let text = "http://example.com/a/b?x=1#frag";
+    let p = parsedUrl(text)?;
+    Check.isTrue(!p.secure, "http")?;
+    Check.equalU64(80, p.port as u64)?;
+    Check.equalBytes("example.com".bytes(), p.host(text.bytes()))?;
+    Check.equalBytes("example.com".bytes(), p.authority(text.bytes()))?;
+    Check.equalBytes("/a/b?x=1".bytes(), p.target(text.bytes()))?;
+    return Ok();
+}
+
+@test
+fn urlPortsAndDefaults() -> Result<void, TestFailure> {
+    let a = "HTTPS://Example.com:8443";
+    let p = parsedUrl(a)?;
+    Check.isTrue(p.secure, "https")?;
+    Check.equalU64(8443, p.port as u64)?;
+    Check.equalBytes("Example.com:8443".bytes(), p.authority(a.bytes()))?;
+    Check.equalU64(0, p.target(a.bytes()).length as u64)?;
+    let b = "https://example.com:443/x";
+    let q = parsedUrl(b)?;
+    Check.equalU64(443, q.port as u64)?;
+    Check.equalBytes("example.com".bytes(), q.authority(b.bytes()))?;
+    let c = "http://example.com?q=1";
+    let r = parsedUrl(c)?;
+    Check.equalBytes("?q=1".bytes(), r.target(c.bytes()))?;
+    let d = "http://[::1]:8080/p";
+    let s = parsedUrl(d)?;
+    Check.equalBytes("::1".bytes(), s.host(d.bytes()))?;
+    Check.equalBytes("[::1]:8080".bytes(), s.authority(d.bytes()))?;
+    Check.equalU64(8080, s.port as u64)?;
+    return Ok();
+}
+
+@test
+fn urlRefused() -> Result<void, TestFailure> {
+    let bad = [
+        "ftp://example.com/",
+        "http://",
+        "http:///path",
+        "http://user@example.com/",
+        "http://example.com:99999/",
+        "http://example.com:0/",
+        "http://example.com:80x/",
+        "http://exa mple.com/",
+        "http://example.com/a b",
+        "http://example.com/a\r\nX: y",
+        "http://[::1/",
+        "example.com",
+    ];
+    for (text in bad) {
+        Check.isTrue(UrlParts.parse(text.bytes()) == null, text)?;
+    }
+    return Ok();
+}
+
+@test
+fn requestHead() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let a = "http://example.com:8080/items?id=7";
+    let p = parsedUrl(a)?;
+    writeRequestHead(mut out, Method.Get, a.bytes(), p, "Accept: */*\r\n".bytes(), null)!;
+    Check.equalBytes(
+        "GET /items?id=7 HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\n\r\n".bytes(),
+        out.view(),
+    )?;
+    out.clear();
+    let b = "https://example.com?x";
+    let q = parsedUrl(b)?;
+    writeRequestHead(mut out, Method.Post, b.bytes(), q, "".bytes(), Some(1234u64))!;
+    Check.equalBytes(
+        "POST /?x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1234\r\n\r\n".bytes(),
+        out.view(),
+    )?;
+    out.clear();
+    let c = "http://h";
+    let r = parsedUrl(c)?;
+    writeRequestHead(mut out, Method.Put, c.bytes(), r, "".bytes(), Some(0u64))!;
+    Check.equalBytes("PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n".bytes(), out.view())?;
+    return Ok();
+}
+
+/// The head of `text` parsed in one call.
+fn parseAll(text: StringView, headers: borrow mut Vector<HeaderSpan>) -> Result<HeadParser, Fault> {
+    var parser = HeadParser.create();
+    let done = parser.feed(text.bytes(), mut headers, 64)?;
+    if (!done) {
+        return Err(Fault.Truncated);
+    }
+    return Ok(parser);
+}
+
+fn sameFraming(a: Framing, b: Framing) -> bool => match (a) {
+    Framing.None => b is Framing.None,
+    Framing.Chunked => b is Framing.Chunked,
+    Framing.UntilClose => b is Framing.UntilClose,
+    Framing.Length(n) => match (b) {
+        Framing.Length(m) => n == m,
+        _ => false,
+    },
+};
+
+@test
+fn headSimple() -> Result<void, TestFailure> {
+    let text = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:  5 \r\nX-Empty:\r\n\r\nhello";
+    var headers = Vector<HeaderSpan>.create();
+    let parser = match (parseAll(text, mut headers)) {
+        Ok(p) => p,
+        Err(_) => { return Check.fail("the head should parse"); },
+    };
+    Check.equalU64(200, parser.status as u64)?;
+    Check.equalU64(3, headers.length as u64)?;
+    let bytes = text.bytes();
+    Check.equalBytes("Content-Type".bytes(), bytes[headers[0].nameStart..headers[0].nameEnd])?;
+    Check.equalBytes("text/plain".bytes(), bytes[headers[0].valueStart..headers[0].valueEnd])?;
+    Check.equalBytes("5".bytes(), bytes[headers[1].valueStart..headers[1].valueEnd])?;
+    Check.equalU64(0, (headers[2].valueEnd - headers[2].valueStart) as u64)?;
+    Check.isTrue(sameFraming(parser.framing(false), Framing.Length(5)), "content-length 5")?;
+    Check.isTrue(sameFraming(parser.framing(true), Framing.None), "HEAD has no body")?;
+    Check.isTrue(parser.reusable(false), "keep-alive by default")?;
+    Check.equalBytes("hello".bytes(), bytes[parser.cursor..])?;
+    return Ok();
+}
+
+@test
+fn headByteAtATime() -> Result<void, TestFailure> {
+    let text = "HTTP/1.1 404 Not Found\nServer: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+    let bytes = text.bytes();
+    var headers = Vector<HeaderSpan>.create();
+    var parser = HeadParser.create();
+    for (n in 1..bytes.length) {
+        match (parser.feed(bytes[0..n], mut headers, 64)) {
+            Ok(done) => { Check.isTrue(!done, "not complete yet")?; }
+            Err(_) => { return Check.fail("a prefix is not an error"); }
+        }
+    }
+    match (parser.feed(bytes, mut headers, 64)) {
+        Ok(done) => { Check.isTrue(done, "complete")?; }
+        Err(_) => { return Check.fail("the head should parse"); }
+    }
+    Check.equalU64(404, parser.status as u64)?;
+    Check.equalU64(2, headers.length as u64)?;
+    Check.isTrue(sameFraming(parser.framing(false), Framing.Chunked), "chunked")?;
+    Check.equalU64(bytes.length as u64, parser.cursor as u64)?;
+    return Ok();
+}
+
+@test
+fn headFramingRules() -> Result<void, TestFailure> {
+    var headers = Vector<HeaderSpan>.create();
+    let cases = [
+        "HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n",
+        "HTTP/1.1 304 Not Modified\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\nConnection: Keep-Alive\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: foo, Close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 7, 7\r\nContent-Length: 7\r\n\r\n",
+    ];
+    let framings = [
+        Framing.None,
+        Framing.None,
+        Framing.UntilClose,
+        Framing.Length(3),
+        Framing.Length(3),
+        Framing.Length(3),
+        Framing.Chunked,
+        Framing.UntilClose,
+        Framing.Length(7),
+    ];
+    let reusable = [true, true, false, false, true, false, false, false, true];
+    for (i in 0..cases.length) {
+        headers.clear();
+        let parser = match (parseAll(cases[i], mut headers)) {
+            Ok(p) => p,
+            Err(_) => { return Check.fail(cases[i]); },
+        };
+        Check.isTrue(sameFraming(parser.framing(false), framings[i]), cases[i])?;
+        Check.isTrue(parser.reusable(false) == reusable[i], cases[i])?;
+    }
+    return Ok();
+}
+
+@test
+fn headRefused() -> Result<void, TestFailure> {
+    var headers = Vector<HeaderSpan>.create();
+    let bad = [
+        "HTTP/2.0 200 OK\r\n\r\n",
+        "HTTP/1.1 20 OK\r\n\r\n",
+        "HTTP/1.1 2000 OK\r\n\r\n",
+        "HTTP/1.1  200 OK\r\n\r\n",
+        "ICY 200 OK\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nNoColon\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nName : v\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n: v\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nA: b\r\n folded\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nA: b\rc\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\n",
+    ];
+    for (text in bad) {
+        headers.clear();
+        match (parseAll(text, mut headers)) {
+            Ok(_) => { return Check.fail(text); }
+            Err(_) => {}
+        }
+    }
+    headers.clear();
+    var parser = HeadParser.create();
+    match (parser.feed("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n".bytes(), mut headers, 2)) {
+        Err(Fault.TooManyHeaders) => {}
+        _ => { return Check.fail("the field limit"); }
+    }
+    return Ok();
+}
+
+/// Decodes `raw` given to the decoder `step` bytes at a time; the body, or the fault.
+fn dechunk(raw: Slice<u8>, step: usize, out: borrow mut Vector<u8>) -> Result<usize, Fault> {
+    var decoder = ChunkDecoder.create();
+    var start: usize = 0;
+    var end: usize = 0;
+    loop {
+        match (decoder.next(raw[start..end])?) {
+            ChunkStep.Need(skip) => {
+                start += skip;
+                if (end == raw.length) {
+                    return Err(Fault.Truncated);
+                }
+                end = (end + step).min(raw.length);
+            }
+            ChunkStep.Data(skip, n) => {
+                start += skip;
+                out.extend(raw[start..start + n])!;
+                start += n;
+            }
+            ChunkStep.Done(skip) => {
+                return Ok(start + skip);
+            }
+        }
+    }
+}
+
+@test
+fn chunksAtEverySplit() -> Result<void, TestFailure> {
+    let text = "5\r\nhello\r\n6;ext=1\r\n world\r\nA  \r\n0123456789\n0\r\nTrailer: x\r\n\r\nNEXT";
+    let raw = text.bytes();
+    for (step in 1..raw.length + 1) {
+        var out = Vector<u8>.create();
+        match (dechunk(raw, step, mut out)) {
+            Ok(used) => {
+                Check.equalBytes("hello world0123456789".bytes(), out.view())?;
+                Check.equalU64((raw.length - 4) as u64, used as u64)?;
+            }
+            Err(_) => { return Check.fail("the body should decode"); }
+        }
+    }
+    return Ok();
+}
+
+@test
+fn chunksRefused() -> Result<void, TestFailure> {
+    let bad = [
+        "\r\nhello\r\n0\r\n\r\n",
+        "g\r\nhello\r\n0\r\n\r\n",
+        "5\r\nhelloXX0\r\n\r\n",
+        "5x\r\nhello\r\n0\r\n\r\n",
+        "11111111111111111\r\n",
+        "5\r\nhel",
+        "5\r\nhello\r\n0\r\n",
+    ];
+    for (text in bad) {
+        var out = Vector<u8>.create();
+        match (dechunk(text.bytes(), 3, mut out)) {
+            Ok(_) => { return Check.fail(text); }
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+@test
+fn fieldSyntax() -> Result<void, TestFailure> {
+    Check.isTrue(isFieldName("X-Request-Id".bytes()), "a token")?;
+    Check.isTrue(!isFieldName("".bytes()), "empty")?;
+    Check.isTrue(!isFieldName("a b".bytes()), "a space")?;
+    Check.isTrue(!isFieldName("a:b".bytes()), "a colon")?;
+    Check.isTrue(isFieldValue("text/html; q=0.9".bytes()), "a value")?;
+    Check.isTrue(isFieldValue("".bytes()), "an empty value")?;
+    Check.isTrue(!isFieldValue("a\r\nb: c".bytes()), "a line break")?;
+    Check.isTrue(!isFieldValue(" a".bytes()), "leading whitespace")?;
+    return Ok();
+}

@@ -1,0 +1,176 @@
+// Redirects (RFC 9110 §15.4): the `Location` reference resolved against the URL that answered (RFC 3986 §5), and the
+// request's fields filtered for the request that follows.
+
+/// Whether `status` asks for the request to be sent somewhere else.
+fn isRedirect(status: u16) -> bool => status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+
+/// Writes into `out` the URL that `location` means when it is found in a response from `base` (whose parts are
+/// `parts`). The fragment is left out: it is never sent.
+public fn resolveLocation(
+    base: Slice<u8>,
+    parts: borrow UrlParts,
+    location: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    var reference = location.trim();
+    match (reference.indexOfByte('#')) {
+        Some(i) => { reference = reference[0..i]; }
+        null => {}
+    }
+    if (hasScheme(reference)) {
+        return out.extend(reference);
+    }
+    if (reference.startsWith("//".bytes())) {
+        out.extend(if (parts.secure) "https:".bytes() else "http:".bytes())?;
+        return out.extend(reference);
+    }
+    let prefix = base[0..parts.targetStart];
+    let target = parts.target(base);
+    var basePath = target;
+    var baseQuery = target[target.length..];
+    match (target.indexOfByte('?')) {
+        Some(i) => {
+            basePath = target[0..i];
+            baseQuery = target[i..];
+        }
+        null => {}
+    }
+    out.extend(prefix)?;
+    if (reference.length == 0) {
+        if (basePath.length == 0) {
+            out.push('/')?;
+        }
+        out.extend(basePath)?;
+        return out.extend(baseQuery);
+    }
+    if (reference[0] == '?') {
+        if (basePath.length == 0) {
+            out.push('/')?;
+        }
+        out.extend(basePath)?;
+        return out.extend(reference);
+    }
+    var path = reference;
+    var query = reference[reference.length..];
+    match (reference.indexOfByte('?')) {
+        Some(i) => {
+            path = reference[0..i];
+            query = reference[i..];
+        }
+        null => {}
+    }
+    if (path[0] == '/') {
+        appendWithoutDots(mut out, path)?;
+        return out.extend(query);
+    }
+    // A relative path: the base's path up to its last slash, then the reference (RFC 3986 §5.2.3).
+    var merged = Vector<u8>.create();
+    var keep: usize = 0;
+    for (i in 0..basePath.length) {
+        if (basePath[i] == '/') {
+            keep = i + 1;
+        }
+    }
+    if (keep == 0) {
+        merged.push('/')?;
+    } else {
+        merged.extend(basePath[0..keep])?;
+    }
+    merged.extend(path)?;
+    appendWithoutDots(mut out, merged.view())?;
+    return out.extend(query);
+}
+
+/// Whether `reference` is absolute: it begins with a scheme and a colon (RFC 3986 §3.1). One of another scheme than
+/// http(s) is copied as it is, and then is no URL a request can go to.
+fn hasScheme(reference: Slice<u8>) -> bool {
+    for (i in 0..reference.length) {
+        let b = reference[i];
+        if (b == ':') {
+            return i > 0;
+        }
+        let letter = (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+        let other = (b >= '0' && b <= '9') || b == '+' || b == '-' || b == '.';
+        if (!(letter || (i > 0 && other))) {
+            return false;
+        }
+    }
+    return false;
+}
+
+/// Appends `path` (which starts with `/`) to `out` with its `.` and `..` segments removed (RFC 3986 §5.2.4).
+fn appendWithoutDots(out: borrow mut Vector<u8>, path: Slice<u8>) -> Result<void, AllocError> {
+    let floor = out.length;
+    var at: usize = 1;
+    loop {
+        var end = at;
+        while (end < path.length && path[end] != '/') {
+            end += 1;
+        }
+        let segment = path[at..end];
+        let last = end >= path.length;
+        let dot = segment.length == 1 && segment[0] == '.';
+        let dots = segment.length == 2 && segment[0] == '.' && segment[1] == '.';
+        if (dots) {
+            var cut = out.length;
+            while (cut > floor && out[cut - 1] != '/') {
+                cut -= 1;
+            }
+            if (cut > floor) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+        }
+        if (dot || dots) {
+            if (last) {
+                out.push('/')?;
+            }
+        } else {
+            out.push('/')?;
+            out.extend(segment)?;
+        }
+        if (last) {
+            return Ok();
+        }
+        at = end + 1;
+    }
+}
+
+/// Copies the field lines of `fields` into `out`, leaving out what must not follow a redirect: credentials when it
+/// goes to another origin (`authorization`, `cookie`, `proxy-authorization`), and the fields that describe a body
+/// (`content-*`) when the body is no longer sent.
+fn filterFields(
+    fields: Slice<u8>,
+    credentials: bool,
+    content: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    var at: usize = 0;
+    while (at < fields.length) {
+        let rest = fields[at..];
+        let end = match (rest.indexOfByte('\n')) {
+            Some(i) => i + 1,
+            null => rest.length,
+        };
+        let line = rest[0..end];
+        let colon = line.indexOfByte(':') ?? 0;
+        let name = line[0..colon];
+        var skip = false;
+        if (!credentials) {
+            skip = name.equalsIgnoreAsciiCase(
+                "authorization".bytes(),
+            ) || name.equalsIgnoreAsciiCase("cookie".bytes()) ||
+                name.equalsIgnoreAsciiCase("proxy-authorization".bytes());
+        }
+        if (!content && name.length >= 8 && name[0..8].equalsIgnoreAsciiCase("content-".bytes())) {
+            skip = true;
+        }
+        if (!skip) {
+            out.extend(line)?;
+        }
+        at += end;
+    }
+    return Ok();
+}

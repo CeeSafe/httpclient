@@ -1,0 +1,13 @@
+[package]
+name = "cosmohttp"
+version = "0.1.0"
+kind = "library"
+sources = ["src"]
+tests = ["tests"]
+ceesafec = ">=0.61.0"        # ADR 0160: a method's result borrows from its receiver (client.get, response.header)
+
+[dependencies]
+web_core = { path = "../../CeeSafe.Web/packages/web_core" }
+web_transport = { path = "../../CeeSafe.Web/packages/web_transport" }
+# TLS: OpenSSL 3 through web_tls's C shim, the only C below this package.
+web_tls = { path = "../../CeeSafe.Web/packages/web_tls" }

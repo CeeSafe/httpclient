@@ -1,0 +1,967 @@
+// The client: prepared requests, the per-origin pool of connections, and the response that lends a connection's
+// buffers and gives the connection back when it is dropped.
+//
+// A client belongs to one thread: its pool is a `RefCell`, not a lock, and concurrent tasks of that thread share it.
+// A program with several worker threads makes a client for each.
+import web_core;
+import web_transport;
+import web_tls;
+
+/// A request to send, any number of times: its method, URL and fields, checked and encoded once.
+@noncopy
+public struct Request {
+    private verb: Method;
+    private text: Vector<u8>;
+    private parts: UrlParts;
+    /// The fields as they go on the wire: `name: value\r\n` each.
+    private fields: Vector<u8>;
+    /// The same fields as an HPACK block for HTTP/2, encoded when they were added.
+    private packed: Vector<u8>;
+
+    /// A request for `url`, an absolute `http://` or `https://` URL.
+    public fn create(method: Method, url: StringView) -> Result<Request, HttpError> {
+        let parts = match (UrlParts.parse(url.bytes())) {
+            Some(p) => p,
+            null => { return Err(HttpError.BadUrl); },
+        };
+        var text = Vector<u8>.create();
+        match (text.extend(url.bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        return Ok(
+            Request {
+                verb: method,
+                text: text,
+                parts: parts,
+                fields: Vector<u8>.create(),
+                packed: Vector<u8>.create(),
+            },
+        );
+    }
+
+    /// Adds a field. `BadRequest` for a name that is not a token, a value with CR, LF or NUL or with whitespace at
+    /// an end, and for `host`, `content-length` and `transfer-encoding`, which the client writes.
+    public fn header(borrow mut this, name: StringView, value: StringView) -> Result<void, HttpError> {
+        let n = name.bytes();
+        let v = value.bytes();
+        if (!isFieldName(n) || !isFieldValue(v) || n.equalsIgnoreAsciiCase("host".bytes()) ||
+            n.equalsIgnoreAsciiCase("content-length".bytes()) || n.equalsIgnoreAsciiCase("transfer-encoding".bytes())) {
+            return Err(HttpError.BadRequest);
+        }
+        match (this.append(n, v)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+    }
+
+    fn append(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        this.fields.reserve(name.length + value.length + 4)?;
+        this.fields.extend(name)?;
+        this.fields.extend(": ".bytes())?;
+        this.fields.extend(value)?;
+        this.fields.extend("\r\n".bytes())?;
+        return packField(mut this.packed, name, value);
+    }
+
+    /// The request's method.
+    public fn method(borrow this) -> Method => this.verb;
+
+    /// The request's URL.
+    public fn url(borrow this) -> Slice<u8> => this.text.view();
+}
+
+/// An origin's connections that wait for a request, newest last.
+struct Origin {
+    secure: bool;
+    port: u16;
+    host: Vector<u8>;
+    idle: Vector<Box<Connection>>;
+    /// What the origin speaks, once a connection has shown it: 0 not known yet, 1 HTTP/1.1, 2 HTTP/2.
+    protocol: u8;
+    /// The requests-in-flight semaphore, a token per free place: one channel, or none without a limit.
+    slots: Vector<Channel<u8>>;
+    /// One token: who holds it may dial the origin's next HTTP/2 connection, so requests that start together
+    /// share one connection instead of dialing one each. One channel, or none for a client without HTTP/2.
+    gate: Vector<Channel<u8>>;
+}
+
+struct Origins {
+    list: Vector<Origin>;
+    closed: bool;
+    /// Connections for the next dials, in order, instead of the network (tests).
+    scripted: Vector<MockTransport>;
+}
+
+/// A place among an origin's requests in flight; dropping it frees the place.
+struct Permit {
+    slot: Channel<u8>?;
+
+    drop {
+        match (borrow this.slot) {
+            Some(s) => { let freed = s.trySend(0); }
+            null => {}
+        }
+    }
+}
+
+/// An HTTP client. Over HTTP/1.1, connections are kept per origin and reused, one request at a time on each; over
+/// HTTP/2, one connection carries an origin's requests at once.
+public struct Client {
+    private options: ClientOptions;
+    private tls: TlsConfig?;
+    private origins: RefCell<Origins>;
+    /// The places for HTTP/2 connections, made with the client and never moved: a response refers to its
+    /// session by index.
+    private sessions: Vector<H2Session>;
+
+    /// A client for `http://` URLs; `https://` URLs fail with `NoTls`.
+    public fn create(options: ClientOptions) -> Client => Client {
+        options: options,
+        tls: null,
+        origins: RefCell<Origins>.create(
+            Origins { list: Vector<Origin>.create(), closed: false, scripted: Vector<MockTransport>.create() },
+        ),
+        sessions: sessionsFor(options),
+    };
+
+    /// A client that also makes `https://` connections with `tls` (a web_tls `TlsConfig.client()` with its trust
+    /// set). The ALPN protocols `tls` offers choose the version: with `h2` among them, a server that picks it is
+    /// spoken to over HTTP/2.
+    public fn withTls(options: ClientOptions, tls: TlsConfig) -> Client => Client {
+        options: options,
+        tls: Some(tls),
+        origins: RefCell<Origins>.create(
+            Origins { list: Vector<Origin>.create(), closed: false, scripted: Vector<MockTransport>.create() },
+        ),
+        sessions: sessionsFor(options),
+    };
+
+    /// GET `url`; the whole response is read before this returns.
+    public async fn get(borrow this, url: StringView) -> Result<Response, HttpError> {
+        let text = url.bytes();
+        let parts = match (UrlParts.parse(text)) {
+            Some(p) => p,
+            null => { return Err(HttpError.BadUrl); },
+        };
+        return await dispatch(this, Method.Get, text, parts, "".bytes(), "".bytes(), "".bytes(), true);
+    }
+
+    /// Sends `request` with `body` (empty for none); the whole response is read before this returns, and its body
+    /// is `response.body()`.
+    public async fn send(borrow this, request: borrow Request, body: Slice<u8>) -> Result<Response, HttpError> =>
+        await dispatch(
+            this,
+            request.verb,
+            request.text.view(),
+            request.parts,
+            request.fields.view(),
+            request.packed.view(),
+            body,
+            true,
+        );
+
+    /// Sends `request` with `body`; this returns once the response's head has arrived, and the body is read with
+    /// `response.read`. Read it to its end to keep the connection for the next request.
+    public async fn open(borrow this, request: borrow Request, body: Slice<u8>) -> Result<Response, HttpError> =>
+        await dispatch(
+            this,
+            request.verb,
+            request.text.view(),
+            request.parts,
+            request.fields.view(),
+            request.packed.view(),
+            body,
+            false,
+        );
+
+    /// Closes the idle connections. Requests that start afterwards fail with `Closed`; responses still held close
+    /// their connections when dropped.
+    public fn close(borrow this) {
+        var guard = this.origins.write();
+        let o = guard.data();
+        o.closed = true;
+        for (i in 0..o.list.length) {
+            o.list[i].idle.clear();
+        }
+        for (i in 0..this.sessions.length) {
+            this.sessions[i].retire();
+        }
+    }
+
+    /// What `origin` is known to speak: 0 not known yet, 1 HTTP/1.1, 2 HTTP/2.
+    fn protocol(borrow this, origin: usize) -> u8 {
+        let guard = this.origins.read();
+        let o = guard.data();
+        return o.list[origin].protocol;
+    }
+
+    fn learned(borrow this, origin: usize, protocol: u8) {
+        var guard = this.origins.write();
+        let o = guard.data();
+        o.list[origin].protocol = protocol;
+    }
+
+    /// Opens a stream for the request on an HTTP/2 connection to `origin` that has room: the session and the slot.
+    fn openStream(
+        borrow this,
+        origin: usize,
+        method: Method,
+        url: Slice<u8>,
+        parts: borrow UrlParts,
+        packed: Slice<u8>,
+        length: u64?,
+        endStream: bool,
+        buffered: bool,
+    ) -> Result<H2Place?, HttpError> {
+        let now = Timer.now();
+        for (i in 0..this.sessions.length) {
+            let session = borrow this.sessions[i];
+            if (!session.serves(origin)) {
+                continue;
+            }
+            if (session.isIdleSince(now, this.options.idleMs)) {
+                session.retire(); // the server has likely closed it too
+                continue;
+            }
+            match (session.open(method, url, parts, packed, length, endStream, buffered, this.options.maxBodyBytes)) {
+                Ok(Some(slot)) => { return Ok(Some(H2Place { session: i, slot: slot })); }
+                Ok(null) => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+        }
+        return Ok(null);
+    }
+
+    /// A session without a connection, for a new one.
+    fn freeSession(borrow this) -> usize? {
+        for (i in 0..this.sessions.length) {
+            if (this.sessions[i].isFree()) {
+                return Some(i);
+            }
+        }
+        return null;
+    }
+
+    /// How many connections wait in the pool.
+    public fn idleConnections(borrow this) -> usize {
+        let guard = this.origins.read();
+        let o = guard.data();
+        var n: usize = 0;
+        for (i in 0..o.list.length) {
+            n += o.list[i].idle.length;
+        }
+        return n;
+    }
+
+    /// The index of `url`'s origin, made if new.
+    fn origin(borrow this, url: Slice<u8>, parts: borrow UrlParts) -> Result<usize, HttpError> {
+        var guard = this.origins.write();
+        let o = guard.data();
+        if (o.closed) {
+            return Err(HttpError.Closed);
+        }
+        let host = parts.host(url);
+        for (i in 0..o.list.length) {
+            let have = borrow o.list[i];
+            if (have.port == parts.port && have.secure == parts.secure && have.host.length == host.length &&
+                have.host.view().equalsIgnoreAsciiCase(host)) {
+                return Ok(i);
+            }
+        }
+        match (this.newOrigin(host, parts)) {
+            Ok(made) => {
+                match (o.list.push(made)) {
+                    Ok() => { return Ok(o.list.length - 1); }
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+    }
+
+    fn newOrigin(borrow this, host: Slice<u8>, parts: borrow UrlParts) -> Result<Origin, AllocError> {
+        var name = Vector<u8>.create();
+        name.extend(host)?;
+        var slots = Vector<Channel<u8>>.create();
+        if (this.options.maxPerOrigin > 0) {
+            let tokens = Channel<u8>.create(this.options.maxPerOrigin)?;
+            for (k in 0..this.options.maxPerOrigin) {
+                let filled = tokens.trySend(0);
+            }
+            slots.push(tokens)?;
+        }
+        var gate = Vector<Channel<u8>>.create();
+        if (this.sessions.length > 0) {
+            let token = Channel<u8>.create(1)?;
+            let filled = token.trySend(0);
+            gate.push(token)?;
+        }
+        return Ok(Origin {
+            secure: parts.secure,
+            port: parts.port,
+            host: name,
+            idle: Vector<Box<Connection>>.create(),
+            protocol: 0,
+            slots: slots,
+            gate: gate,
+        });
+    }
+
+    /// The origin's semaphore, if it has one.
+    fn slots(borrow this, origin: usize) -> Channel<u8>? {
+        let guard = this.origins.read();
+        let o = guard.data();
+        if (o.list[origin].slots.length == 0) {
+            return null;
+        }
+        return Some(o.list[origin].slots[0].clone());
+    }
+
+    /// The origin's dial gate, if it has one.
+    fn gate(borrow this, origin: usize) -> Channel<u8>? {
+        let guard = this.origins.read();
+        let o = guard.data();
+        if (o.list[origin].gate.length == 0) {
+            return null;
+        }
+        return Some(o.list[origin].gate[0].clone());
+    }
+
+    /// The origin's newest idle connection that has not been idle too long; older ones are closed.
+    fn takeIdle(borrow this, origin: usize) -> Box<Connection>? {
+        var guard = this.origins.write();
+        let o = guard.data();
+        let now = Timer.now();
+        loop {
+            let conn = match (o.list[origin].idle.pop()) {
+                Some(c) => c,
+                null => { return null; },
+            };
+            if (this.options.idleMs == 0 || now - conn.idleSince <= this.options.idleMs) {
+                return Some(conn);
+            }
+        }
+    }
+
+    /// Takes a connection back after its response; closed instead if the pool is full or the client is closed.
+    fn giveBack(borrow this, origin: usize, conn: Box<Connection>) {
+        var guard = this.origins.write();
+        let o = guard.data();
+        if (o.closed || o.list[origin].idle.length >= this.options.maxIdlePerOrigin) {
+            return;
+        }
+        var kept = conn;
+        if (kept.buffer.length > this.options.maxKeptBuffer) {
+            // One large response does not pin its buffer to the connection for good.
+            var small = Vector<u8>.create();
+            match (small.resize(this.options.bufferSize, 0)) {
+                Ok() => {}
+                Err(_) => { return; }
+            }
+            kept.buffer = small;
+        }
+        kept.idleSince = Timer.now();
+        kept.reused = true;
+        let pushed = o.list[origin].idle.push(kept);
+    }
+
+    /// A scripted connection waiting for a dial, if a test left one.
+    fn scriptedDial(borrow this) -> MockTransport? {
+        var guard = this.origins.write();
+        let o = guard.data();
+        if (o.scripted.length == 0) {
+            return null;
+        }
+        return Some(o.scripted.remove(0));
+    }
+
+    /// Makes the next dial use `mock` instead of the network (tests).
+    fn script(borrow this, mock: MockTransport) -> Result<void, AllocError> {
+        var guard = this.origins.write();
+        return guard.data().scripted.push(mock);
+    }
+}
+
+/// The client's HTTP/2 sessions: as many as the options ask for, or fewer if memory is short.
+fn sessionsFor(options: ClientOptions) -> Vector<H2Session> {
+    var sessions = Vector<H2Session>.create();
+    if (options.http2Streams == 0) {
+        return sessions;
+    }
+    for (i in 0..options.http2Connections) {
+        match (H2Session.create(options.http2Streams, options)) {
+            Ok(session) => {
+                match (sessions.push(session)) {
+                    Ok() => {}
+                    Err(_) => { break; }
+                }
+            }
+            Err(_) => { break; }
+        }
+    }
+    return sessions;
+}
+
+/// A stream on an HTTP/2 connection: the session's index in the client, and the stream's slot in the session.
+struct H2Place {
+    session: usize;
+    slot: usize;
+}
+
+/// Appends a field to `packed` as HPACK for a request (RFC 9113 §8.2): the name lowercase, credentials marked never
+/// to be indexed, and the fields that describe an HTTP/1.1 connection left out.
+fn packField(packed: borrow mut Vector<u8>, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+    var lower = Vector<u8>.withCapacity(name.length)?;
+    for (b in name) {
+        lower.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+    }
+    let n = lower.view();
+    if (n == "connection".bytes() || n == "keep-alive".bytes() || n == "proxy-connection".bytes() ||
+        n == "upgrade".bytes()) {
+        return Ok();
+    }
+    if (n == "te".bytes() && !value.equalsIgnoreAsciiCase("trailers".bytes())) {
+        return Ok();
+    }
+    let secret = n == "authorization".bytes() || n == "cookie".bytes() || n == "proxy-authorization".bytes();
+    return hpackLiteral(mut packed, staticNameIndex(n), n, value, secret);
+}
+
+/// The field lines of `fields` (`name: value\r\n` each) as an HPACK block in `packed`.
+fn packFields(fields: Slice<u8>, packed: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    packed.clear();
+    var at: usize = 0;
+    while (at < fields.length) {
+        let rest = fields[at..];
+        let end = rest.indexOfByte('\n') ?? rest.length;
+        var line = rest[0..end];
+        if (line.length > 0 && line[line.length - 1] == '\r') {
+            line = line[0..line.length - 1];
+        }
+        match (line.indexOfByte(':')) {
+            Some(colon) => { packField(mut packed, line[0..colon], line[colon + 1..].trim())?; }
+            null => {}
+        }
+        at += end + 1;
+    }
+    return Ok();
+}
+
+/// A request, and the requests its redirects ask for while `maxRedirects` allows (RFC 9110 §15.4). 303 becomes a GET
+/// without the body (a HEAD stays one), and so do 301 and 302 after a POST; 307 and 308 repeat the request as it
+/// was. A redirect to another origin loses the request's credentials, and one from https to http is not followed:
+/// its response is returned as it is, like any redirect without a usable `Location`.
+async fn dispatch<region c>(
+    client: borrow(c) Client,
+    method: Method,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    packed: Slice<u8>,
+    body: Slice<u8>,
+    buffered: bool,
+) -> Result<Response<c>, HttpError> {
+    let limit = client.options.maxRedirects;
+    if (limit == 0) {
+        return await roundTrip(client, method, url, parts, fields, packed, body, buffered);
+    }
+    var verb = method;
+    var text = Vector<u8>.create();
+    var place = parts;
+    var kept = Vector<u8>.create();
+    var keptPacked = Vector<u8>.create();
+    var filtered = false;
+    var credentials = true;
+    var content = true;
+    var hops: u32 = 0;
+    loop {
+        let here = if (hops == 0) url else text.view();
+        let lines = if (filtered) kept.view() else fields;
+        let block = if (filtered) keptPacked.view() else packed;
+        let payload = if (content) body else "".bytes();
+        let response = await roundTrip(client, verb, here, place, lines, block, payload, buffered)?;
+        let status = response.status();
+        if (!isRedirect(status)) {
+            return Ok(response);
+        }
+        let location = match (response.header("location")) {
+            Some(l) => l,
+            null => { return Ok(response); },
+        };
+        var next = Vector<u8>.create();
+        match (resolveLocation(here, place, location, mut next)) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        let target = match (UrlParts.parse(next.view())) {
+            Some(p) => p,
+            null => { return Ok(response); },
+        };
+        if (place.secure && !target.secure) {
+            return Ok(response);
+        }
+        if (hops >= limit) {
+            return Err(HttpError.TooManyRedirects);
+        }
+        let toGet =
+            (status == 303 && !(verb is Method.Head)) || ((status == 301 || status == 302) && verb is Method.Post);
+        if (toGet) {
+            verb = Method.Get;
+            content = false;
+        }
+        let sameOrigin = target.secure == place.secure && target.port == place.port &&
+            target.host(next.view()).equalsIgnoreAsciiCase(place.host(here));
+        if (!sameOrigin) {
+            credentials = false;
+        }
+        if (!credentials || !content) {
+            let made = filterFields(fields, credentials, content, mut kept);
+            let both = if (made.isOk()) packFields(kept.view(), mut keptPacked) else made;
+            match (both) {
+                Ok() => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+            filtered = true;
+        }
+        hops += 1;
+        place = target;
+        text = next;
+    }
+}
+
+/// One request and its response. Over HTTP/2 if the origin has a connection with room, or its next connection
+/// turns out to speak it; else over HTTP/1.1, on a pooled connection if there is one. A request whose connection
+/// had gone away is sent again on another when that is safe (`Connection.stale`, `H2Session.mayRetry`).
+async fn roundTrip<region c>(
+    client: borrow(c) Client,
+    method: Method,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    packed: Slice<u8>,
+    body: Slice<u8>,
+    buffered: bool,
+) -> Result<Response<c>, HttpError> {
+    if (parts.secure && client.tls == null) {
+        return Err(HttpError.NoTls);
+    }
+    let origin = client.origin(url, parts)?;
+    var permit = Permit { slot: null };
+    match (client.slots(origin)) {
+        Some(slots) => {
+            match (await slots.recvAsync()) {
+                Ok(Some(_)) => {}
+                Ok(null) => { return Err(HttpError.Closed); }
+                Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); }
+            }
+            permit.slot = Some(slots);
+        }
+        null => {}
+    }
+    let options = borrow client.options;
+    let head = method is Method.Head;
+    let length: u64? = if (body.length > 0 || Methods.sendsLength(method)) Some(body.length as u64) else null;
+    // HTTP/2 is possible when the client has sessions and the origin may speak it: https (by ALPN), or http by
+    // prior knowledge.
+    let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge);
+    var attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        var place: H2Place? = null;
+        var conn: Box<Connection>? = null;
+        if (mayH2 && client.protocol(origin) != 1) {
+            place = client.openStream(origin, method, url, parts, packed, length, body.length == 0, buffered)?;
+        }
+        if (place == null) {
+            conn = client.takeIdle(origin);
+        }
+        // Whoever dials an origin that may speak HTTP/2 holds its gate: the others wait here, and find the new
+        // connection when they get the gate in turn.
+        var gate = Permit { slot: null };
+        if (place == null && conn == null && mayH2 && client.protocol(origin) != 1) {
+            match (client.gate(origin)) {
+                Some(token) => {
+                    match (await token.recvAsync()) {
+                        Ok(Some(_)) => {}
+                        Ok(null) => { return Err(HttpError.Closed); }
+                        Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); }
+                    }
+                    gate.slot = Some(token);
+                    place = client.openStream(origin, method, url, parts, packed, length, body.length == 0, buffered)?;
+                    if (place == null && client.protocol(origin) == 1) {
+                        conn = client.takeIdle(origin);
+                    }
+                }
+                null => {}
+            }
+        }
+        if (place == null && conn == null) {
+            let wire = await dial(client, url, parts)?;
+            let speaksH2 = mayH2 && (if (parts.secure) wireAlpn(wire) is Alpn.Http2 else true);
+            if (speaksH2) {
+                let index = match (client.freeSession()) {
+                    Some(i) => i,
+                    null => { return Err(HttpError.Net(NetError.LimitExceeded)); },
+                };
+                match (client.sessions[index].start(Link { wire: wire }, origin)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+                client.learned(origin, 2);
+                place = client.openStream(origin, method, url, parts, packed, length, body.length == 0, buffered)?;
+                if (place == null) {
+                    return Err(HttpError.Net(NetError.LimitExceeded));
+                }
+            } else {
+                if (parts.secure) {
+                    client.learned(origin, 1);
+                }
+                let made = match (Connection.create(wire, options.bufferSize)) {
+                    Ok(c) => c,
+                    Err(_) => { return Err(HttpErrors.noMemory()); },
+                };
+                match (Box.create(made)) {
+                    Ok(b) => { conn = Some(b); }
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+        }
+        gate = Permit { slot: null }; // the connection exists: the next request may look
+        match (place) {
+            Some(at) => {
+                let session = borrow client.sessions[at.session];
+                let done = if (options.responseMs == 0) await h2Answer(
+                    session,
+                    at.slot,
+                    body,
+                    buffered,
+                ) else await Async.timeout(
+                    options.responseMs,
+                    HttpError.Net(NetError.TimedOut),
+                    async () => await h2Answer(session, at.slot, body, buffered),
+                );
+                var response = Response {
+                    client: client,
+                    conn: null,
+                    origin: origin,
+                    permit: permit,
+                    viaH2: true,
+                    session: at.session,
+                    slot: at.slot,
+                    generation: 0,
+                    code: 0,
+                    head: Vector<u8>.create(),
+                    spans: Vector<HeaderSpan>.create(),
+                    data: Vector<u8>.create(),
+                    filled: 0,
+                    streamed: !buffered,
+                };
+                let taken = session.takeResponse(at.slot, mut response.head, mut response.spans, mut response.data);
+                response.generation = taken.generation;
+                response.code = taken.status;
+                response.filled = taken.filled;
+                match (done) {
+                    Ok() => { return Ok(response); }
+                    Err(e) => {
+                        let again = options.retryStale && attempts < 3 && session.mayRetry(at.slot, method);
+                        // Dropping the response gives the slot back, and resets the stream if it is still open.
+                        permit = response.unpermit();
+                        if (!again) {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            null => {
+                var link = conn!;
+                link.out.clear();
+                match (writeRequestHead(mut link.out, method, url, parts, fields, length)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+                let done = if (options.responseMs == 0) await answer(
+                    mut link,
+                    body,
+                    head,
+                    buffered,
+                    options,
+                ) else await Async.timeout(
+                    options.responseMs,
+                    HttpError.Net(NetError.TimedOut),
+                    async () => await answer(mut link, body, head, buffered, options),
+                );
+                match (done) {
+                    Ok() => {
+                        return Ok(Response {
+                            client: client,
+                            conn: Some(link),
+                            origin: origin,
+                            permit: permit,
+                            viaH2: false,
+                            session: 0,
+                            slot: 0,
+                            generation: 0,
+                            code: 0,
+                            head: Vector<u8>.create(),
+                            spans: Vector<HeaderSpan>.create(),
+                            data: Vector<u8>.create(),
+                            filled: 0,
+                            streamed: !buffered,
+                        });
+                    }
+                    Err(e) => {
+                        if (!(options.retryStale && link.stale(method))) {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The request written and the response read: its head, and its body too for a buffered response.
+async fn answer(
+    conn: borrow mut Connection,
+    body: Slice<u8>,
+    head: bool,
+    buffered: bool,
+    options: borrow ClientOptions,
+) -> Result<void, HttpError> {
+    await conn.exchange(body, head, options)?;
+    if (buffered) {
+        await conn.readBody(options.maxBodyBytes)?;
+    }
+    return Ok();
+}
+
+/// The request's body sent and its response awaited on an HTTP/2 stream: to its end for a buffered response, to
+/// its head for a streamed one.
+async fn h2Answer(session: borrow H2Session, slot: usize, body: Slice<u8>, buffered: bool) -> Result<void, HttpError> {
+    if (body.length > 0) {
+        await session.sendBody(slot, body)?;
+    }
+    return await session.progress(slot, if (buffered) WANT_END else WANT_HEAD);
+}
+
+/// A new connection to `url`'s origin: each of the host's addresses in turn until one connects, then TLS for https.
+async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<Wire, HttpError> {
+    let options = borrow client.options;
+    let host = match (StringView.fromUtf8(parts.host(url))) {
+        Some(h) => h,
+        null => { return Err(HttpError.BadUrl); },
+    };
+    var plain: PlainStream? = null;
+    match (client.scriptedDial()) {
+        Some(mock) => { plain = Some(PlainStream.mock(mock)); }
+        null => {}
+    }
+    if (plain == null) {
+        var addresses = Vector<SocketAddress>.create();
+        match (SocketAddresses.parseIp(host, parts.port)) {
+            Some(a) => {
+                match (addresses.push(a)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+            null => {
+                match (await AsyncDns.resolve(host, parts.port)) {
+                    Ok(found) => { addresses = found; }
+                    Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); }
+                }
+            }
+        }
+        var failure = HttpError.NoAddress;
+        for (i in 0..addresses.length) {
+            let address = addresses[i];
+            let dialed = if (options.connectMs == 0) await TcpTransport.connectTo(address) else await Async.timeout(
+                options.connectMs,
+                NetError.TimedOut,
+                async () => await TcpTransport.connectTo(address),
+            );
+            match (dialed) {
+                Ok(tcp) => {
+                    match (tcp.setNoDelay(true)) {
+                        Ok() => {}
+                        Err(_) => {} // the first write says so if the connection is already gone
+                    }
+                    plain = Some(PlainStream.tcp(tcp));
+                    break;
+                }
+                Err(e) => { failure = HttpError.Net(e); }
+            }
+        }
+        if (plain == null) {
+            return Err(failure);
+        }
+    }
+    let stream = plain!;
+    if (parts.secure) {
+        return await secured(client, stream, host);
+    }
+    return Ok(Wire.Plain(stream));
+}
+
+/// TLS over `stream`, the server's certificate verified for `host`.
+async fn secured(client: borrow Client, stream: PlainStream, host: StringView) -> Result<Wire, HttpError> {
+    let config = match (borrow client.tls) {
+        Some(t) => t,
+        null => { return Err(HttpError.NoTls); },
+    };
+    let ms = client.options.handshakeMs;
+    let deadline = if (ms == 0) Deadline.never() else Deadline.after(ms);
+    match (await TlsTransport.connect(stream, config, host, deadline)) {
+        Ok(t) => { return Ok(Wire.Tls(t)); }
+        Err(e) => { return Err(HttpError.Net(e)); }
+    }
+}
+
+/// A response. Its fields and a buffered body are views of buffers the response holds while it lives: over
+/// HTTP/1.1 the connection it came on, over HTTP/2 its stream's. Dropping it gives them back: an HTTP/1.1 connection
+/// to the pool if the whole response was read and the server keeps it open (closed otherwise), an HTTP/2 stream's
+/// place to its connection (a stream still open is reset).
+@noncopy
+public struct Response<region c> {
+    private client: borrow(c) Client;
+    private conn: Box<Connection>?;
+    private origin: usize;
+    private permit: Permit;
+    private viaH2: bool;
+    private session: usize;
+    private slot: usize;
+    private generation: u64;
+    private code: u16;
+    /// An HTTP/2 response's fields (`:status` first) and, when buffered, its body: `data[0..filled]`.
+    private head: Vector<u8>;
+    private spans: Vector<HeaderSpan>;
+    private data: Vector<u8>;
+    private filled: usize;
+    private streamed: bool;
+
+    /// The status code.
+    public fn status(borrow this) -> u16 => match (borrow this.conn) {
+        Some(c) => c.parser.status,
+        null => this.code,
+    };
+
+    /// Whether the response came over HTTP/2.
+    public fn isHttp2(borrow this) -> bool => this.viaH2;
+
+    /// The whole body of a buffered response (`Client.get`, `Client.send`); empty for a streamed one.
+    public fn body(borrow this) -> Slice<u8> => match (borrow this.conn) {
+        Some(c) => c.buffer[c.bodyStart..c.bodyEnd],
+        null => this.data[0..this.filled],
+    };
+
+    /// How many fields the head has.
+    public fn headerCount(borrow this) -> usize => match (borrow this.conn) {
+        Some(c) => c.headers.length,
+        null => if (this.spans.length > 0) this.spans.length - 1 else 0,
+    };
+
+    /// Field `i`'s name: as the server wrote it over HTTP/1.1, lowercase over HTTP/2.
+    public fn name(borrow this, i: usize) -> Slice<u8> => match (borrow this.conn) {
+        Some(c) => c.name(i),
+        null => this.head[this.spans[i + 1].nameStart..this.spans[i + 1].nameEnd],
+    };
+
+    /// Field `i`'s value.
+    public fn value(borrow this, i: usize) -> Slice<u8> => match (borrow this.conn) {
+        Some(c) => c.value(i),
+        null => this.head[this.spans[i + 1].valueStart..this.spans[i + 1].valueEnd],
+    };
+
+    /// The index of the first field named `name` (ASCII case ignored), for `value`.
+    public fn find(borrow this, name: StringView) -> usize? {
+        match (borrow this.conn) {
+            Some(c) => { return c.find(name.bytes()); }
+            null => {}
+        }
+        let wanted = name.bytes();
+        for (i in 1..this.spans.length) {
+            let s = this.spans[i];
+            if (s.nameEnd - s.nameStart == wanted.length && this.head[s.nameStart..s.nameEnd].equalsIgnoreAsciiCase(
+                wanted,
+            )) {
+                return Some(i - 1);
+            }
+        }
+        return null;
+    }
+
+    /// The value of the first field named `name` (ASCII case ignored).
+    public fn header(borrow this, name: StringView) -> Slice<u8>? {
+        let i = this.find(name)?;
+        return Some(this.value(i));
+    }
+
+    /// The body's length when the head gives it (`content-length`); null for a chunked body or one that ends with
+    /// the connection, and over HTTP/2 when the server did not say.
+    public fn contentLength(borrow this) -> u64? {
+        match (borrow this.conn) {
+            Some(c) => {
+                return match (c.framing) {
+                    Framing.Length(n) => Some(n),
+                    Framing.None => Some(0u64),
+                    _ => null,
+                };
+            }
+            null => {}
+        }
+        let i = this.find("content-length")?;
+        return this.value(i).parseInt<u64>();
+    }
+
+    /// The next bytes of a streamed response's body (`Client.open`) into `buffer`: at least one, or 0 at its end.
+    public async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
+        match (borrow mut this.conn) {
+            Some(c) => { return await c.readSome(buffer); }
+            null => {}
+        }
+        if (!this.viaH2 || !this.streamed) {
+            return Ok(0);
+        }
+        return await this.client.sessions[this.session].read(this.slot, buffer);
+    }
+
+    /// Whether the whole response has been read.
+    public fn isComplete(borrow this) -> bool {
+        match (borrow this.conn) {
+            Some(c) => { return c.complete; }
+            null => {}
+        }
+        if (!this.viaH2 || !this.streamed) {
+            return true;
+        }
+        return this.client.sessions[this.session].isComplete(this.slot);
+    }
+
+    /// Ends the response, keeping its place among the origin's requests in flight for the request that is sent
+    /// again.
+    fn unpermit(this) -> Permit {
+        var me = this;
+        return replace(mut me.permit, Permit { slot: null });
+    }
+
+    drop {
+        match (replace(mut this.conn, null)) {
+            Some(conn) => {
+                if (conn.complete && conn.reusable) {
+                    this.client.giveBack(this.origin, conn);
+                }
+            }
+            null => {}
+        }
+        if (this.viaH2) {
+            this.client.sessions[this.session].release(
+                this.slot,
+                this.generation,
+                mut this.head,
+                mut this.spans,
+                mut this.data,
+            );
+        }
+    }
+}

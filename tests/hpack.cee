@@ -1,0 +1,221 @@
+// HPACK against RFC 7541's own examples (Appendix C): the expected bytes and fields are the RFC's.
+
+/// The bytes that `text`, hexadecimal with spaces, stands for.
+fn hex(text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    var high: u8 = 0;
+    var half = false;
+    for (c in text.bytes()) {
+        var d: u8 = 0;
+        if (c >= '0' && c <= '9') {
+            d = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            d = c - 'a' + 10;
+        } else {
+            continue;
+        }
+        if (half) {
+            made(out.push((high << 4) | d))?;
+        } else {
+            high = d;
+        }
+        half = !half;
+    }
+    return Ok(out);
+}
+
+/// Decodes `block` and checks that its fields are `expected`: name, value, name, value, ...
+fn expectFields(decoder: borrow mut HpackDecoder, block: StringView, expected: Slice<StringView>) -> Result<void, TestFailure> {
+    let bytes = hex(block)?;
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    match (decoder.decode(bytes.view(), mut out, mut spans, 65536, 100)) {
+        Ok() => {}
+        Err(f) => { return Err(TestFailure.create(HttpErrors.fault(f))); }
+    }
+    Check.equalU64((expected.length / 2) as u64, spans.length as u64)?;
+    for (i in 0..spans.length) {
+        let s = spans[i];
+        Check.equalBytes(expected[i * 2].bytes(), out[s.nameStart..s.nameEnd])?;
+        Check.equalBytes(expected[i * 2 + 1].bytes(), out[s.valueStart..s.valueEnd])?;
+    }
+    return Ok();
+}
+
+@test
+fn requestsWithoutHuffman() -> Result<void, TestFailure> {
+    // C.3: three requests on one connection.
+    var decoder = HpackDecoder.create(4096);
+    let first = [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"];
+    expectFields(mut decoder, "8286 8441 0f77 7777 2e65 7861 6d70 6c65 2e63 6f6d", first[..])?;
+    Check.equalU64(1, decoder.count() as u64)?;
+    let second = [
+        ":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache",
+    ];
+    expectFields(mut decoder, "8286 84be 5808 6e6f 2d63 6163 6865", second[..])?;
+    Check.equalU64(2, decoder.count() as u64)?;
+    let third = [
+        ":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key",
+        "custom-value",
+    ];
+    expectFields(
+        mut decoder,
+        "8287 85bf 400a 6375 7374 6f6d 2d6b 6579 0c63 7573 746f 6d2d 7661 6c75 65",
+        third[..],
+    )?;
+    Check.equalU64(3, decoder.count() as u64)?;
+    return Ok();
+}
+
+@test
+fn requestsWithHuffman() -> Result<void, TestFailure> {
+    // C.4: the same three requests, their strings Huffman-coded.
+    var decoder = HpackDecoder.create(4096);
+    let first = [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"];
+    expectFields(mut decoder, "8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff", first[..])?;
+    let second = [
+        ":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache",
+    ];
+    expectFields(mut decoder, "8286 84be 5886 a8eb 1064 9cbf", second[..])?;
+    let third = [
+        ":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key",
+        "custom-value",
+    ];
+    expectFields(mut decoder, "8287 85bf 4088 25a8 49e9 5ba9 7d7f 8925 a849 e95b b8e8 b4bf", third[..])?;
+    Check.equalU64(3, decoder.count() as u64)?;
+    return Ok();
+}
+
+@test
+fn responsesWithEviction() -> Result<void, TestFailure> {
+    // C.6: three responses with a table of 256 bytes, so entries are evicted.
+    var decoder = HpackDecoder.create(256);
+    let first = [
+        ":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location",
+        "https://www.example.com",
+    ];
+    expectFields(
+        mut decoder,
+        "4882 6402 5885 aec3 771a 4b61 96d0 7abe 9410 54d4 44a8 2005 9504 0b81 66e0 82a6 2d1b ff6e 919d 29ad 1718 63c7 8f0b 97c8 e9ae 82ae 43d3",
+        first[..],
+    )?;
+    Check.equalU64(4, decoder.count() as u64)?;
+    let second = [
+        ":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location",
+        "https://www.example.com",
+    ];
+    expectFields(mut decoder, "4883 640e ffc1 c0bf", second[..])?;
+    Check.equalU64(4, decoder.count() as u64)?;
+    let third = [
+        ":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location",
+        "https://www.example.com", "content-encoding", "gzip", "set-cookie",
+        "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1",
+    ];
+    expectFields(
+        mut decoder,
+        "88c1 6196 d07a be94 1054 d444 a820 0595 040b 8166 e084 a62d 1bff c05a 839b d9ab 77ad 94e7 821d d7f2 e6c7 b335 dfdf cd5b 3960 d5af 2708 7f36 72c1 ab27 0fb5 291f 9587 3160 65c0 03ed 4ee5 b106 3d50 07",
+        third[..],
+    )?;
+    Check.equalU64(3, decoder.count() as u64)?;
+    return Ok();
+}
+
+@test
+fn tableChurn() -> Result<void, TestFailure> {
+    // Many more insertions than the table holds: the storage is compacted and the newest entries stay right.
+    var decoder = HpackDecoder.create(4096);
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    for (round in 0u64..2000) {
+        var block = Vector<u8>.create();
+        var value = String.create();
+        made(value.append("value-number-"))?;
+        made(value.appendNumber(round))?;
+        made(block.push(0x40))?; // a literal with a new name, added to the table
+        made(hpackInteger(mut block, 0, 7, 8))?;
+        made(block.extend("x-custom".bytes()))?;
+        made(hpackInteger(mut block, 0, 7, value.length))?;
+        made(block.extend(value.view().bytes()))?;
+        made(block.push(0xBE))?; // the entry just added, by index 62
+        out.clear();
+        spans.clear();
+        match (decoder.decode(block.view(), mut out, mut spans, 65536, 100)) {
+            Ok() => {}
+            Err(f) => { return Err(TestFailure.create(HttpErrors.fault(f))); }
+        }
+        Check.equalU64(2, spans.length as u64)?;
+        let again = spans[1];
+        Check.equalBytes("x-custom".bytes(), out[again.nameStart..again.nameEnd])?;
+        Check.equalBytes(value.view().bytes(), out[again.valueStart..again.valueEnd])?;
+    }
+    Check.isTrue(decoder.count() <= 4096 / 32, "the table stays within its size")?;
+    return Ok();
+}
+
+@test
+fn badBlocks() -> Result<void, TestFailure> {
+    let bad = [
+        "80", // index 0
+        "be", // a dynamic entry that does not exist
+        "ff ff ff ff ff ff ff", // an integer that never ends
+        "40 0a 6375", // a string longer than the block
+        "8286 3f e1 1f", // a table size update after a field
+        "3f e2 1f", // a table size update above the setting (4097)
+        "00 01 41 00", // an uppercase name
+        "00 81 ff 00", // a Huffman string of padding only, longer than 7 bits
+        "00 83 ffffff 00", // EOS inside a Huffman string
+        "00 81 fe 00", // padding that is not all ones (the '!' code cut short)
+    ];
+    for (text in bad) {
+        var decoder = HpackDecoder.create(4096);
+        var out = Vector<u8>.create();
+        var spans = Vector<HeaderSpan>.create();
+        let bytes = hex(text)?;
+        match (decoder.decode(bytes.view(), mut out, mut spans, 65536, 100)) {
+            Ok() => { return Check.fail(text); }
+            Err(_) => {}
+        }
+    }
+    // The limits.
+    var decoder = HpackDecoder.create(4096);
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    let three = hex("8286 84")?;
+    match (decoder.decode(three.view(), mut out, mut spans, 65536, 2)) {
+        Err(Fault.TooManyHeaders) => {}
+        _ => { return Check.fail("the field limit"); }
+    }
+    out.clear();
+    spans.clear();
+    match (decoder.decode(three.view(), mut out, mut spans, 8, 100)) {
+        Err(Fault.HeadTooLarge) => {}
+        _ => { return Check.fail("the size limit"); }
+    }
+    return Ok();
+}
+
+@test
+fn literalsRoundTrip() -> Result<void, TestFailure> {
+    var block = Vector<u8>.create();
+    var long = Vector<u8>.create();
+    made(long.resize(300, 'v'))?;
+    made(hpackLiteral(mut block, 31, "".bytes(), "application/json".bytes(), false))?;
+    made(hpackLiteral(mut block, 23, "".bytes(), "Bearer secret".bytes(), true))?;
+    made(hpackLiteral(mut block, 0, "x-long".bytes(), long.view(), false))?;
+    Check.equalU64(0x0f, block[0] as u64)?; // no indexing, a name index past the 4-bit prefix
+    var decoder = HpackDecoder.create(4096);
+    var out = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    match (decoder.decode(block.view(), mut out, mut spans, 65536, 100)) {
+        Ok() => {}
+        Err(f) => { return Err(TestFailure.create(HttpErrors.fault(f))); }
+    }
+    Check.equalU64(3, spans.length as u64)?;
+    Check.equalBytes("content-type".bytes(), out[spans[0].nameStart..spans[0].nameEnd])?;
+    Check.equalBytes("application/json".bytes(), out[spans[0].valueStart..spans[0].valueEnd])?;
+    Check.equalBytes("authorization".bytes(), out[spans[1].nameStart..spans[1].nameEnd])?;
+    Check.equalBytes("x-long".bytes(), out[spans[2].nameStart..spans[2].nameEnd])?;
+    Check.equalBytes(long.view(), out[spans[2].valueStart..spans[2].valueEnd])?;
+    Check.equalU64(0, decoder.count() as u64)?; // none of them entered the table
+    return Ok();
+}

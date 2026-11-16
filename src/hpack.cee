@@ -1,0 +1,425 @@
+// HPACK (RFC 7541). The decoder is complete: the static and dynamic tables, every literal form, table size
+// updates, and Huffman-coded strings, decoded four bits at a time through a generated table (tools/gen_huffman.py).
+// The encoder is stateless on purpose: a request's fields are encoded once, when the request is built, as literals
+// that refer to no dynamic table, so the same bytes are right on every connection and sending a request costs a
+// copy.
+
+/// The Huffman decoder's table: for each of 256 states and 16 four-bit inputs, the next state, flags and a symbol.
+const HUFFMAN_SYMBOL: u8 = 1;
+const HUFFMAN_ACCEPT: u8 = 2;
+const HUFFMAN_FAIL: u8 = 4;
+
+/// The name of static table entry `i` (RFC 7541 Appendix A), 1 to 61.
+fn staticName(i: usize) -> StringView => match (i) {
+    1 => ":authority",
+    2 => ":method",
+    3 => ":method",
+    4 => ":path",
+    5 => ":path",
+    6 => ":scheme",
+    7 => ":scheme",
+    8 => ":status",
+    9 => ":status",
+    10 => ":status",
+    11 => ":status",
+    12 => ":status",
+    13 => ":status",
+    14 => ":status",
+    15 => "accept-charset",
+    16 => "accept-encoding",
+    17 => "accept-language",
+    18 => "accept-ranges",
+    19 => "accept",
+    20 => "access-control-allow-origin",
+    21 => "age",
+    22 => "allow",
+    23 => "authorization",
+    24 => "cache-control",
+    25 => "content-disposition",
+    26 => "content-encoding",
+    27 => "content-language",
+    28 => "content-length",
+    29 => "content-location",
+    30 => "content-range",
+    31 => "content-type",
+    32 => "cookie",
+    33 => "date",
+    34 => "etag",
+    35 => "expect",
+    36 => "expires",
+    37 => "from",
+    38 => "host",
+    39 => "if-match",
+    40 => "if-modified-since",
+    41 => "if-none-match",
+    42 => "if-range",
+    43 => "if-unmodified-since",
+    44 => "last-modified",
+    45 => "link",
+    46 => "location",
+    47 => "max-forwards",
+    48 => "proxy-authenticate",
+    49 => "proxy-authorization",
+    50 => "range",
+    51 => "referer",
+    52 => "refresh",
+    53 => "retry-after",
+    54 => "server",
+    55 => "set-cookie",
+    56 => "strict-transport-security",
+    57 => "transfer-encoding",
+    58 => "user-agent",
+    59 => "vary",
+    60 => "via",
+    61 => "www-authenticate",
+    _ => "",
+};
+
+/// The value of static table entry `i`; empty for the entries that have none.
+fn staticValue(i: usize) -> StringView => match (i) {
+    2 => "GET",
+    3 => "POST",
+    4 => "/",
+    5 => "/index.html",
+    6 => "http",
+    7 => "https",
+    8 => "200",
+    9 => "204",
+    10 => "206",
+    11 => "304",
+    12 => "400",
+    13 => "404",
+    14 => "500",
+    16 => "gzip, deflate",
+    _ => "",
+};
+
+/// The static table's index for the field name `name` (lowercase), or 0. For entries 15 and up, the fields a
+/// request may carry; the pseudo-fields are the client's own.
+fn staticNameIndex(name: Slice<u8>) -> usize {
+    for (i in 15..62) {
+        let have = staticName(i).bytes();
+        if (have.length == name.length && have == name) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/// An entry of the dynamic table: its name and value are `bytes[offset..]`, the name first.
+struct TableEntry {
+    offset: usize;
+    nameLength: usize;
+    valueLength: usize;
+}
+
+/// Decodes field blocks. One decoder serves a connection: the dynamic table carries over from block to block.
+public struct HpackDecoder {
+    /// The entries' bytes, oldest first; `entries[first..]` are live, the newest last.
+    private bytes: Vector<u8>;
+    private entries: Vector<TableEntry>;
+    private first: usize;
+    /// The table's size as §4.1 counts it: each entry's name and value lengths and 32.
+    private size: usize;
+    /// The size the encoder may use now, and the most it may ask for (SETTINGS_HEADER_TABLE_SIZE).
+    private limit: usize;
+    private ceiling: usize;
+
+    /// A decoder whose peer may use a dynamic table of up to `tableSize` bytes.
+    public fn create(tableSize: usize) -> HpackDecoder => HpackDecoder {
+        bytes: Vector<u8>.create(),
+        entries: Vector<TableEntry>.create(),
+        first: 0,
+        size: 0,
+        limit: tableSize,
+        ceiling: tableSize,
+    };
+
+    /// Empties the table, for a new connection.
+    public fn reset(borrow mut this) {
+        this.bytes.clear();
+        this.entries.clear();
+        this.first = 0;
+        this.size = 0;
+        this.limit = this.ceiling;
+    }
+
+    /// How many entries the dynamic table holds.
+    public fn count(borrow this) -> usize => this.entries.length - this.first;
+
+    /// Decodes `block`, a complete field block, appending each field's name and value to `out` and a span for it to
+    /// `spans`. `out` may hold at most `maxBytes` and `spans` at most `maxFields` afterwards. A fault leaves the
+    /// table in an unknown state: the connection cannot go on.
+    public fn decode(
+        borrow mut this,
+        block: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+        maxBytes: usize,
+        maxFields: usize,
+    ) -> Result<void, Fault> {
+        var at: usize = 0;
+        var fields = false;
+        while (at < block.length) {
+            let b = block[at];
+            if ((b & 0x80) != 0) {
+                // An indexed field (§6.1).
+                let index = integer(block, mut at, 7)?;
+                let nameStart = out.length;
+                this.copyName(index, mut out)?;
+                let nameEnd = out.length;
+                this.copyValue(index, mut out)?;
+                push(mut spans, nameStart, nameEnd, out.length, maxFields)?;
+                fields = true;
+            } else if ((b & 0xC0) == 0x40 || (b & 0xE0) == 0) {
+                // A literal field: added to the table (§6.2.1), or not (§6.2.2, §6.2.3).
+                let indexing = (b & 0x40) != 0;
+                let index = integer(block, mut at, if (indexing) 6 else 4)?;
+                let nameStart = out.length;
+                if (index == 0) {
+                    string(block, mut at, mut out)?;
+                    for (k in nameStart..out.length) {
+                        let c = out[k];
+                        if (c >= 'A' && c <= 'Z') {
+                            return Err(Fault.BadHeader); // field names are lowercase in HTTP/2 (RFC 9113 §8.2.1)
+                        }
+                    }
+                } else {
+                    this.copyName(index, mut out)?;
+                }
+                let nameEnd = out.length;
+                string(block, mut at, mut out)?;
+                let valueEnd = out.length;
+                push(mut spans, nameStart, nameEnd, valueEnd, maxFields)?;
+                if (indexing) {
+                    this.add(out[nameStart..nameEnd], out[nameEnd..valueEnd])?;
+                }
+                fields = true;
+            } else {
+                // A table size update (§6.3): only before the block's first field, and within the setting.
+                let wanted = integer(block, mut at, 5)?;
+                if (fields || wanted > this.ceiling) {
+                    return Err(Fault.BadCompression);
+                }
+                this.limit = wanted;
+                this.evict(0);
+            }
+            if (out.length > maxBytes) {
+                return Err(Fault.HeadTooLarge);
+            }
+        }
+        return Ok();
+    }
+
+    /// Appends entry `index`'s name to `out`.
+    fn copyName(borrow this, index: usize, out: borrow mut Vector<u8>) -> Result<void, Fault> {
+        if (index == 0) {
+            return Err(Fault.BadCompression);
+        }
+        if (index <= 61) {
+            return grown(out.extend(staticName(index).bytes()));
+        }
+        let e = this.entry(index)?;
+        return grown(out.extend(this.bytes[e.offset..e.offset + e.nameLength]));
+    }
+
+    /// Appends entry `index`'s value to `out`.
+    fn copyValue(borrow this, index: usize, out: borrow mut Vector<u8>) -> Result<void, Fault> {
+        if (index <= 61) {
+            return grown(out.extend(staticValue(index).bytes()));
+        }
+        let e = this.entry(index)?;
+        let start = e.offset + e.nameLength;
+        return grown(out.extend(this.bytes[start..start + e.valueLength]));
+    }
+
+    /// The dynamic entry with `index` (62 is the newest).
+    fn entry(borrow this, index: usize) -> Result<TableEntry, Fault> {
+        let back = index - 62;
+        if (back >= this.entries.length - this.first) {
+            return Err(Fault.BadCompression);
+        }
+        return Ok(this.entries[this.entries.length - 1 - back]);
+    }
+
+    /// Adds an entry (§4.4): older entries leave until it fits; one larger than the whole table empties it.
+    fn add(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, Fault> {
+        let cost = name.length + value.length + 32;
+        if (cost > this.limit) {
+            this.evict(this.limit + 1);
+            return Ok();
+        }
+        this.evict(cost);
+        // The live bytes move to the front when the dead ones before them outweigh them.
+        if (this.first > 0 && this.first == this.entries.length) {
+            this.entries.clear();
+            this.bytes.clear();
+            this.first = 0;
+        } else if (this.first >= 32) {
+            let base = this.entries[this.first].offset;
+            let live = this.bytes.length - base;
+            this.bytes.copyWithin(base, 0, live);
+            this.bytes.truncate(live);
+            let kept = this.entries.length - this.first;
+            for (k in 0..kept) {
+                var moved = this.entries[this.first + k];
+                moved.offset -= base;
+                this.entries[k] = moved;
+            }
+            this.entries.truncate(kept);
+            this.first = 0;
+        }
+        let offset = this.bytes.length;
+        grown(this.bytes.extend(name))?;
+        grown(this.bytes.extend(value))?;
+        grown(this.entries.push(TableEntry { offset: offset, nameLength: name.length, valueLength: value.length }))?;
+        this.size += cost;
+        return Ok();
+    }
+
+    /// Drops the oldest entries until `room` more bytes fit under the limit.
+    fn evict(borrow mut this, room: usize) {
+        while (this.first < this.entries.length && this.size + room > this.limit) {
+            let e = this.entries[this.first];
+            this.size -= e.nameLength + e.valueLength + 32;
+            this.first += 1;
+        }
+    }
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, Fault> {
+    match (r) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(Fault.HeadTooLarge); }
+    }
+}
+
+fn push(
+    spans: borrow mut Vector<HeaderSpan>,
+    nameStart: usize,
+    nameEnd: usize,
+    valueEnd: usize,
+    maxFields: usize,
+) -> Result<void, Fault> {
+    if (spans.length >= maxFields) {
+        return Err(Fault.TooManyHeaders);
+    }
+    return grown(
+        spans.push(HeaderSpan { nameStart: nameStart, nameEnd: nameEnd, valueStart: nameEnd, valueEnd: valueEnd }),
+    );
+}
+
+/// An integer with a prefix of `bits` bits (§5.1) at `block[at]`; `at` moves past it.
+fn integer(block: Slice<u8>, at: borrow mut usize, bits: u8) -> Result<usize, Fault> {
+    let mask: u8 = (1u8 << bits) - 1;
+    var value = (block[*at] & mask) as usize;
+    *at += 1;
+    if (value < mask as usize) {
+        return Ok(value);
+    }
+    var shift: u32 = 0;
+    loop {
+        if (*at >= block.length || shift > 28) {
+            return Err(Fault.BadCompression);
+        }
+        let b = block[*at];
+        *at += 1;
+        value += ((b & 127) as usize) << shift;
+        shift += 7;
+        if ((b & 128) == 0) {
+            return Ok(value);
+        }
+    }
+}
+
+/// A string (§5.2) at `block[at]`, appended to `out` decoded; `at` moves past it.
+fn string(block: Slice<u8>, at: borrow mut usize, out: borrow mut Vector<u8>) -> Result<void, Fault> {
+    if (*at >= block.length) {
+        return Err(Fault.BadCompression);
+    }
+    let coded = (block[*at] & 0x80) != 0;
+    let length = integer(block, mut at, 7)?;
+    if (length > block.length - *at) {
+        return Err(Fault.BadCompression);
+    }
+    let raw = block[*at..*at + length];
+    *at += length;
+    if (!coded) {
+        return grown(out.extend(raw));
+    }
+    return huffmanDecode(raw, mut out);
+}
+
+/// Appends the text that the Huffman-coded `raw` stands for to `out` (§5.2). The padding must be the first bits of
+/// EOS and shorter than a byte; EOS itself is a fault.
+public fn huffmanDecode(raw: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, Fault> {
+    let table = embed("huffman.bin");
+    let start = out.length;
+    // No code is shorter than 5 bits, so n bytes hold at most 8n/5 symbols.
+    grown(out.resize(start + raw.length * 2, 0))?;
+    var written = start;
+    var state: usize = 0;
+    var accept = true;
+    for (b in raw) {
+        var entry = (state * 16 + (b >> 4) as usize) * 3;
+        var flags = table[entry + 1];
+        if ((flags & HUFFMAN_FAIL) != 0) {
+            return Err(Fault.BadCompression);
+        }
+        if ((flags & HUFFMAN_SYMBOL) != 0) {
+            out[written] = table[entry + 2];
+            written += 1;
+        }
+        state = table[entry] as usize;
+        entry = (state * 16 + (b & 15) as usize) * 3;
+        flags = table[entry + 1];
+        if ((flags & HUFFMAN_FAIL) != 0) {
+            return Err(Fault.BadCompression);
+        }
+        if ((flags & HUFFMAN_SYMBOL) != 0) {
+            out[written] = table[entry + 2];
+            written += 1;
+        }
+        state = table[entry] as usize;
+        accept = (flags & HUFFMAN_ACCEPT) != 0;
+    }
+    if (!accept) {
+        return Err(Fault.BadCompression);
+    }
+    out.truncate(written);
+    return Ok();
+}
+
+/// Appends `value` as an integer with a prefix of `bits` bits, the bits above the prefix being `flags` (§5.1).
+public fn hpackInteger(out: borrow mut Vector<u8>, flags: u8, bits: u8, value: usize) -> Result<void, AllocError> {
+    let mask = ((1u32 << bits as u32) - 1) as usize;
+    if (value < mask) {
+        return out.push(flags | truncate<u8>(value));
+    }
+    out.push(flags | truncate<u8>(mask))?;
+    var rest = value - mask;
+    while (rest >= 128) {
+        out.push(truncate<u8>(rest & 127) | 128)?;
+        rest >>= 7;
+    }
+    return out.push(truncate<u8>(rest));
+}
+
+/// Appends a literal field that enters no table (§6.2.2), or one that must never be indexed by anyone who forwards
+/// it (§6.2.3: credentials). `nameIndex` names a table entry with the field's name, or is 0 and `name` is written.
+/// Strings are written as they are, not Huffman-coded.
+public fn hpackLiteral(
+    out: borrow mut Vector<u8>,
+    nameIndex: usize,
+    name: Slice<u8>,
+    value: Slice<u8>,
+    never: bool,
+) -> Result<void, AllocError> {
+    hpackInteger(mut out, if (never) 0x10 else 0, 4, nameIndex)?;
+    if (nameIndex == 0) {
+        hpackInteger(mut out, 0, 7, name.length)?;
+        out.extend(name)?;
+    }
+    hpackInteger(mut out, 0, 7, value.length)?;
+    return out.extend(value);
+}

@@ -1,0 +1,213 @@
+// Redirects, the per-origin limit and the response timeout, over scripted connections.
+import web_core;
+import web_transport;
+
+/// `location` resolved against `base`.
+fn resolved(base: StringView, location: StringView) -> Result<Vector<u8>, TestFailure> {
+    let parts = parsedUrl(base)?;
+    var out = Vector<u8>.create();
+    made(resolveLocation(base.bytes(), parts, location.bytes(), mut out))?;
+    return Ok(out);
+}
+
+@test
+fn locationsResolve() -> Result<void, TestFailure> {
+    // RFC 3986 §5.4.1 and §5.4.2, for the base http://a/b/c/d;p?q.
+    let base = "http://a/b/c/d;p?q";
+    let references = [
+        "g", "./g", "g/", "/g", "//g", "?y", "g?y", "#s", "g#s", "", ".", "./", "..", "../", "../g", "../..", "../../",
+        "../../g", "../../../g", "/./g", "/../g", "g.", ".g", "g..", "./../g", "./g/.", "g/./h", "g/../h",
+        "https://other.example/x?y#z", " /spaced ",
+    ];
+    let expected = [
+        "http://a/b/c/g", "http://a/b/c/g", "http://a/b/c/g/", "http://a/g", "http://g", "http://a/b/c/d;p?y",
+        "http://a/b/c/g?y", "http://a/b/c/d;p?q", "http://a/b/c/g", "http://a/b/c/d;p?q", "http://a/b/c/",
+        "http://a/b/c/", "http://a/b/", "http://a/b/", "http://a/b/g", "http://a/", "http://a/", "http://a/g",
+        "http://a/g", "http://a/g", "http://a/g", "http://a/b/c/g.", "http://a/b/c/.g", "http://a/b/c/g..",
+        "http://a/b/g", "http://a/b/c/g/", "http://a/b/c/g/h", "http://a/b/c/h", "https://other.example/x?y",
+        "http://a/spaced",
+    ];
+    for (i in 0..references.length) {
+        let got = resolved(base, references[i])?;
+        Check.equalBytes(expected[i].bytes(), got.view())?;
+    }
+    let bare = resolved("https://host:8443", "next")?;
+    Check.equalBytes("https://host:8443/next".bytes(), bare.view())?;
+    let query = resolved("http://host", "?a=1")?;
+    Check.equalBytes("http://host/?a=1".bytes(), query.view())?;
+    return Ok();
+}
+
+fn following(hops: u32) -> Client {
+    var options = ClientOptions.defaults();
+    options.maxRedirects = hops;
+    return Client.create(options);
+}
+
+@test
+async fn redirectsAreFollowed() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = following(5);
+    // One connection: a 302 to a path, a 303 to another, then the answer. Each read gives one response.
+    script(client, "HTTP/1.1 302 Found\r\nLocation: /second\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone", 0, copies)?;
+    var request = match (Request.create(Method.Post, "http://example.com/first")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (request.header("Content-Type", "text/plain")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    match (request.header("Authorization", "Bearer secret")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    {
+        let response = match (await client.send(request, "payload".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("done".bytes(), response.body())?;
+    }
+    // The POST, then a GET without the body or its content-type; the same origin keeps the credentials. The first
+    // connection had ended, so the GET went to it, found it closed, and was sent again on the second.
+    let sent = written(copies)?;
+    let first = "POST /first HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/plain\r\nAuthorization: Bearer secret\r\nContent-Length: 7\r\n\r\npayload";
+    let second = "GET /second HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer secret\r\n\r\n";
+    Check.equalU64((first.length + 2 * second.length) as u64, sent.length as u64)?;
+    Check.equalBytes(first.bytes(), sent[0..first.length])?;
+    Check.equalBytes(second.bytes(), sent[first.length..first.length + second.length])?;
+    Check.equalBytes(second.bytes(), sent[first.length + second.length..])?;
+    return Ok();
+}
+
+@test
+async fn redirectToAnotherOriginDropsCredentials() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = following(5);
+    script(client, "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://other.example:8080/put\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    script(client, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+    var request = match (Request.create(Method.Put, "http://example.com/put")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    for (name in ["Authorization", "Cookie", "Proxy-Authorization", "X-Kept"]) {
+        match (request.header(name, "v")) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+    }
+    {
+        let response = match (await client.send(request, "body".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(201, response.status() as u64)?;
+    }
+    let sent = written(copies)?;
+    let first = "PUT /put HTTP/1.1\r\nHost: example.com\r\nAuthorization: v\r\nCookie: v\r\nProxy-Authorization: v\r\nX-Kept: v\r\nContent-Length: 4\r\n\r\nbody";
+    let second = "PUT /put HTTP/1.1\r\nHost: other.example:8080\r\nX-Kept: v\r\nContent-Length: 4\r\n\r\nbody";
+    Check.equalU64((first.length + second.length) as u64, sent.length as u64)?;
+    Check.equalBytes(second.bytes(), sent[first.length..])?;
+    return Ok();
+}
+
+@test
+async fn redirectLimits() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let looping = "HTTP/1.1 301 Moved\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let client = following(2);
+    for (k in 0..3) {
+        script(client, looping, 0, copies)?;
+    }
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.TooManyRedirects) => {}
+        _ => { return Check.fail("the redirect limit"); }
+    }
+    // Without the option a redirect is an ordinary response.
+    let plain = Client.create(ClientOptions.defaults());
+    script(plain, looping, 0, copies)?;
+    {
+        let response = match (await plain.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(301, response.status() as u64)?;
+    }
+    // A redirect without a Location, or with one that is no URL, is returned as it is.
+    let other = following(5);
+    script(other, "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 0, copies)?;
+    {
+        let response = match (await other.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(302, response.status() as u64)?;
+    }
+    script(other, "HTTP/1.1 302 Found\r\nLocation: ftp://example.com/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 0, copies)?;
+    {
+        let response = match (await other.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(302, response.status() as u64)?;
+    }
+    return Ok();
+}
+
+@test
+async fn responseTimeout() -> Result<void, TestFailure> {
+    var options = ClientOptions.defaults();
+    options.responseMs = 50;
+    let client = Client.create(options);
+    // A server that sends half a head and then nothing.
+    let mock = made(MockTransport.create("HTTP/1.1 200 OK\r\nContent-".bytes()))?.withHang();
+    made(client.script(mock))?;
+    match (await client.get("http://example.com/")) {
+        Err(HttpError.Net(NetError.TimedOut)) => {}
+        Err(e) => { return Err(failed(e)); }
+        Ok(_) => { return Check.fail("a response from half a head"); }
+    }
+    Check.equalU64(0, client.idleConnections() as u64)?;
+    return Ok();
+}
+
+async fn held(client: borrow Client, order: borrow Cell<u32>, mark: u32, holdMs: u64) -> Result<void, TestFailure> {
+    let response = match (await client.get("http://example.com/")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    order.set(order.get() * 10 + mark);
+    if (holdMs > 0) {
+        match (await Timer.sleep(holdMs)) {
+            Ok() => {}
+            Err(_) => { return Check.fail("the sleep"); }
+        }
+    }
+    return Ok();
+}
+
+@test
+async fn perOriginLimitMakesRequestsWait() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var options = ClientOptions.defaults();
+    options.maxPerOrigin = 1;
+    let client = Client.create(options);
+    // One connection serves both: the second request waits for the first response to be dropped, then reuses it.
+    script(
+        client,
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb",
+        39,
+        copies,
+    )?;
+    let order = Cell<u32>.create(0);
+    await Async.scope(TestFailure.create("out of memory"), (s) => {
+        s.spawn(async () => await held(client, order, 1, 30));
+        s.spawn(async () => await held(client, order, 2, 0));
+    })?;
+    Check.equalU64(12, order.get() as u64)?;
+    Check.equalU64(1, client.idleConnections() as u64)?;
+    return Ok();
+}

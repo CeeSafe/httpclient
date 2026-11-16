@@ -13,6 +13,8 @@ public struct ClientStats {
     public retries: u64;
     /// Connections opened, for requests, uploads and WebSockets.
     public connections: u64;
+    /// Responses that came over HTTP/3.
+    public overHttp3: u64;
     /// The milliseconds the ended requests took together.
     public totalMs: u64;
 }

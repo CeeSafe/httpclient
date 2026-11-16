@@ -1,27 +1,20 @@
-// GET a URL over HTTP/3 and print the status, the fields and the size of the body:
+// GET a URL with cosmohttp's Client, which speaks HTTP/3 through this package's pool, and print how each request
+// went:
 //
 //   get3 https://example.com/ [count]
 //
-// With a count, the request is sent that many times over the one connection.
+// The first request goes over TCP (HTTP/2 or HTTP/1.1); if the server advertises HTTP/3 (`Alt-Svc`), the next ones
+// go over it. With GET3_FIRST set, HTTP/3 is tried from the first request.
 import web_core;
 import web_tls;
 import web_quic;
 import cosmohttp;
 import cosmohttp3;
 
-async fn fetch(tls: borrow QuicTls, request: borrow Request, count: u64) -> Result<void, AsyncError> {
-    let parts = request.urlParts();
-    let host = StringView.fromUtf8(parts.host(request.url())) ?? "";
-    let conn = match (await H3Connection.connect(tls, host, parts.port, H3Options.defaults())) {
-        Ok(c) => c,
-        Err(e) => {
-            await AsyncConsole.writeLine(HttpErrors.describe(e))?;
-            return Ok();
-        },
-    };
+async fn fetch(http: borrow Client, url: StringView, count: u64) -> Result<void, AsyncError> {
     for (k in 0..count) {
         let started = Clock.monotonicNanos();
-        let response = match (await conn.send(request, "".bytes())) {
+        let response = match (await http.get(url)) {
             Ok(r) => r,
             Err(e) => {
                 await AsyncConsole.writeLine(HttpErrors.describe(e))?;
@@ -29,34 +22,51 @@ async fn fetch(tls: borrow QuicTls, request: borrow Request, count: u64) -> Resu
             },
         };
         var line = String.create();
-        line.append("HTTP/3 ")!;
+        line.append(if (response.isHttp3()) "HTTP/3 " else if (response.isHttp2()) "HTTP/2 " else "HTTP/1.1 ")!;
         line.appendNumber(response.status() as u64)!;
         line.append(", ")!;
         line.appendNumber(response.body().length as u64)!;
-        line.append(" bytes, ")!;
-        line.appendNumber((Clock.monotonicNanos() - started) / 1000)!;
-        line.append(" us")!;
-        await AsyncConsole.writeLine(line.view())?;
-        if (k == 0) {
-            for (i in 0..response.headerCount()) {
-                var field = String.create();
-                let named = field.appendUtf8(response.name(i))!;
-                field.append(": ")!;
-                let valued = field.appendUtf8(response.value(i))!;
-                await AsyncConsole.writeLine(field.view())?;
+        line.append(if (response.wasDecoded()) " bytes decompressed, " else " bytes, ")!;
+        line.appendNumber((Clock.monotonicNanos() - started) / 1000000)!;
+        line.append(" ms")!;
+        match (response.header("alt-svc")) {
+            Some(v) => {
+                line.append("   alt-svc: ")!;
+                let shown = line.appendUtf8(v)!;
             }
+            null => {}
         }
+        await AsyncConsole.writeLine(line.view())?;
     }
-    await conn.close();
     return Ok();
 }
 
-fn context() -> Result<TlsConfig, TlsSetupError> {
-    var config = TlsConfig.client()?;
-    config.trustSystem()?;
+/// A client that verifies servers against the system's roots: HTTP/2 and HTTP/1.1 over TCP, HTTP/3 over QUIC.
+fn client() -> Result<Client, TlsSetupError> {
+    var tcp = TlsConfig.client()?;
+    tcp.trustSystem()?;
+    let both = [Alpn.Http2, Alpn.Http11];
+    tcp.setAlpn(both[..])?;
+    var udp = TlsConfig.client()?;
+    udp.trustSystem()?;
     let h3 = [Alpn.Http3];
-    config.setAlpn(h3[..])?;
-    return Ok(config);
+    udp.setAlpn(h3[..])?;
+    let quic = match (QuicTls.of(udp)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TlsSetupError.Internal); },
+    };
+    let pool = match (Http3Pool.create(quic, H3Options.defaults(), 4)) {
+        Ok(p) => p,
+        Err(_) => { return Err(TlsSetupError.Internal); },
+    };
+    let transport: Box<dyn Http3Transport> = match (Box.create(pool)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TlsSetupError.Internal); },
+    };
+    var options = ClientOptions.defaults();
+    options.decompress = true;
+    options.http3PriorKnowledge = Environment.variable("GET3_FIRST") != null;
+    return Ok(Client.withHttp3(options, tcp, transport));
 }
 
 fn main() {
@@ -68,35 +78,21 @@ fn main() {
         },
     };
     let count = match (Process.argument(2)) {
-        Some(c) => c.parseInt<u64>() ?? 1,
-        null => 1,
-    };
-    let request = match (Request.create(Method.Get, url)) {
-        Ok(r) => r,
-        Err(_) => {
-            Console.writeLine("get3: not a URL");
-            return;
-        },
+        Some(c) => c.parseInt<u64>() ?? 3,
+        null => 3,
     };
     if (!QuicLibrary.initialise()) {
         Console.writeLine("get3: the QUIC library did not start (OpenSSL 3.5 or later is needed)");
         return;
     }
-    let config = match (context()) {
+    let http = match (client()) {
         Ok(c) => c,
         Err(_) => {
             Console.writeLine("get3: could not set up TLS");
             return;
         },
     };
-    let tls = match (QuicTls.of(config)) {
-        Ok(t) => t,
-        Err(_) => {
-            Console.writeLine("get3: could not set up QUIC's TLS");
-            return;
-        },
-    };
-    match (Async.run(fetch(tls, request, count))) {
+    match (Async.run(fetch(http, url, count))) {
         Ok() => {}
         Err(_) => { Console.writeLine("get3: failed"); }
     }

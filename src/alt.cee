@@ -1,0 +1,97 @@
+// HTTP/3 as a transport the client may be given. This package has no QUIC in it: the cosmohttp3 package implements
+// `Http3Transport`, and a client made with `Client.withHttp3` uses it for buffered requests to `https` origins that
+// have said they speak HTTP/3 (`Alt-Svc`, RFC 7838), below everything else the client does: redirects, retries, the
+// cache, cookies and decompression are the same whichever way a request goes.
+
+/// A response as an `Http3Transport` hands it over: its buffers become the `Response`'s.
+public struct Http3Answer {
+    public status: u16;
+    /// The fields' names and values, `:status` first, then the trailers; `spans` says where each is.
+    public head: Vector<u8>;
+    public spans: Vector<HeaderSpan>;
+    public body: Vector<u8>;
+    /// How many of `spans`, the last ones, are trailers.
+    public trailers: usize;
+
+    public fn create() -> Http3Answer => Http3Answer {
+        status: 0,
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+        body: Vector<u8>.create(),
+        trailers: 0,
+    };
+}
+
+/// Why a request did not go over HTTP/3.
+public struct Http3Failure {
+    public error: HttpError;
+    /// The server cannot have acted on the request: it never left, or the server said it was not processed. Such a
+    /// request may go another way whatever its method.
+    public unsent: bool;
+}
+
+/// Carries a request over HTTP/3.
+public interface Http3Transport {
+    /// Sends the request to the URL's host at UDP port `port` and reads the whole response into `answer`. `fields`
+    /// are lines, `name: value\r\n` each; `responseMs` (0: no limit) and `maxBodyBytes` are the client's limits.
+    async fn fetch(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, maxBodyBytes: u64, answer: borrow mut Http3Answer,) -> Result<void, Http3Failure>;
+}
+
+/// What an `Alt-Svc` value says about HTTP/3 on the same host.
+public struct AltSvc {
+    /// Forget what was advertised (`clear`).
+    public clear: bool;
+    /// The UDP port, and for how many seconds the advertisement holds.
+    public port: u16;
+    public maxAge: u64;
+}
+
+/// The first HTTP/3 alternative on the same host in an `Alt-Svc` value (`h3=":443"; ma=86400`), or `clear`; null if
+/// it names none. Alternatives on another host, and drafts of HTTP/3, are passed over.
+public fn altSvcH3(value: Slice<u8>) -> AltSvc? {
+    if (value.trim().equalsIgnoreAsciiCase("clear".bytes())) {
+        return Some(AltSvc { clear: true, port: 0, maxAge: 0 });
+    }
+    var at: usize = 0;
+    while (at < value.length) {
+        // One alternative: up to a comma that is not inside quotes.
+        var end = at;
+        var quoted = false;
+        while (end < value.length && (quoted || value[end] != ',')) {
+            if (value[end] == '"') {
+                quoted = !quoted;
+            }
+            end += 1;
+        }
+        let entry = value[at..end].trim();
+        at = end + 1;
+        if (entry.length < 6 || !entry[0..4].equalsIgnoreAsciiCase("h3=\"".bytes()) || entry[4] != ':') {
+            continue;
+        }
+        var k: usize = 5;
+        var port: u32 = 0;
+        while (k < entry.length && entry[k] >= '0' && entry[k] <= '9' && port <= 65535) {
+            port = port * 10 + (entry[k] - '0') as u32;
+            k += 1;
+        }
+        if (k == 5 || k >= entry.length || entry[k] != '"' || port == 0 || port > 65535) {
+            continue;
+        }
+        var maxAge: u64 = 86400;
+        var rest = entry[k + 1..];
+        loop {
+            let semi = match (rest.indexOfByte(';')) {
+                Some(i) => i,
+                null => { break; },
+            };
+            rest = rest[semi + 1..];
+            let stop = rest.indexOfByte(';') ?? rest.length;
+            let parameter = rest[0..stop].trim();
+            if (parameter.length > 3 && parameter[0..3].equalsIgnoreAsciiCase("ma=".bytes())) {
+                maxAge = parameter[3..].parseInt<u64>() ?? 0;
+            }
+        }
+        return Some(AltSvc { clear: false, port: truncate<u16>(port), maxAge: maxAge });
+    }
+    return null;
+}

@@ -1,0 +1,129 @@
+// cosmohttp's Client speaking HTTP/3 through the pool, against the server of h3.cee.
+import web_core;
+import web_tls;
+import web_quic;
+import cosmohttp;
+
+fn urlFor(port: u16, path: StringView) -> Result<String, TestFailure> {
+    var url = String.create();
+    let built = url.append("https://localhost:").isOk() && url.appendNumber(port as u64).isOk() && url.append(path).isOk();
+    if (!built) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    return Ok(url);
+}
+
+async fn fetched(client: borrow Client, port: u16, path: StringView, status: u64, body: StringView) -> Result<void, TestFailure> {
+    let url = urlFor(port, path)?;
+    let response = match (await client.get(url.view())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue(response.isHttp3(), "over HTTP/3")?;
+    Check.equalU64(status, response.status() as u64)?;
+    return Check.equalBytes(body.bytes(), response.body());
+}
+
+async fn throughTheClient(client: borrow Client, port: u16, silent: u16) -> Result<void, TestFailure> {
+    await fetched(client, port, "/hello", 200, "hello over h3")?;
+    // The client's own work happens above the transport: a redirect is followed, over HTTP/3 again.
+    await fetched(client, port, "/moved", 200, "hello over h3")?;
+    await fetched(client, port, "/missing", 404, "")?;
+    await Async.scope(TestFailure.create("out of memory"), (s) => {
+        s.spawn(async () => await fetched(client, port, "/hello", 200, "hello over h3"));
+        s.spawn(async () => await fetched(client, port, "/split", 200, "abcd"));
+        s.spawn(async () => await fetched(client, port, "/interim", 200, "final"));
+        s.spawn(async () => await fetched(client, port, "/moved", 200, "hello over h3"));
+        s.spawn(async () => await fetched(client, port, "/nothing", 204, ""));
+    })?;
+    let stats = client.stats();
+    Check.equalU64(10, stats.overHttp3)?; // each redirect is two
+    Check.equalU64(0, stats.connections)?; // no TCP connection was opened
+    // A server that does not answer on UDP: found out within the handshake's time, then TCP is tried (nothing
+    // listens there either), and the origin is left alone.
+    let started = Timer.now();
+    let url = urlFor(silent, "/hello")?;
+    Check.isTrue((await client.get(url.view())).isErr(), "nobody answers")?;
+    Check.isTrue(Timer.now() - started < 5000, "found out soon")?;
+    let again = Timer.now();
+    Check.isTrue((await client.get(url.view())).isErr(), "nobody answers, again")?;
+    Check.isTrue(Timer.now() - again < 200, "HTTP/3 was not tried a second time")?;
+    // The first server is unharmed.
+    await fetched(client, port, "/hello", 200, "hello over h3")?;
+    return Ok();
+}
+
+@test
+async fn theClientOverHttp3() -> Result<void, TestFailure> {
+    Check.isTrue(QuicLibrary.initialise(), "the QUIC library")?;
+    let p = configs()?;
+    let any = SocketAddress.V4([127u8, 0, 0, 1], 0);
+    let socket = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the server's socket")); },
+    };
+    let local = match (socket.localAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("the server's address")); },
+    };
+    // A socket nobody reads: a server that is not there.
+    let quiet = match (AsyncUdpSocket.bind(any, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Err(TestFailure.create("the silent socket")); },
+    };
+    let silent = match (quiet.localAddress()) {
+        Ok(SocketAddress.V4(_, port)) => port,
+        _ => { return Err(TestFailure.create("the silent address")); },
+    };
+    let port = match (local) {
+        SocketAddress.V4(_, n) => n,
+        _ => { return Err(TestFailure.create("the server's port")); },
+    };
+    let tls = match (Arc<QuicTls>.create(p.server)) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { unused: 0 })) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    let app = match (Arc<Box<dyn QuicApplication + Send + Share>>.create(boxed)) {
+        Ok(a) => a,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    var h3 = H3Options.defaults();
+    h3.handshakeMs = 400;
+    let pool = match (Http3Pool.create(p.client, h3, 2)) {
+        Ok(q) => q,
+        Err(e) => { return Err(failed(e)); },
+    };
+    let transport: Box<dyn Http3Transport> = match (Box.create(pool)) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    var options = ClientOptions.defaults();
+    options.http3PriorKnowledge = true;
+    options.connectMs = 1000;
+    options.maxRedirects = 5;
+    let client = Client.withHttp3(options, p.clientConfig, transport);
+    let raced: Result<Raced<Ended>, AsyncError> = await Async.race(
+        async move () => {
+            let _ = await QuicServer.serve(socket, local, tls, app, QuicServerOptions.defaults());
+            return Ok(Ended.Server);
+        },
+        async () => {
+            match (await throughTheClient(client, port, silent)) {
+                Ok() => { return Ok(Ended.Client); }
+                Err(e) => { return Ok(Ended.ClientFailed(e)); }
+            }
+        },
+    );
+    return match (raced) {
+        Ok(won) => match (won.value) {
+            Ended.Client => Ok(),
+            Ended.ClientFailed(e) => Err(e),
+            Ended.Server => Err(TestFailure.create("the server ended before the client")),
+        },
+        Err(_) => Err(TestFailure.create("the race")),
+    };
+}

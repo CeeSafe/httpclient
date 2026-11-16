@@ -137,6 +137,8 @@ fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocErr
         dataFrame(mut out, "four".bytes())?;
     } else if (path == "/nothing".bytes()) {
         headersFrame(mut out, "204", [])?;
+    } else if (path == "/moved".bytes()) {
+        headersFrame(mut out, "302", ["location", "/hello", "content-length", "0"][..])?;
     } else if (path == "/reset".bytes()) {
         return Ok(false);
     } else {

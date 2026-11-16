@@ -85,6 +85,11 @@ struct Origin {
     idle: Vector<Box<Connection>>;
     /// What the origin speaks, once a connection has shown it: 0 not known yet, 1 HTTP/1.1, 2 HTTP/2.
     protocol: u8;
+    /// HTTP/3 as the origin advertised it (`Alt-Svc`): the UDP port (0: not advertised) and until when (`Timer.now`).
+    h3Port: u16;
+    h3Until: u64;
+    /// HTTP/3 failed: not to be tried again before this time.
+    h3BadUntil: u64;
     /// The requests-in-flight semaphore, a token per free place: one channel, or none without a limit.
     slots: Vector<Channel<u8>>;
     /// One token: who holds it may dial the origin's next HTTP/2 connection, so requests that start together
@@ -129,6 +134,8 @@ public struct Client {
     /// The responses the client has kept (`ClientOptions.cacheBytes`).
     private cache: RefCell<ResponseCache>;
     private counters: RefCell<ClientStats>;
+    /// HTTP/3, if the client was given a way to speak it (`withHttp3`).
+    private http3: (Box<dyn Http3Transport>)?;
 
     /// A client for `http://` URLs; `https://` URLs fail with `NoTls`.
     public fn create(options: ClientOptions) -> Client => Client {
@@ -147,8 +154,18 @@ public struct Client {
         jar: RefCell<CookieJar>.create(CookieJar.create()),
         cache: RefCell<ResponseCache>.create(ResponseCache.create(options.cacheBytes)),
         counters: RefCell<ClientStats>.create(
-            ClientStats { requests: 0, responses: 0, errors: 0, cached: 0, retries: 0, connections: 0, totalMs: 0 },
+            ClientStats {
+                requests: 0,
+                responses: 0,
+                errors: 0,
+                cached: 0,
+                retries: 0,
+                connections: 0,
+                overHttp3: 0,
+                totalMs: 0,
+            },
         ),
+        http3: null,
     };
 
     /// A client that also makes `https://` connections with `tls` (a web_tls `TlsConfig.client()` with its trust
@@ -170,9 +187,29 @@ public struct Client {
         jar: RefCell<CookieJar>.create(CookieJar.create()),
         cache: RefCell<ResponseCache>.create(ResponseCache.create(options.cacheBytes)),
         counters: RefCell<ClientStats>.create(
-            ClientStats { requests: 0, responses: 0, errors: 0, cached: 0, retries: 0, connections: 0, totalMs: 0 },
+            ClientStats {
+                requests: 0,
+                responses: 0,
+                errors: 0,
+                cached: 0,
+                retries: 0,
+                connections: 0,
+                overHttp3: 0,
+                totalMs: 0,
+            },
         ),
+        http3: null,
     };
+
+    /// A client as `withTls` makes, which also speaks HTTP/3 through `transport` (cosmohttp3's `Http3Pool`): for
+    /// buffered requests (`get`, `send`) to `https` origins that advertise it with `Alt-Svc`, or to all of them with
+    /// `ClientOptions.http3PriorKnowledge`. When HTTP/3 fails for an origin, its requests go over TCP again for
+    /// `http3RetryMs`.
+    public fn withHttp3(options: ClientOptions, tls: TlsConfig, transport: Box<dyn Http3Transport>) -> Client {
+        var client = Client.withTls(options, tls);
+        client.http3 = Some(transport);
+        return client;
+    }
 
     /// GET `url`; the whole response is read before this returns.
     public async fn get(borrow this, url: StringView) -> Result<Response, HttpError> {
@@ -290,6 +327,51 @@ public struct Client {
         let guard = this.origins.read();
         let o = guard.data();
         return o.list[origin].protocol;
+    }
+
+    /// The UDP port to try HTTP/3 on for `origin`, or null: it has not advertised it (and the client does not
+    /// assume it), the advertisement has run out, or it failed lately.
+    fn http3Port(borrow this, origin: usize, urlPort: u16) -> u16? {
+        let guard = this.origins.read();
+        let all = guard.data();
+        let o = borrow all.list[origin];
+        let now = Timer.now();
+        if (now < o.h3BadUntil) {
+            return null;
+        }
+        if (o.h3Port != 0 && now < o.h3Until) {
+            return Some(o.h3Port);
+        }
+        return if (this.options.http3PriorKnowledge) Some(urlPort) else null;
+    }
+
+    /// HTTP/3 failed for `origin`: TCP for a while.
+    fn http3Failed(borrow this, origin: usize) {
+        var guard = this.origins.write();
+        let o = guard.data();
+        o.list[origin].h3BadUntil = Timer.now() + this.options.http3RetryMs;
+    }
+
+    /// Keeps what a response's `Alt-Svc` says about HTTP/3 on `origin`.
+    fn noteAltSvc(borrow this, origin: usize, response: borrow Response) {
+        if (this.http3 == null) {
+            return;
+        }
+        let said = match (response.header("alt-svc")) {
+            Some(value) => match (altSvcH3(value)) {
+                Some(a) => a,
+                null => { return; },
+            },
+            null => { return; },
+        };
+        var guard = this.origins.write();
+        let o = guard.data();
+        if (said.clear || said.maxAge == 0) {
+            o.list[origin].h3Port = 0;
+            return;
+        }
+        o.list[origin].h3Port = said.port;
+        o.list[origin].h3Until = Timer.now().saturatingAdd(said.maxAge.saturatingMul(1000));
     }
 
     fn learned(borrow this, origin: usize, protocol: u8) {
@@ -485,6 +567,9 @@ public struct Client {
             host: name,
             idle: Vector<Box<Connection>>.create(),
             protocol: 0,
+            h3Port: 0,
+            h3Until: 0,
+            h3BadUntil: 0,
             slots: slots,
             gate: gate,
         });
@@ -809,6 +894,7 @@ fn storedResponse<region c>(client: borrow(c) Client, entry: borrow CacheEntry) 
         origin: 0,
         permit: Permit { slot: null },
         viaH2: false,
+        viaH3: false,
         session: 0,
         slot: 0,
         generation: 0,
@@ -1125,6 +1211,87 @@ async fn roundTrip<region c>(
             Err(_) => { return Err(HttpErrors.noMemory()); }
         }
     }
+    // HTTP/3 first, for a buffered request to an origin that speaks it; any other way if that fails.
+    if (buffered && parts.secure) {
+        match (borrow client.http3) {
+            Some(transport) => {
+                match (client.http3Port(origin, parts.port)) {
+                    Some(port) => {
+                        var lines = Vector<u8>.create();
+                        var built = lines.extend(fields);
+                        if (built.isOk()) {
+                            built = lines.extend(cookieLine.view());
+                        }
+                        if (built.isOk() && coded) {
+                            built = lines.extend("Accept-Encoding: gzip, deflate\r\n".bytes());
+                        }
+                        match (built) {
+                            Ok() => {}
+                            Err(_) => { return Err(HttpErrors.noMemory()); }
+                        }
+                        var answer = Http3Answer.create();
+                        let went = await transport.fetch(
+                            method,
+                            url,
+                            parts,
+                            port,
+                            lines.view(),
+                            body,
+                            options.responseMs,
+                            options.maxBodyBytes,
+                            mut answer,
+                        );
+                        match (went) {
+                            Ok() => {
+                                let filled = answer.body.length;
+                                var response = Response {
+                                    client: client,
+                                    conn: null,
+                                    origin: origin,
+                                    permit: permit,
+                                    viaH2: false,
+                                    viaH3: true,
+                                    session: 0,
+                                    slot: 0,
+                                    generation: 0,
+                                    code: answer.status,
+                                    head: answer.head,
+                                    spans: answer.spans,
+                                    data: answer.body,
+                                    filled: filled,
+                                    streamed: false,
+                                    decoded: false,
+                                    cached: false,
+                                    trailers: answer.trailers,
+                                };
+                                {
+                                    var guard = client.counters.write();
+                                    let c = guard.data();
+                                    c.overHttp3 += 1;
+                                }
+                                client.noteAltSvc(origin, response);
+                                if (options.cookies) {
+                                    client.keepCookies(response, url, parts);
+                                }
+                                if (options.decompress) {
+                                    response.decode()?;
+                                }
+                                return Ok(response);
+                            }
+                            Err(f) => {
+                                client.http3Failed(origin);
+                                if (!f.unsent && !Methods.idempotent(method)) {
+                                    return Err(f.error);
+                                }
+                            }
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
     var attempts: u32 = 0;
     loop {
         attempts += 1;
@@ -1163,6 +1330,7 @@ async fn roundTrip<region c>(
                     origin: origin,
                     permit: permit,
                     viaH2: true,
+                    viaH3: false,
                     session: at.session,
                     slot: at.slot,
                     generation: 0,
@@ -1183,6 +1351,7 @@ async fn roundTrip<region c>(
                 response.trailers = taken.trailers;
                 match (done) {
                     Ok() => {
+                        client.noteAltSvc(origin, response);
                         if (options.cookies) {
                             client.keepCookies(response, url, parts);
                         }
@@ -1227,6 +1396,7 @@ async fn roundTrip<region c>(
                             origin: origin,
                             permit: permit,
                             viaH2: false,
+                            viaH3: false,
                             session: 0,
                             slot: 0,
                             generation: 0,
@@ -1240,6 +1410,7 @@ async fn roundTrip<region c>(
                             cached: false,
                             trailers: 0,
                         };
+                        client.noteAltSvc(origin, response);
                         if (options.cookies) {
                             client.keepCookies(response, url, parts);
                         }
@@ -1489,6 +1660,7 @@ public struct Response<region c> {
     private origin: usize;
     private permit: Permit;
     private viaH2: bool;
+    private viaH3: bool;
     private session: usize;
     private slot: usize;
     private generation: u64;
@@ -1514,6 +1686,9 @@ public struct Response<region c> {
 
     /// Whether the response came over HTTP/2.
     public fn isHttp2(borrow this) -> bool => this.viaH2;
+
+    /// Whether the response came over HTTP/3 (`Client.withHttp3`).
+    public fn isHttp3(borrow this) -> bool => this.viaH3;
 
     /// The whole body of a buffered response (`Client.get`, `Client.send`); empty for a streamed one.
     public fn body(borrow this) -> Slice<u8> {
@@ -2017,6 +2192,7 @@ async fn beginUpload<region c>(
             origin: origin,
             permit: permit,
             viaH2: viaH2,
+            viaH3: false,
             session: session,
             slot: slot,
             generation: generation,

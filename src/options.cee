@@ -46,6 +46,10 @@ public struct ClientOptions {
     public http2Streams: usize;
     /// Speak HTTP/2 to `http://` origins without asking (RFC 9113 §3.3). `https://` origins choose by ALPN.
     public http2PriorKnowledge: bool;
+    /// With `Client.withHttp3`: try HTTP/3 for every `https` origin, not only those that advertise it (`Alt-Svc`).
+    public http3PriorKnowledge: bool;
+    /// How long an origin's requests stay off HTTP/3 after it failed there, in milliseconds.
+    public http3RetryMs: u64;
 
     /// 10 s to connect and to handshake, no response timeout; 16 idle connections per origin for 60 s, no limit on
     /// requests in flight; 16 KiB buffers, kept up to 1 MiB; heads up to 64 KiB and 128 fields; buffered bodies up to
@@ -72,5 +76,7 @@ public struct ClientOptions {
         http2Connections: 4,
         http2Streams: 100,
         http2PriorKnowledge: false,
+        http3PriorKnowledge: false,
+        http3RetryMs: 300000,
     };
 }

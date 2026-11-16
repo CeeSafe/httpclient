@@ -5,6 +5,8 @@ HTTP/3 for [cosmohttp](..), as a package of its own so that the core client keep
 QUIC is `web_quic` (CeeSafe.Web): ngtcp2 with OpenSSL 3.5 or later, through a C shim. Everything above it is
 written here: HTTP/3's frames, QPACK, and the connection.
 
+With cosmohttp's `Client`, which then uses HTTP/3 where a server offers it:
+
 ```ceesafe
 import web_core;
 import web_tls;
@@ -12,7 +14,18 @@ import web_quic;
 import cosmohttp;
 import cosmohttp3;
 
-// once: QuicLibrary.initialise(); a TlsConfig.client() with trustSystem() and ALPN [Alpn.Http3]; QuicTls.of(config)
+// once: QuicLibrary.initialise()
+// `tcp`: a TlsConfig.client() with ALPN [Alpn.Http2, Alpn.Http11]; `udp`: another with ALPN [Alpn.Http3]
+let pool = Http3Pool.create(QuicTls.of(udp)?, H3Options.defaults(), 4)?;
+let transport: Box<dyn Http3Transport> = Box.create(pool)?;
+let client = Client.withHttp3(ClientOptions.defaults(), tcp, transport);
+let response = await client.get("https://example.com/")?;   // HTTP/2 first; HTTP/3 once `Alt-Svc` offers it
+response.isHttp3();
+```
+
+Or one connection by hand:
+
+```ceesafe
 let conn = await H3Connection.connect(tls, "example.com", 443, H3Options.defaults())?;
 let request = Request.create(Method.Get, "https://example.com/")?;   // cosmohttp's Request
 let response = await conn.send(request, "".bytes())?;                 // or conn.open(...) and response.read(...)
@@ -20,7 +33,7 @@ response.status(); response.header("content-type"); response.body();
 await conn.close();
 ```
 
-`examples/get3` fetches a URL: `get3 https://cloudflare-quic.com/ 3`.
+`examples/get3` fetches a URL a few times and prints how each request went: `get3 https://cloudflare-quic.com/ 4`.
 
 ## How it works
 
@@ -38,13 +51,18 @@ await conn.close();
   GOAWAY (no new requests; those not yet sent fail as not acted on), a stream the server resets (the request fails,
   the connection goes on), and a response dropped early (its stream is cancelled).
 
+- **The pool** holds a few connections, one to each server in use. A new connection's handshake has its own, short
+  time limit (`handshakeMs`), and a name's addresses are tried in turn, so a server that does not answer on UDP
+  costs a moment and the client goes back to TCP. A connection idle for longer than `idleMs` is not used again; a
+  new one is made in its place.
+
 ## What is not here yet
 
-One connection, made by hand: no pool, no `Alt-Svc` upgrade from cosmohttp's `Client`, no fallback to HTTP/2 when
-UDP is blocked, no retry of a request the server refused. No 0-RTT or session resumption, no connection migration,
-no server push (never allowed), no request bodies written piece by piece, no cookies, cache, redirects or
-decompression (those live in cosmohttp's `Client`). A name's first address is used, not raced. The request body is
-copied once into the stream's queue.
+Through the client, only buffered requests go over HTTP/3. No 0-RTT or session resumption, no connection
+migration, no keep-alive of idle connections, no server push (never allowed), no request bodies written piece by
+piece. A name's addresses are tried one after another, not raced. When every place in the pool is taken by servers
+with requests in flight, a request for another server goes over TCP. The request body is copied once into the
+stream's queue.
 
 ## Working on it
 

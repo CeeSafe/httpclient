@@ -202,6 +202,13 @@ not the same measurement.
   and simply ends over HTTP/2, where a write waits for the server's window. Nothing of the body is kept, so nothing
   is sent again: no redirect is followed and no retry made, and a pooled HTTP/1.1 connection the server had closed
   meanwhile is the caller's error. An upload dropped before `finish` closes its connection or resets its stream.
+- **HTTP/3**, through the [cosmohttp3](cosmohttp3) package (`Client.withHttp3(options, tls, transport)` with its
+  `Http3Pool`): this package has no QUIC in it, only the place where a transport plugs in (`Http3Transport`). A
+  buffered request to an `https` origin that advertised HTTP/3 (`Alt-Svc`) goes over it, or every one with
+  `http3PriorKnowledge`; `response.isHttp3()` says so. It sits below redirects, retries, the cache, cookies and
+  decompression, which work the same. If HTTP/3 fails for an origin, the request goes over TCP (unless the server
+  may have acted on it and it is not safe to repeat) and the origin stays on TCP for `http3RetryMs` (5 minutes).
+  Streamed responses, uploads and WebSockets stay on TCP.
 - **gRPC** (`grpcRequest(url)`, `grpcUnary(client, request, message)`, `grpcNext(response.body(), mut at)`,
   `grpcStatus(response)`, `grpcMessage(response, mut text)`; `GrpcReader` for a server that streams). Messages are
   bytes: encoding them is the caller's. Over HTTP/2 only; no compressed messages; no call where both sides stream at
@@ -246,8 +253,8 @@ not the same measurement.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 inside this client (it is a package of its own, [cosmohttp3](cosmohttp3), one
-connection at a time for now) and the `Alt-Svc` upgrade to it; telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
+Of CosmoHttpClient's surface: HTTP/3 for streamed responses and uploads (buffered requests have it, through
+[cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache. A name
 with several addresses is tried one address at a time, not raced. In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
@@ -257,7 +264,7 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 90 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 93 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
 python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib

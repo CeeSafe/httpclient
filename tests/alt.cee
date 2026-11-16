@@ -1,0 +1,184 @@
+// HTTP/3 as a transport given to the client: a stand-in here, since QUIC is another package's.
+import web_core;
+import web_transport;
+import web_tls;
+
+@test
+fn altSvcValues() -> Result<void, TestFailure> {
+    match (altSvcH3("h3=\":443\"; ma=86400".bytes())) {
+        Some(a) => { Check.isTrue(!a.clear && a.port == 443 && a.maxAge == 86400, "the usual form")?; }
+        null => { return Check.fail("h3 on 443"); }
+    }
+    match (altSvcH3("h3-29=\":443\"; ma=3600, h2=\"alt.example:443\", H3=\":8443\";persist=1; MA=60 , h3=\":9\"".bytes())) {
+        Some(a) => { Check.isTrue(a.port == 8443 && a.maxAge == 60, "the first h3 on the same host")?; }
+        null => { return Check.fail("h3 among others"); }
+    }
+    match (altSvcH3("h3=\":443\"".bytes())) {
+        Some(a) => { Check.isTrue(a.maxAge == 86400, "a day when it does not say")?; }
+        null => { return Check.fail("h3 without ma"); }
+    }
+    match (altSvcH3(" Clear ".bytes())) {
+        Some(a) => { Check.isTrue(a.clear, "clear")?; }
+        null => { return Check.fail("clear"); }
+    }
+    Check.isTrue(altSvcH3("h3=\"other.example:443\"".bytes()) == null, "another host")?;
+    Check.isTrue(altSvcH3("h2=\":443\", h3-29=\":443\"".bytes()) == null, "no h3")?;
+    Check.isTrue(altSvcH3("h3=\":0\", h3=\":70000\", h3=\":x\", h3=\":443".bytes()) == null, "ports that are none")?;
+    Check.isTrue(altSvcH3("".bytes()) == null, "nothing")?;
+    return Ok();
+}
+
+/// A stand-in for HTTP/3: it answers by the URL's path, and can fail its first call.
+struct FakeH3 {
+    calls: RefCell<u32>;
+    failFirst: bool;
+    /// The first failure is one the server may have acted on.
+    sent: bool;
+}
+
+fn field(answer: borrow mut Http3Answer, name: StringView, value: StringView) -> Result<void, AllocError> {
+    let nameStart = answer.head.length;
+    answer.head.extend(name.bytes())?;
+    let nameEnd = answer.head.length;
+    answer.head.extend(value.bytes())?;
+    return answer.spans.push(HeaderSpan { nameStart: nameStart, nameEnd: nameEnd, valueStart: nameEnd, valueEnd: answer.head.length });
+}
+
+fn fakeAnswer(path: Slice<u8>, port: u16, fields: Slice<u8>, answer: borrow mut Http3Answer) -> Result<void, AllocError> {
+    answer.status = 200;
+    field(mut answer, ":status", "200")?;
+    if (path == "/port".bytes()) {
+        field(mut answer, "alt-svc", "h3=\":8443\"; ma=60")?;
+        var text = String.create();
+        text.appendNumber(port as u64)?;
+        answer.body.extend(text.view().bytes())?;
+    } else if (path == "/clear".bytes()) {
+        field(mut answer, "alt-svc", "clear")?;
+        answer.body.extend("cleared".bytes())?;
+    } else if (path == "/zip".bytes()) {
+        field(mut answer, "content-encoding", "gzip")?;
+        field(mut answer, "set-cookie", "a=1")?;
+        answer.body.extend(embed("data/small.gz"))?;
+    } else {
+        answer.body.extend(fields)?;
+    }
+    return Ok();
+}
+
+impl Http3Transport for FakeH3 {
+    async fn fetch(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        maxBodyBytes: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, Http3Failure> {
+        var call: u32 = 0;
+        {
+            var guard = this.calls.write();
+            let n = guard.data();
+            *n += 1;
+            call = *n;
+        }
+        if (this.failFirst && call == 1) {
+            return Err(Http3Failure { error: HttpError.Net(NetError.TimedOut), unsent: !this.sent });
+        }
+        return match (fakeAnswer(parts.target(url), port, fields, mut answer)) {
+            Ok() => Ok(),
+            Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
+        };
+    }
+}
+
+fn withFake(options: ClientOptions, failFirst: bool, sent: bool) -> Result<Client, TestFailure> {
+    let tls = match (TlsConfig.client()) {
+        Ok(t) => t,
+        Err(_) => { return Err(TestFailure.create("the TLS configuration")); },
+    };
+    let fake: Box<dyn Http3Transport> =
+        made(Box.create(FakeH3 { calls: RefCell<u32>.create(0), failFirst: failFirst, sent: sent }))?;
+    return Ok(Client.withHttp3(options, tls, fake));
+}
+
+async fn over3(client: borrow Client, url: StringView, body: StringView) -> Result<void, TestFailure> {
+    let response = match (await client.get(url)) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue(response.isHttp3() && !response.isHttp2(), "over HTTP/3")?;
+    Check.equalU64(200, response.status() as u64)?;
+    return Check.equalBytes(body.bytes(), response.body());
+}
+
+@test
+async fn requestsGoOverTheGivenTransport() -> Result<void, TestFailure> {
+    var options = ClientOptions.defaults();
+    options.http3PriorKnowledge = true;
+    options.cookies = true;
+    options.decompress = true;
+    let client = withFake(options, false, false)?;
+    // Without an advertisement the URL's own port is tried; then what `Alt-Svc` says, until it is cleared.
+    await over3(client, "https://example.com:444/port", "444")?;
+    await over3(client, "https://example.com:444/port", "8443")?;
+    await over3(client, "https://example.com:444/clear", "cleared")?;
+    await over3(client, "https://example.com:444/port", "444")?;
+    // What the client does above the transport is the same: decompression, and cookies both ways.
+    {
+        let response = match (await client.get("https://example.com:444/zip")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.wasDecoded() && response.isHttp3(), "decoded")?;
+        Check.equalBytes(embed("data/small.raw"), response.body())?;
+        Check.equalU64(2, response.headerCount() as u64)?;
+    }
+    await over3(client, "https://example.com:444/fields", "Cookie: a=1\r\nAccept-Encoding: gzip, deflate\r\n")?;
+    let stats = client.stats();
+    Check.equalU64(6, stats.overHttp3)?;
+    Check.equalU64(0, stats.connections)?;
+    // Only https, and only buffered responses: an http URL goes to a connection (here there is none to dial).
+    let copies = made(Channel<u8>.create(4096))?;
+    script(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 0, copies)?;
+    let response = match (await client.get("http://example.com/plain")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue(!response.isHttp3(), "http is not for HTTP/3")?;
+    return Ok();
+}
+
+@test
+async fn aFailedTransportIsLeftAloneForAWhile() -> Result<void, TestFailure> {
+    // The first call fails without the request having left: it goes to TCP (which a test may not dial, so it
+    // fails there), and so does the next, although the transport would now answer.
+    var options = ClientOptions.defaults();
+    options.http3PriorKnowledge = true;
+    let client = withFake(options, true, false)?;
+    let copies = made(Channel<u8>.create(4096))?;
+    script(client, "", 0, copies)?; // makes the client refuse to dial once this is used up
+    Check.isTrue((await client.get("https://example.com/port")).isErr(), "HTTP/3 failed, and TCP is not there")?;
+    Check.isTrue((await client.get("https://example.com/port")).isErr(), "not tried again so soon")?;
+    Check.equalU64(0, client.stats().overHttp3)?;
+    // With no waiting time, the second request is tried over HTTP/3 again.
+    options.http3RetryMs = 0;
+    let eager = withFake(options, true, false)?;
+    script(eager, "", 0, copies)?;
+    Check.isTrue((await eager.get("https://example.com/port")).isErr(), "the first fails")?;
+    await over3(eager, "https://example.com/port", "443")?;
+    // A POST the server may have seen is not sent another way.
+    let unsure = withFake(options, true, true)?;
+    let post = match (Request.create(Method.Post, "https://example.com/port")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (await unsure.send(post, "x".bytes())) {
+        Ok(_) => { return Check.fail("the failure is the answer"); }
+        Err(e) => { Check.equalBytes(HttpErrors.describe(HttpError.Net(NetError.TimedOut)).bytes(), HttpErrors.describe(e).bytes())?; }
+    }
+    return Ok();
+}

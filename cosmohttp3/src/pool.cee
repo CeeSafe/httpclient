@@ -1,0 +1,187 @@
+// HTTP/3 for cosmohttp's `Client`: a few connections, one for each server the client talks to, behind the
+// `Http3Transport` the client calls (`Client.withHttp3`).
+import web_core;
+import web_tls;
+import web_quic;
+import cosmohttp;
+
+/// What a connection's place in the pool is used for.
+struct Seat {
+    /// The server: `host:port`.
+    key: Vector<u8>;
+    /// When a request last went to it (`Timer.now`).
+    usedAt: u64;
+}
+
+/// HTTP/3 connections for a client. Each place holds one connection at a time, to one server; when all are taken
+/// by servers still in use, a request for another server does not go over HTTP/3.
+public struct Http3Pool {
+    private tls: QuicTls;
+    private options: H3Options;
+    private conns: Vector<H3Connection>;
+    private seats: RefCell<Vector<Seat>>;
+
+    /// A pool of up to `connections` connections that verify servers with `tls` (a client's, with ALPN `h3`).
+    /// `QuicLibrary.initialise()` must have been called.
+    public fn create(tls: QuicTls, options: H3Options, connections: usize) -> Result<Http3Pool, HttpError> {
+        let count = if (connections == 0) 1 else connections;
+        var conns = noRoom(Vector<H3Connection>.withCapacity(count))?;
+        var seats = noRoom(Vector<Seat>.withCapacity(count))?;
+        for (i in 0..count) {
+            noRoom(conns.push(H3Connection.vacant(options)?))?;
+            noRoom(seats.push(Seat { key: Vector<u8>.create(), usedAt: 0 }))?;
+        }
+        return Ok(Http3Pool { tls: tls, options: options, conns: conns, seats: RefCell<Vector<Seat>>.create(seats) });
+    }
+
+    /// How many connections are open and usable.
+    public fn openConnections(borrow this) -> usize {
+        var n: usize = 0;
+        for (i in 0..this.conns.length) {
+            if (this.conns[i].isUsable()) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// The place of a usable connection to `key`, marked as used now; null if there is none. A connection that
+    /// has been idle too long is not one: the server has likely forgotten it.
+    fn pick(borrow this, key: Slice<u8>) -> usize? {
+        var guard = this.seats.write();
+        let seats = guard.data();
+        let now = Timer.now();
+        for (i in 0..seats.length) {
+            if (seats[i].key.view() != key || !this.conns[i].isUsable()) {
+                continue;
+            }
+            if (this.conns[i].inFlight() == 0 && now - seats[i].usedAt > this.options.idleMs) {
+                continue;
+            }
+            seats[i].usedAt = now;
+            return Some(i);
+        }
+        return null;
+    }
+
+    /// Starts a connection to `key` at `address` in a free place: one whose connection is gone, else the one
+    /// used longest ago.
+    fn claim(borrow this, key: Slice<u8>, host: StringView, address: SocketAddress) -> Result<usize, HttpError> {
+        var guard = this.seats.write();
+        let seats = guard.data();
+        var best: usize? = null;
+        var bestGone = false;
+        for (i in 0..seats.length) {
+            if (!this.conns[i].isFree()) {
+                continue;
+            }
+            let gone = !this.conns[i].isUsable();
+            let better = match (best) {
+                Some(b) => (gone && !bestGone) || (gone == bestGone && seats[i].usedAt < seats[b].usedAt),
+                null => true,
+            };
+            if (better) {
+                best = Some(i);
+                bestGone = gone;
+            }
+        }
+        let index = match (best) {
+            Some(b) => b,
+            null => { return Err(HttpError.Net(NetError.LimitExceeded)); },
+        };
+        this.conns[index].start(this.tls, host, address)?;
+        seats[index].key.clear();
+        noRoom(seats[index].key.extend(key))?;
+        seats[index].usedAt = Timer.now();
+        return Ok(index);
+    }
+}
+
+fn unsent(e: HttpError) -> Http3Failure => Http3Failure { error: e, unsent: true };
+
+impl Http3Transport for Http3Pool {
+    async fn fetch(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        maxBodyBytes: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, Http3Failure> {
+        let host = match (StringView.fromUtf8(parts.host(url))) {
+            Some(h) => h,
+            null => { return Err(unsent(HttpError.BadUrl)); },
+        };
+        var key = Vector<u8>.create();
+        var keyed = key.extend(host.bytes());
+        if (keyed.isOk()) {
+            keyed = key.push(':');
+        }
+        if (keyed.isOk()) {
+            keyed = key.push(truncate<u8>(port >> 8));
+        }
+        if (keyed.isOk()) {
+            keyed = key.push(truncate<u8>(port));
+        }
+        if (keyed.isErr()) {
+            return Err(unsent(HttpErrors.noMemory()));
+        }
+        var index = this.pick(key.view());
+        if (index == null) {
+            var addresses = Vector<SocketAddress>.create();
+            match (SocketAddresses.parseIp(host, port)) {
+                Some(a) => {
+                    if (addresses.push(a).isErr()) {
+                        return Err(unsent(HttpErrors.noMemory()));
+                    }
+                }
+                null => {
+                    match (await AsyncDns.resolve(host, port)) {
+                        Ok(found) => { addresses = found; }
+                        Err(e) => { return Err(unsent(HttpError.Net(NetErrors.fromAsync(e)))); }
+                    }
+                }
+            }
+            // Another request may have made the connection while the name was looked up.
+            index = this.pick(key.view());
+            var failure = HttpError.NoAddress;
+            var tried: usize = 0;
+            while (index == null && tried < addresses.length) {
+                let to = addresses[tried];
+                tried += 1;
+                let made = match (this.claim(key.view(), host, to)) {
+                    Ok(k) => k,
+                    Err(e) => { return Err(unsent(e)); },
+                };
+                // A server that does not answer on UDP at this address is found out here, in `handshakeMs`, not
+                // in `responseMs`; then the name's next address is tried.
+                let limit = this.options.handshakeMs;
+                let shaken = if (limit == 0) await this.conns[made].ready() else await Async.timeout(
+                    limit,
+                    HttpError.Net(NetError.TimedOut),
+                    async () => await this.conns[made].ready(),
+                );
+                match (shaken) {
+                    Ok() => { index = Some(made); }
+                    Err(e) => {
+                        this.conns[made].abandon();
+                        failure = e;
+                        match (e) {
+                            HttpError.Net(NetError.Cancelled) => { return Err(unsent(e)); }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if (index == null) {
+                return Err(unsent(failure));
+            }
+        }
+        let i = index!;
+        return await this.conns[i].fetch(method, url, parts, fields, body, responseMs, maxBodyBytes, mut answer);
+    }
+}

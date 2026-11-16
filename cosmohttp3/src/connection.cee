@@ -32,6 +32,9 @@ const NO_STREAM: i64 = -1;
 const WANT_HEAD: u8 = 1;
 const WANT_END: u8 = 2;
 const WANT_DATA: u8 = 3;
+/// The handshake is done and our control stream is open; it names no stream.
+const WANT_READY: u8 = 4;
+const NO_SLOT: usize = 0xFFFFFFFF;
 
 /// The limits of an HTTP/3 connection.
 public struct H3Options {
@@ -45,10 +48,23 @@ public struct H3Options {
     public maxHeaders: usize;
     /// The largest body `send` buffers.
     public maxBodyBytes: u64;
+    /// In an `Http3Pool`: how long a new connection's handshake may take, and how long a connection may have had
+    /// nothing in flight and still be used (the server forgets an idle connection, and nothing here keeps one
+    /// awake).
+    public handshakeMs: u64;
+    public idleMs: u64;
 
-    /// 30 s for a response, 100 requests at once, heads up to 64 KiB and 128 fields, bodies up to 256 MiB.
-    public fn defaults() -> H3Options =>
-        H3Options { responseMs: 30000, streams: 100, maxHeadBytes: 65536, maxHeaders: 128, maxBodyBytes: 268435456 };
+    /// 30 s for a response, 100 requests at once, heads up to 64 KiB and 128 fields, bodies up to 256 MiB; in a
+    /// pool, 5 s for a handshake and 15 s of idleness.
+    public fn defaults() -> H3Options => H3Options {
+        responseMs: 30000,
+        streams: 100,
+        maxHeadBytes: 65536,
+        maxHeaders: 128,
+        maxBodyBytes: 268435456,
+        handshakeMs: 5000,
+        idleMs: 15000,
+    };
 }
 
 /// A request's place on the connection.
@@ -215,6 +231,57 @@ public struct H3Connection {
         address: SocketAddress,
         options: H3Options,
     ) -> Result<H3Connection, HttpError> {
+        let conn = H3Connection.vacant(options)?;
+        conn.start(tls, host, address)?;
+        return Ok(conn);
+    }
+
+    /// A connection's place without a connection in it: `start` gives it one, and another later.
+    fn vacant(options: H3Options) -> Result<H3Connection, HttpError> {
+        let slots = if (options.streams == 0) 1 else options.streams;
+        var streams = noRoom(Vector<H3Stream>.withCapacity(slots))?;
+        var signals = noRoom(Vector<AsyncSignal>.withCapacity(slots))?;
+        var free = noRoom(Vector<usize>.withCapacity(slots))?;
+        for (i in 0..slots) {
+            noRoom(streams.push(H3Stream.empty()))?;
+            noRoom(signals.push(AsyncSignal.create()))?;
+            noRoom(free.push(slots - 1 - i))?;
+        }
+        let state = H3State {
+            streams: streams,
+            free: free,
+            cancels: Vector<i64>.create(),
+            unis: Vector<H3Uni>.create(),
+            leading: false,
+            opened: false,
+            settled: false,
+            broken: true,
+            failure: HttpError.Closed,
+            draining: false,
+            held: 0,
+        };
+        return Ok(H3Connection {
+            io: RefCell<H3Io?>.create(null),
+            state: RefCell<H3State>.create(state),
+            signals: signals,
+            outSignal: AsyncSignal.create(),
+            options: options,
+        });
+    }
+
+    /// Whether nothing refers to the connection in this place: no request is in flight and no task leads, so
+    /// `start` may put another connection here.
+    fn isFree(borrow this) -> bool {
+        let guard = this.state.read();
+        let st = guard.data();
+        return st.held == 0 && !st.leading;
+    }
+
+    /// Puts a new connection in this place, which must be free: the one before is dropped.
+    fn start(borrow this, tls: borrow QuicTls, host: StringView, address: SocketAddress) -> Result<void, HttpError> {
+        if (!this.isFree()) {
+            return Err(HttpError.Net(NetError.LimitExceeded));
+        }
         let any = match (address) {
             SocketAddress.V4(_, _) => SocketAddress.V4([0u8, 0, 0, 0], 0),
             SocketAddress.V6(_, _, _) => SocketAddress.V6([0u8; 16], 0, 0),
@@ -244,42 +311,117 @@ public struct H3Connection {
         };
         // The server gets room back as responses are read, not as their bytes arrive.
         conn.creditOnConsume();
-        let slots = if (options.streams == 0) 1 else options.streams;
-        var streams = noRoom(Vector<H3Stream>.withCapacity(slots))?;
-        var signals = noRoom(Vector<AsyncSignal>.withCapacity(slots))?;
-        var free = noRoom(Vector<usize>.withCapacity(slots))?;
-        for (i in 0..slots) {
-            noRoom(streams.push(H3Stream.empty()))?;
-            noRoom(signals.push(AsyncSignal.create()))?;
-            noRoom(free.push(slots - 1 - i))?;
-        }
         var inbuf = Vector<u8>.create();
         var events = Vector<u8>.create();
         var out = Vector<u8>.create();
         noRoom(inbuf.resize(65536, 0))?;
         noRoom(events.resize(quicEventBufferSize(), 0))?;
         noRoom(out.resize(quicDatagramSize(), 0))?;
-        let state = H3State {
-            streams: streams,
-            free: free,
-            cancels: Vector<i64>.create(),
-            unis: Vector<H3Uni>.create(),
-            leading: false,
-            opened: false,
-            settled: false,
-            broken: false,
-            failure: HttpError.Closed,
-            draining: false,
-            held: 0,
+        var guard = this.state.write();
+        let st = guard.data();
+        st.free.clear();
+        let slots = st.streams.length;
+        for (i in 0..slots) {
+            st.streams[i].used = false;
+            st.streams[i].id = NO_STREAM;
+            st.streams[i].waiting = false;
+            noRoom(st.free.push(slots - 1 - i))?;
+        }
+        st.cancels.clear();
+        st.unis.clear();
+        st.opened = false;
+        st.settled = false;
+        st.broken = false;
+        st.draining = false;
+        st.held = 0;
+        let before = this.io.replace(
+            Some(H3Io { socket: socket, conn: conn, peer: address, inbuf: inbuf, events: events, out: out }),
+        );
+        return Ok();
+    }
+
+    /// Does the handshake, if it is not done: for a caller that wants to know a new connection works before it
+    /// sends a request on it.
+    async fn ready(borrow this) -> Result<void, HttpError> {
+        {
+            var guard = this.state.write();
+            let st = guard.data();
+            if (st.broken) {
+                return Err(st.failure);
+            }
+            if (st.opened || st.leading) {
+                return Ok(); // done, or a request is already driving it
+            }
+            st.leading = true;
+        }
+        let led = await this.lead(NO_SLOT, WANT_READY);
+        this.handOver();
+        return led;
+    }
+
+    /// The leader has stopped: the first task found waiting leads now.
+    fn handOver(borrow this) {
+        var guard = this.state.write();
+        let st = guard.data();
+        st.leading = false;
+        for (i in 0..st.streams.length) {
+            if (st.streams[i].waiting) {
+                st.streams[i].waiting = false;
+                this.signals[i].raise();
+                break;
+            }
+        }
+    }
+
+    /// Gives the connection up: its requests fail as not acted on if they had not left.
+    fn abandon(borrow this) {
+        var guard = this.state.write();
+        let st = guard.data();
+        if (!st.broken) {
+            this.failAll(st, HttpError.Net(NetError.TimedOut));
+        }
+    }
+
+    /// One request and its whole response into `answer`, for a client that speaks HTTP/3 through a pool
+    /// (cosmohttp's `Http3Transport`).
+    async fn fetch(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        maxBodyBytes: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, Http3Failure> {
+        let slot = match (this.reserve(method, url, parts, fields, body, true, maxBodyBytes)) {
+            Ok(s) => s,
+            Err(e) => { return Err(Http3Failure { error: e, unsent: true }); },
         };
-        let io = H3Io { socket: socket, conn: conn, peer: address, inbuf: inbuf, events: events, out: out };
-        return Ok(H3Connection {
-            io: RefCell<H3Io?>.create(Some(io)),
-            state: RefCell<H3State>.create(state),
-            signals: signals,
-            outSignal: AsyncSignal.create(),
-            options: options,
-        });
+        let done = if (responseMs == 0) await this.progress(slot, WANT_END) else await Async.timeout(
+            responseMs,
+            HttpError.Net(NetError.TimedOut),
+            async () => await this.progress(slot, WANT_END),
+        );
+        var failure: Http3Failure? = null;
+        match (done) {
+            Ok() => {
+                let taken = this.take(slot, mut answer.head, mut answer.spans, mut answer.body);
+                answer.status = taken.status;
+                answer.trailers = taken.trailers;
+            }
+            Err(e) => { failure = Some(Http3Failure { error: e, unsent: this.wasRefused(slot) }); }
+        }
+        // The slot goes back; the answer keeps the buffers it took.
+        var head = Vector<u8>.create();
+        var spans = Vector<HeaderSpan>.create();
+        var data = Vector<u8>.create();
+        this.release(slot, mut head, mut spans, mut data);
+        return match (failure) {
+            Some(f) => Err(f),
+            null => Ok(),
+        };
     }
 
     /// As `connectTo`, for the server named `host` (a name, or an IP address) at `port`: the first address the name
@@ -359,6 +501,7 @@ public struct H3Connection {
         fields: Slice<u8>,
         body: Slice<u8>,
         buffered: bool,
+        maxBodyBytes: u64,
     ) -> Result<usize, HttpError> {
         var guard = this.state.write();
         let st = guard.data();
@@ -414,7 +557,7 @@ public struct H3Connection {
         s.hasDeclared = false;
         s.declared = 0;
         s.received = 0;
-        s.maxBody = this.options.maxBodyBytes;
+        s.maxBody = maxBodyBytes;
         s.hasTrailers = false;
         s.trailersAt = 0;
         s.credit = 0;
@@ -429,6 +572,12 @@ public struct H3Connection {
 
     /// Whether the stream in `slot` has what `want` names. A failed stream's failure is the error.
     fn satisfied(borrow this, st: borrow H3State, slot: usize, want: u8) -> Result<bool, HttpError> {
+        if (want == WANT_READY) {
+            if (st.broken) {
+                return Err(st.failure);
+            }
+            return Ok(st.opened);
+        }
         let s = borrow st.streams[slot];
         if (s.failed) {
             return Err(s.failure);
@@ -462,19 +611,7 @@ public struct H3Connection {
             }
             if (lead) {
                 let led = await this.lead(slot, want);
-                {
-                    var guard = this.state.write();
-                    let st = guard.data();
-                    st.leading = false;
-                    // Someone else leads now: the first task found waiting.
-                    for (i in 0..st.streams.length) {
-                        if (st.streams[i].waiting) {
-                            st.streams[i].waiting = false;
-                            this.signals[i].raise();
-                            break;
-                        }
-                    }
-                }
+                this.handOver();
                 led?;
             } else {
                 match (await this.signals[slot].wait()) {
@@ -1344,7 +1481,7 @@ async fn exchange<region c>(
     body: Slice<u8>,
     buffered: bool,
 ) -> Result<H3Response<c>, HttpError> {
-    let slot = conn.reserve(method, url, parts, fields, body, buffered)?;
+    let slot = conn.reserve(method, url, parts, fields, body, buffered, conn.options.maxBodyBytes)?;
     var response = H3Response {
         conn: conn,
         slot: slot,

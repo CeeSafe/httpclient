@@ -1,4 +1,4 @@
-# cosmohttp
+# httpclient
 
 An HTTP/1.1 and HTTP/2 client for [CeeSafe](https://ceesafe.github.io/CeeSafe/), written for speed: a request is one
 write, the response is parsed in buffers that are reused, and a request on a warm connection allocates nothing.
@@ -11,7 +11,7 @@ retries, gzip and deflate, cookies, a response cache, WebSockets, streamed reque
 ```ceesafe
 import web_core;
 import web_tls;
-import cosmohttp;
+import httpclient;
 
 async fn fetch(http: borrow Client) -> Result<void, HttpError> {
     let response = await http.get("https://example.com/")?;
@@ -42,7 +42,7 @@ For JSON, [CeeSafeLibs](../../CeeSafeLibs)' `json` reads the body where it is:
 CeeSafe.Web's `web_client` is the general client: `Send + Share`, HTTP/2, WebSockets, Happy Eyeballs, a retry
 budget, trailers. This one does less and does it with less work for each request.
 
-| | web_client | cosmohttp |
+| | web_client | httpclient |
 |---|---|---|
 | Threads | one client shared by all (`AsyncMutex`) | one client for each thread (`RefCell`, no lock) |
 | Buffers | allocated for each request | owned by the connection, reused |
@@ -167,7 +167,7 @@ The same two runs on an Intel Xeon E3-1270 v6 (4 cores, 8 threads), Ubuntu 24.04
 2026-11-17, with nothing else running; the best of 3 runs. Requests a second, and the client's CPU time and
 allocations for a request:
 
-| route, connections or streams | cosmohttp | web_client | CPU µs: cosmohttp, web_client | allocations: cosmohttp, web_client |
+| route, connections or streams | httpclient | web_client | CPU µs: httpclient, web_client | allocations: httpclient, web_client |
 |---|---:|---:|---:|---:|
 | HTTP/1.1, 1 KiB, 1 | 50,556 | 38,955 | 11.7, 18.8 | 0, 10 |
 | HTTP/1.1, 1 KiB, 16 | 130,378 | 73,909 | 7.7, 13.6 | 0, 10 |
@@ -234,7 +234,7 @@ not the same measurement.
 - **A name with several addresses** is not tried one address at a time: the first gets a head start (`raceMs`,
   250 ms), then the first address of the other family (IPv4 or IPv6) is tried beside it, and whichever connects
   first is used. A first address that fails outright ends its head start at once.
-- **HTTP/3**, through the [cosmohttp3](cosmohttp3) package (`Client.withHttp3(options, tls, transport)` with its
+- **HTTP/3**, through the [httpclient3](httpclient3) package (`Client.withHttp3(options, tls, transport)` with its
   `Http3Pool`): this package has no QUIC in it, only the place where a transport plugs in (`Http3Transport`). A
   request to an `https` origin that advertised HTTP/3 (`Alt-Svc`) goes over it, or every one with
   `http3PriorKnowledge`; `response.isHttp3()` says so. It sits below redirects, retries, the cache, cookies and
@@ -288,7 +288,7 @@ not the same measurement.
 ## What is not here yet
 
 Of CosmoHttpClient's surface: HTTP/3 for uploads (requests with a body in hand and their responses, buffered or
-streamed, have it, through [cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
+streamed, have it, through [httpclient3](httpclient3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; a proxy reached over TLS, and a different proxy for each scheme; TLS session resumption; a DNS cache.  In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
 in flight with `maxPerOrigin`).

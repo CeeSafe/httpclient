@@ -5,7 +5,7 @@
 // With a count, the request is sent that many times over one client, so later ones reuse the pooled connection.
 import web_core;
 import web_tls;
-import cosmohttp;
+import httpclient;
 
 /// A client that verifies https servers against the system's roots, offers HTTP/2 and HTTP/1.1 (only HTTP/1.1 with
 /// GET_HTTP1 set), and asks for compressed responses (not with GET_PLAIN set).

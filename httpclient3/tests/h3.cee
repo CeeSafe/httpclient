@@ -3,7 +3,7 @@
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
+import httpclient;
 
 fn failed(e: HttpError) -> TestFailure => TestFailure.create(HttpErrors.describe(e));
 
@@ -292,7 +292,7 @@ async fn scenarios(tls: borrow QuicTls, server: SocketAddress) -> Result<void, T
     // A body up and back, the request's fields, a query without a path's rest.
     {
         var request = asking(Method.Post, "https://localhost:4433/echo?x=1")?;
-        match (request.header("User-Agent", "cosmohttp3-test")) {
+        match (request.header("User-Agent", "httpclient3-test")) {
             Ok() => {}
             Err(e) => { return Err(failed(e)); }
         }
@@ -315,7 +315,7 @@ async fn scenarios(tls: borrow QuicTls, server: SocketAddress) -> Result<void, T
         Check.equalU64(200, response.status() as u64)?;
         Check.equalBytes(upload.view(), response.body())?;
         Check.equalBytes("POST".bytes(), response.header("x-method") ?? "".bytes())?;
-        Check.equalBytes("cosmohttp3-test".bytes(), response.header("x-agent") ?? "".bytes())?;
+        Check.equalBytes("httpclient3-test".bytes(), response.header("x-agent") ?? "".bytes())?;
         Check.equalBytes("localhost:4433".bytes(), response.header("x-authority") ?? "".bytes())?;
     }
     await getOne(conn, "https://localhost/split", 200, "abcd")?;

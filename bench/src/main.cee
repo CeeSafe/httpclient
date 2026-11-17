@@ -1,8 +1,8 @@
 // The request-rate benchmark: this client and CeeSafe.Web's web_client against the same loopback server.
 //
 //   bench server <port>                         a keep-alive HTTP/1.1 server: /1k, /64k, /chunked, /empty
-//   bench cosmo <url> <requests> <concurrency>  cosmohttp, buffered responses
-//   bench stream <url> <requests> <concurrency> cosmohttp, streamed responses read through a 16 KiB buffer
+//   bench cosmo <url> <requests> <concurrency>  httpclient, buffered responses
+//   bench stream <url> <requests> <concurrency> httpclient, streamed responses read through a 16 KiB buffer
 //   bench web <url> <requests> <concurrency>    web_client, readToEnd and finish
 //   bench cosmo2 | stream2 | web2 ...           the same three over HTTP/2 by prior knowledge (h2c), against a
 //                                               server that speaks it (CeeSafe.Web's benchmarks/http)
@@ -13,7 +13,7 @@ import web_core;
 import web_transport;
 import web_http;
 import web_client;
-import cosmohttp;
+import httpclient;
 
 enum BenchError {
     Failed,
@@ -141,8 +141,8 @@ async fn server(port: u16) -> Result<void, BenchError> {
 }
 
 async fn cosmoWorker(
-    client: borrow cosmohttp.Client,
-    request: borrow cosmohttp.Request,
+    client: borrow httpclient.Client,
+    request: borrow httpclient.Request,
     count: u64,
     bytes: borrow Cell<u64>,
 ) -> Result<void, BenchError> {
@@ -165,8 +165,8 @@ async fn cosmoWorker(
 }
 
 async fn streamWorker(
-    client: borrow cosmohttp.Client,
-    request: borrow cosmohttp.Request,
+    client: borrow httpclient.Client,
+    request: borrow httpclient.Request,
     count: u64,
     bytes: borrow Cell<u64>,
 ) -> Result<void, BenchError> {
@@ -310,11 +310,11 @@ async fn client(mode: StringView, url: StringView, requests: u64, concurrency: u
         })?;
         return await report(mode, each * concurrency, concurrency, Timer.now() - started, bytes.get());
     }
-    var options = cosmohttp.ClientOptions.defaults();
+    var options = httpclient.ClientOptions.defaults();
     options.maxIdlePerOrigin = truncate<usize>(concurrency);
     options.http2PriorKnowledge = mode == "cosmo2" || mode == "stream2";
-    let cosmo = cosmohttp.Client.create(options);
-    let request = match (cosmohttp.Request.create(cosmohttp.Method.Get, url)) {
+    let cosmo = httpclient.Client.create(options);
+    let request = match (httpclient.Request.create(httpclient.Method.Get, url)) {
         Ok(r) => r,
         Err(_) => { return Err(BenchError.Failed); },
     };

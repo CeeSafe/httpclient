@@ -1,4 +1,4 @@
-// HTTP/3 as a transport the client may be given. This package has no QUIC in it: the cosmohttp3 package implements
+// HTTP/3 as a transport the client may be given. This package has no QUIC in it: the httpclient3 package implements
 // `Http3Transport`, and a client made with `Client.withHttp3` uses it for buffered requests to `https` origins that
 // have said they speak HTTP/3 (`Alt-Svc`, RFC 7838), below everything else the client does: redirects, retries, the
 // cache, cookies and decompression are the same whichever way a request goes.

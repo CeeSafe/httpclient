@@ -1,7 +1,11 @@
 # Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
 
 [[package]]
-name = "cosmohttp"
+name = "encoding"
+source = "path+../../../../CeeSafeLibs/encoding"
+
+[[package]]
+name = "httpclient"
 source = "path+../.."
 
 [[package]]

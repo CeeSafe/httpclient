@@ -19,7 +19,7 @@ public struct Request {
     private packed: Vector<u8>;
 
     /// The URL's parts, and the request's fields as lines (`name: value\r\n` each): what another transport
-    /// (cosmohttp3) needs to send it.
+    /// (httpclient3) needs to send it.
     public fn urlParts(borrow this) -> UrlParts => this.parts;
 
     public fn fieldLines(borrow this) -> Slice<u8> => this.fields.view();
@@ -205,7 +205,7 @@ public struct Client {
         proxy: null,
     };
 
-    /// A client as `withTls` makes, which also speaks HTTP/3 through `transport` (cosmohttp3's `Http3Pool`): for
+    /// A client as `withTls` makes, which also speaks HTTP/3 through `transport` (httpclient3's `Http3Pool`): for
     /// buffered requests (`get`, `send`) to `https` origins that advertise it with `Alt-Svc`, or to all of them with
     /// `ClientOptions.http3PriorKnowledge`. When HTTP/3 fails for an origin, its requests go over TCP again for
     /// `http3RetryMs`.

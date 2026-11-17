@@ -1,4 +1,4 @@
-// GET a URL with cosmohttp's Client, which speaks HTTP/3 through this package's pool, and print how each request
+// GET a URL with httpclient's Client, which speaks HTTP/3 through this package's pool, and print how each request
 // went:
 //
 //   get3 https://example.com/ [count]
@@ -8,8 +8,8 @@
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
-import cosmohttp3;
+import httpclient;
+import httpclient3;
 
 async fn fetch(http: borrow Client, url: StringView, count: u64) -> Result<void, AsyncError> {
     for (k in 0..count) {

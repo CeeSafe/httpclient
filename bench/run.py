@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The request-rate benchmark: cosmohttp against CeeSafe.Web's web_client, over loopback.
+"""The request-rate benchmark: httpclient against CeeSafe.Web's web_client, over loopback.
 
 usage: python3 bench/run.py [--requests 100000] [--runs 3] [--routes 1k,64k,chunked] [--conc 1,16,64]
                             [--modes cosmo,stream,web] [--port 18290] [--json out.json]

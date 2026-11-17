@@ -1,12 +1,12 @@
 # Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
 
 [[package]]
-name = "cosmohttp"
-source = "path+.."
-
-[[package]]
 name = "encoding"
 source = "path+../../../CeeSafeLibs/encoding"
+
+[[package]]
+name = "httpclient"
+source = "path+.."
 
 [[package]]
 name = "ngtcp2"

@@ -1,5 +1,5 @@
 [package]
-name = "cosmohttp"
+name = "httpclient"
 version = "0.1.0"
 kind = "library"
 sources = ["src"]

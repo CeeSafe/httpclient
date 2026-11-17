@@ -1,6 +1,6 @@
 // One HTTP/3 connection (RFC 9114) over QUIC (web_quic: ngtcp2).
 //
-// There is no connection task. As in cosmohttp's HTTP/2 session, the task that waits for a response does the
+// There is no connection task. As in httpclient's HTTP/2 session, the task that waits for a response does the
 // connection's work (the "leader"): it turns what requests have queued into stream writes, sends the datagrams QUIC
 // has, receives datagrams, runs QUIC's timers and hands what arrived to the streams. Other tasks sleep on their
 // stream's signal until the leader wakes them, and one of them leads when the leader has what it came for. So a
@@ -12,7 +12,7 @@
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
+import httpclient;
 
 const FRAME_DATA: u64 = 0;
 const FRAME_HEADERS: u64 = 1;
@@ -427,7 +427,7 @@ public struct H3Connection {
     }
 
     /// One request and its whole response into `answer`, for a client that speaks HTTP/3 through a pool
-    /// (cosmohttp's `Http3Transport`).
+    /// (httpclient's `Http3Transport`).
     async fn fetch(
         borrow this,
         method: Method,

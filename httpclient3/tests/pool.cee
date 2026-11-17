@@ -1,8 +1,8 @@
-// cosmohttp's Client speaking HTTP/3 through the pool, against the server of h3.cee.
+// httpclient's Client speaking HTTP/3 through the pool, against the server of h3.cee.
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
+import httpclient;
 
 fn urlFor(port: u16, path: StringView) -> Result<String, TestFailure> {
     var url = String.create();

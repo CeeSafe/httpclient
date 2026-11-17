@@ -1,5 +1,5 @@
 // Variable-length integers and QPACK, against the RFCs' own examples.
-import cosmohttp;
+import httpclient;
 
 fn made<T>(r: Result<T, AllocError>) -> Result<T, TestFailure> {
     match (r) {

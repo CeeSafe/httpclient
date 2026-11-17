@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "executable"
 
 [dependencies]
-cosmohttp = { path = ".." }
+httpclient = { path = ".." }
 web_core = { path = "../../../CeeSafe.Web/packages/web_core" }
 web_transport = { path = "../../../CeeSafe.Web/packages/web_transport" }
 web_http = { path = "../../../CeeSafe.Web/packages/web_http" }

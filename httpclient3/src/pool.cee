@@ -1,9 +1,9 @@
-// HTTP/3 for cosmohttp's `Client`: a few connections, one for each server the client talks to, behind the
+// HTTP/3 for httpclient's `Client`: a few connections, one for each server the client talks to, behind the
 // `Http3Transport` the client calls (`Client.withHttp3`).
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
+import httpclient;
 
 /// What a connection's place in the pool is used for.
 struct Seat {

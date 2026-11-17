@@ -1,18 +1,18 @@
-# cosmohttp3
+# httpclient3
 
-HTTP/3 for [cosmohttp](..), as a package of its own so that the core client keeps no QUIC dependency.
+HTTP/3 for [httpclient](..), as a package of its own so that the core client keeps no QUIC dependency.
 
 QUIC is `web_quic` (CeeSafe.Web): ngtcp2 with OpenSSL 3.5 or later, through a C shim. Everything above it is
 written here: HTTP/3's frames, QPACK, and the connection.
 
-With cosmohttp's `Client`, which then uses HTTP/3 where a server offers it:
+With httpclient's `Client`, which then uses HTTP/3 where a server offers it:
 
 ```ceesafe
 import web_core;
 import web_tls;
 import web_quic;
-import cosmohttp;
-import cosmohttp3;
+import httpclient;
+import httpclient3;
 
 // once: QuicLibrary.initialise()
 // `tcp`: a TlsConfig.client() with ALPN [Alpn.Http2, Alpn.Http11]; `udp`: another with ALPN [Alpn.Http3]
@@ -27,7 +27,7 @@ Or one connection by hand:
 
 ```ceesafe
 let conn = await H3Connection.connect(tls, "example.com", 443, H3Options.defaults())?;
-let request = Request.create(Method.Get, "https://example.com/")?;   // cosmohttp's Request
+let request = Request.create(Method.Get, "https://example.com/")?;   // httpclient's Request
 let response = await conn.send(request, "".bytes())?;                 // or conn.open(...) and response.read(...)
 response.status(); response.header("content-type"); response.body();
 await conn.close();
@@ -37,7 +37,7 @@ await conn.close();
 
 ## How it works
 
-- **No connection task.** As in cosmohttp's HTTP/2 session, the task that waits for a response does the connection's
+- **No connection task.** As in httpclient's HTTP/2 session, the task that waits for a response does the connection's
   work: it hands queued requests to QUIC, sends and receives datagrams, runs QUIC's timers and gives what arrived to
   the streams; the other waiting tasks sleep until it wakes them, and one of them takes over when it is done. A
   connection with nothing in flight is not driven, so one left alone longer than the idle timeout (30 s) is gone.

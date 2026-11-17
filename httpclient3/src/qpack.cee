@@ -5,7 +5,7 @@
 // encoder or decoder stream, and never blocks a stream. Requests are encoded the same way, with static references
 // and literals: a request's fields are few, and most of their bytes are values no table would hold (a path, a
 // token).
-import cosmohttp;
+import httpclient;
 
 /// Appends the two-byte prefix of a field section that uses no dynamic entries (§4.5.1): Required Insert Count 0,
 /// Base 0.

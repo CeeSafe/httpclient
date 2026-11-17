@@ -277,7 +277,7 @@ The .NET client has telemetry hooks (`OnRequest`, `OnResponse`, `OnError`). The 
 - a capturing closure (`borrow @effects(alloc) fn(...)`) could update the caller's state, but a struct that borrows a
   closure has a region parameter, which would then be on `ClientOptions`, `Client`, and every type that names them.
 
-**Here:** cosmohttp keeps counters (`Client.stats()`) and has no hooks; a caller times and logs around its own
+**Here:** httpclient keeps counters (`Client.stats()`) and has no hooks; a caller times and logs around its own
 calls. **What would help:** an owned closure type that can be stored without a region (a boxed closure), or a
 documented pattern for "a callback registered once, called from async code".
 
@@ -286,7 +286,7 @@ documented pattern for "a callback registered once, called from async code".
 **Kind:** build noise; no runtime fault found. **Found:** 2026-11-17, ceesafec 0.61.0 with gcc 13.3.0 on Ubuntu
 24.04 x86-64 (clang on macOS says nothing). **Not reduced.**
 
-Building cosmohttp's tests (and cosmohttp3's, which include cosmohttp) prints three warnings like:
+Building httpclient's tests (and httpclient3's, which include httpclient) prints three warnings like:
 
 ```
 ceesafe/rt.h:962:9: warning: 'free' called on unallocated object 'ceesafe_vec_empty' [-Wfree-nonheap-object]
@@ -343,7 +343,7 @@ connection):
 | 64 | 1,079 | 427 µs |
 
 The same client on the same machine does 20,708 a second for 4 KiB bodies and 22,805 for 64 KiB over HTTP/1.1,
-and cosmohttp over HTTP/2 does 13,831 to 35,154 for the same 64 KiB route against the same server, so the server
+and httpclient over HTTP/2 does 13,831 to 35,154 for the same 64 KiB route against the same server, so the server
 is not what is slow. With one stream a request takes 8.5 ms of which 0.25 ms is CPU: it waits for something. With
 16 and 64 streams the CPU time is what grows. On an M1 the same rows were 2,119, 7,443 and 8,670 a second: slow
 there too, less so. No run failed.

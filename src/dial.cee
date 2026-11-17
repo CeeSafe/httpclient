@@ -1,0 +1,117 @@
+// Connecting to a name that has several addresses (RFC 8305, "Happy Eyeballs", in short): the first address gets a
+// head start, then a second one is tried beside it, and the first to connect is used. A host whose IPv6 route is
+// dead then costs the head start, not the whole connect timeout.
+import web_core;
+import web_transport;
+
+enum Dialed {
+    Connected(TcpTransport),
+    Failed(NetError),
+}
+
+async fn connectOne(address: SocketAddress, connectMs: u64) -> Result<TcpTransport, NetError> {
+    if (connectMs == 0) {
+        return await TcpTransport.connectTo(address);
+    }
+    return await Async.timeout(connectMs, NetError.TimedOut, async () => await TcpTransport.connectTo(address));
+}
+
+fn isV6(a: borrow SocketAddress) -> bool => match (a) {
+    SocketAddress.V6(_, _, _) => true,
+    _ => false,
+};
+
+/// A connection to the first of `addresses` that takes one, each given `connectMs` (0: no limit). With `raceMs`
+/// above 0 and several addresses, the second attempt (the first address of the other family, else the next one)
+/// starts when the first has failed or `raceMs` has passed, and runs beside it; the rest are tried one at a time
+/// if both fail. The error is the last address's.
+async fn connectAny(addresses: Slice<SocketAddress>, connectMs: u64, raceMs: u64) -> Result<TcpTransport, NetError> {
+    if (addresses.length == 0) {
+        return Err(NetError.Closed);
+    }
+    var failure = NetError.Closed;
+    var second: usize = 0; // 0: no race
+    if (raceMs > 0 && addresses.length > 1) {
+        second = 1;
+        for (i in 1..addresses.length) {
+            if (isV6(addresses[i]) != isV6(addresses[0])) {
+                second = i;
+                break;
+            }
+        }
+        let first = addresses[0];
+        let other = addresses[second];
+        // Each attempt says when it has failed, so the other knows it is alone; an attempt that failed does not
+        // end the race before the other has had its turn.
+        let firstFailed = AsyncSignal.create();
+        let secondFailed = AsyncSignal.create();
+        let firstGone = Cell<bool>.create(false);
+        let raced: Result<Raced<Dialed>, NetError> = await Async.race(
+            async () => {
+                match (await connectOne(first, connectMs)) {
+                    Ok(tcp) => { return Ok(Dialed.Connected(tcp)); }
+                    Err(e) => {
+                        firstGone.set(true);
+                        firstFailed.raise();
+                        match (await secondFailed.wait()) {
+                            Ok() => {}
+                            Err(x) => { return Err(NetErrors.fromAsync(x)); }
+                        }
+                        return Ok(Dialed.Failed(e));
+                    }
+                }
+            },
+            async () => {
+                // The head start: over when it has passed, or when the first attempt has failed.
+                let waited: Result<void, AsyncError> = await Async.timeout(
+                    raceMs,
+                    AsyncError.TimedOut,
+                    async () => await firstFailed.wait(),
+                );
+                match (waited) {
+                    Err(AsyncError.Cancelled) => { return Err(NetError.Cancelled); }
+                    _ => {}
+                }
+                match (await connectOne(other, connectMs)) {
+                    Ok(tcp) => { return Ok(Dialed.Connected(tcp)); }
+                    Err(e) => {
+                        if (!firstGone.get()) {
+                            match (await firstFailed.wait()) {
+                                Ok() => {}
+                                Err(x) => { return Err(NetErrors.fromAsync(x)); }
+                            }
+                        }
+                        secondFailed.raise();
+                        return Ok(Dialed.Failed(e));
+                    }
+                }
+            },
+        );
+        let won = raced?;
+        match (won.value) {
+            Dialed.Connected(tcp) => { return Ok(tcp); }
+            Dialed.Failed(e) => { failure = e; }
+        }
+        match (won.other) {
+            Some(Dialed.Connected(tcp)) => { return Ok(tcp); }
+            Some(Dialed.Failed(e)) => { failure = e; }
+            null => {}
+        }
+    }
+    for (i in 0..addresses.length) {
+        if (second != 0 && (i == 0 || i == second)) {
+            continue; // tried above
+        }
+        match (await connectOne(addresses[i], connectMs)) {
+            Ok(tcp) => { return Ok(tcp); }
+            Err(e) => {
+                failure = e;
+                match (e) {
+                    NetError.Cancelled => { return Err(e); }
+                    _ => {}
+                }
+            }
+        }
+    }
+    return Err(failure);
+}

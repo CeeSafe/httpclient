@@ -1602,21 +1602,14 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<
             }
         }
         var failure = HttpError.NoAddress;
-        for (i in 0..addresses.length) {
-            let address = addresses[i];
-            let dialed = if (options.connectMs == 0) await TcpTransport.connectTo(address) else await Async.timeout(
-                options.connectMs,
-                NetError.TimedOut,
-                async () => await TcpTransport.connectTo(address),
-            );
-            match (dialed) {
+        if (addresses.length > 0) {
+            match (await connectAny(addresses.view(), options.connectMs, options.raceMs)) {
                 Ok(tcp) => {
                     match (tcp.setNoDelay(true)) {
                         Ok() => {}
                         Err(_) => {} // the first write says so if the connection is already gone
                     }
                     plain = Some(PlainStream.tcp(tcp));
-                    break;
                 }
                 Err(e) => { failure = HttpError.Net(e); }
             }

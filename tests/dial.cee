@@ -1,0 +1,66 @@
+// Connecting to one of several addresses, against listeners on the loopback.
+import web_core;
+import web_transport;
+
+fn listening() -> Result<Listener, TestFailure> {
+    return match (Listener.bind("127.0.0.1", 0)) {
+        Ok(l) => Ok(l),
+        Err(_) => Err(TestFailure.create("a listener")),
+    };
+}
+
+fn portOf(listener: borrow Listener) -> Result<u16, TestFailure> {
+    return match (listener.port()) {
+        Ok(p) => Ok(p),
+        Err(_) => Err(TestFailure.create("a listener's port")),
+    };
+}
+
+/// A port on the loopback where nobody listens: one that a listener had, and gave up.
+fn closedPort() -> Result<u16, TestFailure> {
+    let gone = listening()?;
+    return portOf(gone);
+}
+
+fn local(port: u16) -> SocketAddress => SocketAddress.V4([127u8, 0, 0, 1], port);
+
+@test
+async fn theFirstAddressThatAnswersIsUsed() -> Result<void, TestFailure> {
+    let listener = listening()?;
+    let good = local(portOf(listener)?);
+    let closed = local(closedPort()?);
+    let alsoClosed = local(closedPort()?);
+    // A refused first address ends its head start at once: the second is not kept waiting.
+    let started = Timer.now();
+    let refusedFirst = [closed, good];
+    Check.isTrue((await connectAny(refusedFirst[..], 5000, 3000)).isOk(), "the second address")?;
+    Check.isTrue(Timer.now() - started < 2000, "without waiting out the head start")?;
+    let goodFirst = [good, closed];
+    Check.isTrue((await connectAny(goodFirst[..], 5000, 3000)).isOk(), "the first address")?;
+    let onlyThird = [closed, alsoClosed, good];
+    Check.isTrue((await connectAny(onlyThird[..], 5000, 50)).isOk(), "the third, after the two that raced")?;
+    let none = [closed, alsoClosed];
+    Check.isTrue((await connectAny(none[..], 5000, 50)).isErr(), "nobody listens")?;
+    // One at a time.
+    Check.isTrue((await connectAny(refusedFirst[..], 5000, 0)).isOk(), "in turn")?;
+    Check.isTrue((await connectAny(none[..], 5000, 0)).isErr(), "in turn, nobody")?;
+    let one = [good];
+    Check.isTrue((await connectAny(one[..], 5000, 250)).isOk(), "a single address")?;
+    let nothing = [closed];
+    Check.isTrue((await connectAny(nothing[0..0], 5000, 250)).isErr(), "no address at all")?;
+    return Ok();
+}
+
+@test
+async fn aSilentAddressCostsOnlyTheHeadStart() -> Result<void, TestFailure> {
+    // 192.0.2.1 is an address for documentation (RFC 5737): nothing answers there, or there is no route to it.
+    // Either way the listener on the loopback is reached, long before the connect timeout.
+    let listener = listening()?;
+    let good = local(portOf(listener)?);
+    let silent = SocketAddress.V4([192u8, 0, 2, 1], 9);
+    let both = [silent, good];
+    let started = Timer.now();
+    Check.isTrue((await connectAny(both[..], 8000, 100)).isOk(), "the address that answers")?;
+    Check.isTrue(Timer.now() - started < 4000, "long before the connect timeout")?;
+    return Ok();
+}

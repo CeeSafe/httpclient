@@ -7,7 +7,7 @@ tests = ["tests"]
 
 [dependencies]
 httpclient = { path = ".." }
-web_core = { path = "../../../CeeSafe.Web/packages/web_core" }
-web_tls = { path = "../../../CeeSafe.Web/packages/web_tls" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_core" }
+web_tls = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_tls" }
 # QUIC: ngtcp2 with OpenSSL (3.5 or later), through web_quic's shim. HTTP/3 and QPACK above it are this package's own.
-web_quic = { path = "../../../CeeSafe.Web/packages/web_quic" }
+web_quic = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_quic" }

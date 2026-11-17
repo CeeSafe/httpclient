@@ -5,8 +5,8 @@ kind = "executable"
 
 [dependencies]
 httpclient = { path = ".." }
-web_core = { path = "../../../CeeSafe.Web/packages/web_core" }
-web_transport = { path = "../../../CeeSafe.Web/packages/web_transport" }
-web_http = { path = "../../../CeeSafe.Web/packages/web_http" }
-web_tls = { path = "../../../CeeSafe.Web/packages/web_tls" }
-web_client = { path = "../../../CeeSafe.Web/packages/web_client" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_core" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_transport" }
+web_http = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_http" }
+web_tls = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_tls" }
+web_client = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_client" }

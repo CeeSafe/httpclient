@@ -1,8 +1,9 @@
 # httpclient
 
-An HTTP/1.1 and HTTP/2 client for [CeeSafe](https://ceesafe.github.io/CeeSafe/), written for speed: a request is one
-write, the response is parsed in buffers that are reused, and a request on a warm connection allocates nothing.
-It is a new design after the .NET library [CosmoHttpClient](../../CosmoHttpClient), not a translation of it.
+An HTTP client for [CeeSafe](https://ceesafe.github.io/CeeSafe/): HTTP/1.1 and HTTP/2 here, HTTP/3 through the
+[httpclient3](httpclient3) package beside it. It is written for speed: a request is one write, the response is
+parsed in buffers that are reused, and a request on a warm connection allocates nothing. It is a new design after
+the .NET library CosmoHttpClient, not a translation of it.
 
 **Status:** HTTP/1.1 and HTTP/2 over TCP and TLS, connection pooling, buffered and streamed responses, redirects,
 retries, gzip and deflate, cookies, a response cache, WebSockets, streamed request bodies. Not yet: HTTP/3
@@ -34,7 +35,7 @@ let response = await http.send(request, "{\"name\":\"widget\"}".bytes())?;
 `Client.open` returns as soon as the head has arrived; `response.read(buffer)` then gives the body a piece at a
 time, a chunk's data going straight from the socket into `buffer`.
 
-For JSON, [CeeSafeLibs](../../CeeSafeLibs)' `json` reads the body where it is:
+For JSON, [CeeSafeLibs](https://github.com/CeeSafe/CeeSafeLibs)' `json` reads the body where it is:
 `Json.decode<Thing>(response.body())`.
 
 ## How it differs from web_client
@@ -304,7 +305,10 @@ python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Pytho
 (cd examples/get && ceesafec build && ./out/get https://example.com/ 3)
 ```
 
-It depends on CeeSafe.Web by path (`../../CeeSafe.Web/packages`): `web_core`, `web_transport` and `web_tls`.
+It depends on [CeeSafe.Web](https://github.com/CeeSafe/CeeSafe.Web)'s `web_core`, `web_transport` and `web_tls`
+and [CeeSafeLibs](https://github.com/CeeSafe/CeeSafeLibs)' `encoding`, each pinned to a commit in `ceesafe.toml`
+and fetched by `ceesafec`, so a clone builds on its own. Only `bench/run.py --h2` wants a CeeSafe.Web checkout
+beside this one's parent (`../../CeeSafe.Web`), for its benchmark server.
 Building needs ceesafec 0.61.0 or later (its methods' results borrow from the receiver, CeeSafe ADR 0160) and
 OpenSSL 3 (Homebrew's `openssl@3` on macOS). CeeSafe bugs and gaps met on the way are in
 [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md).

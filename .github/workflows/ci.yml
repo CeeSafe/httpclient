@@ -1,0 +1,73 @@
+# httpclient CI: check, format and tests of both packages, natively and with ASan and UBSan, and the builds of the
+# examples and the benchmark, on macOS and Linux. The allocation and cancellation sweeps are not run here: they take
+# thousands of runs each, and are run by hand before a release (README.md, "Working on it").
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CEESAFE_VERSION: v0.62.2 # the release the packages were last tested with; their manifests ask for 0.61.0 or later
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu 26.04 for its OpenSSL 3.5, which web_quic (httpclient3) needs; 24.04 has 3.0.
+        os: [macos-15, ubuntu-26.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ceesafec
+        run: |
+          curl -fsSL https://ceesafe.github.io/CeeSafe/install.sh | sh
+          echo "$HOME/.ceesafe/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: ceesafec --version
+
+      - name: OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+
+      - name: Check and format
+        run: |
+          set -e
+          for p in . httpclient3 examples/get httpclient3/examples/get3 bench; do
+            echo "== $p"
+            (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
+          done
+
+      - name: Tests
+        run: |
+          set -e
+          ceesafec test
+          (cd httpclient3 && ceesafec test)
+
+      - name: Tests with ASan and UBSan
+        run: |
+          set -e
+          ceesafec test --cflag -fsanitize=address,undefined
+          (cd httpclient3 && ceesafec test --cflag -fsanitize=address,undefined)
+
+      - name: Example and benchmark builds
+        run: |
+          set -e
+          for p in examples/get httpclient3/examples/get3 bench; do
+            echo "== $p"
+            (cd "$p" && ceesafec build)
+          done

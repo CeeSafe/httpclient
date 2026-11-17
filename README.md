@@ -312,3 +312,9 @@ beside this one's parent (`../../CeeSafe.Web`), for its benchmark server.
 Building needs ceesafec 0.61.0 or later (its methods' results borrow from the receiver, CeeSafe ADR 0160) and
 OpenSSL 3 (Homebrew's `openssl@3` on macOS). CeeSafe bugs and gaps met on the way are in
 [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md).
+
+## License
+
+httpclient and httpclient3 are licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
+as CeeSafe and CeeSafe.Web are, with an exception that permits linking them with OpenSSL
+([COPYING.OPENSSL](COPYING.OPENSSL)), which they do through `web_tls` and `web_quic`.

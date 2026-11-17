@@ -161,6 +161,28 @@ What the table does and does not show:
 
 The whole table (HTTP/1.1 rows too) is `bench/results/2026-11-16-m1-h2.json`.
 
+### On Linux
+
+The same two runs on an Intel Xeon E3-1270 v6 (4 cores, 8 threads), Ubuntu 24.04, gcc 13, ceesafec 0.61.0,
+2026-11-17, with nothing else running; the best of 3 runs. Requests a second, and the client's CPU time and
+allocations for a request:
+
+| route, connections or streams | cosmohttp | web_client | CPU µs: cosmohttp, web_client | allocations: cosmohttp, web_client |
+|---|---:|---:|---:|---:|
+| HTTP/1.1, 1 KiB, 1 | 50,556 | 38,955 | 11.7, 18.8 | 0, 10 |
+| HTTP/1.1, 1 KiB, 16 | 130,378 | 73,909 | 7.7, 13.6 | 0, 10 |
+| HTTP/1.1, 1 KiB, 64 | 131,363 | 74,325 | 7.8, 13.7 | 0, 10 |
+| HTTP/1.1, 64 KiB, 16 | 69,444 | 44,742 | 14.8, 22.8 | 0, 10 |
+| HTTP/1.1, chunked, 64 | 109,734 | 73,397 | 9.3, 13.9 | 0, 10 |
+| HTTP/2, 13 bytes, 1 | 27,480 | 21,537 | 14.3, 25.2 | 0, 27 |
+| HTTP/2, 13 bytes, 16 | 127,713 | 59,808 | 3.0, 9.7 | 0, 27 |
+| HTTP/2, 4 KiB, 64 | 122,210 | 98,393 | 3.1, 10.3 | 0, 26 |
+| HTTP/2, 64 KiB, 16 | 33,955 | 329 | 17.1, 562.2 | 0, 30 |
+
+web_client's HTTP/2 with 64 KiB bodies is far slower here than anywhere else (117 to 1,079 requests a second);
+that is F13 in [CEESAFE_FINDINGS.md](CEESAFE_FINDINGS.md), not looked into. The whole tables are
+`bench/results/2026-11-17-linux-x64.json` and `-h2.json`.
+
 The .NET CosmoHttpClient's own figure for a pooled 1 KiB GET on an M1 is 42.9 µs and 946 B allocated, against
 Kestrel in the same process; this client's 23.5 µs is against a simpler server in another process, so the two are
 not the same measurement.

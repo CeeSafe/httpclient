@@ -1,0 +1,407 @@
+[
+ {
+  "route": "1k",
+  "conc": 1,
+  "mode": "cosmo",
+  "rps": 50556,
+  "cpu_us": 11.690119999999993,
+  "user_us": 3.0757799999999946,
+  "allocs": 0.0,
+  "all_rps": [
+   50479,
+   50556,
+   48923
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 1,
+  "mode": "stream",
+  "rps": 50428,
+  "cpu_us": 11.82059000000005,
+  "user_us": 3.5288600000000514,
+  "allocs": 0.0001,
+  "all_rps": [
+   47596,
+   48379,
+   50428
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 1,
+  "mode": "web",
+  "rps": 38955,
+  "cpu_us": 18.83237000000001,
+  "user_us": 8.763280000000009,
+  "allocs": 10.0,
+  "all_rps": [
+   38595,
+   38955,
+   38124
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 16,
+  "mode": "cosmo",
+  "rps": 130378,
+  "cpu_us": 7.714380000000015,
+  "user_us": 2.4313800000000185,
+  "allocs": 0.0,
+  "all_rps": [
+   123762,
+   123456,
+   130378
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 16,
+  "mode": "stream",
+  "rps": 127551,
+  "cpu_us": 7.882730000000002,
+  "user_us": 2.6609200000000044,
+  "allocs": 0.0,
+  "all_rps": [
+   126903,
+   127551,
+   126582
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 16,
+  "mode": "web",
+  "rps": 73909,
+  "cpu_us": 13.602220000000003,
+  "user_us": 7.51570000000001,
+  "allocs": 10.0,
+  "all_rps": [
+   73909,
+   69252,
+   70372
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 64,
+  "mode": "cosmo",
+  "rps": 131363,
+  "cpu_us": 7.771386843789993,
+  "user_us": 2.1403749199743793,
+  "allocs": 0.0,
+  "all_rps": [
+   129324,
+   130677,
+   131363
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 64,
+  "mode": "stream",
+  "rps": 129492,
+  "cpu_us": 7.872339148527547,
+  "user_us": 2.3506922215108874,
+  "allocs": 0.0,
+  "all_rps": [
+   129492,
+   125273,
+   127347
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "1k",
+  "conc": 64,
+  "mode": "web",
+  "rps": 74325,
+  "cpu_us": 13.681147967349556,
+  "user_us": 7.580635803457105,
+  "allocs": 10.0,
+  "all_rps": [
+   73290,
+   74325,
+   70949
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 1,
+  "mode": "cosmo",
+  "rps": 31695,
+  "cpu_us": 18.83664999999972,
+  "user_us": 3.767299999999807,
+  "allocs": 0.0,
+  "all_rps": [
+   28449,
+   31695,
+   30721
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 1,
+  "mode": "stream",
+  "rps": 30257,
+  "cpu_us": 20.797199999999805,
+  "user_us": 6.2911499999998455,
+  "allocs": 0.0,
+  "all_rps": [
+   29673,
+   30257,
+   29498
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 1,
+  "mode": "web",
+  "rps": 24600,
+  "cpu_us": 29.14505000000016,
+  "user_us": 10.811900000000207,
+  "allocs": 10.0,
+  "all_rps": [
+   23094,
+   24600,
+   23174
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 16,
+  "mode": "cosmo",
+  "rps": 69444,
+  "cpu_us": 14.810600000000207,
+  "user_us": 2.802000000000149,
+  "allocs": 0.0,
+  "all_rps": [
+   69444,
+   68728,
+   69204
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 16,
+  "mode": "stream",
+  "rps": 61728,
+  "cpu_us": 16.571749999999952,
+  "user_us": 5.256899999999831,
+  "allocs": 0.0,
+  "all_rps": [
+   60060,
+   58479,
+   61728
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 16,
+  "mode": "web",
+  "rps": 44742,
+  "cpu_us": 22.789400000000093,
+  "user_us": 10.123100000000207,
+  "allocs": 10.0,
+  "all_rps": [
+   44742,
+   43383,
+   42918
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 64,
+  "mode": "cosmo",
+  "rps": 53390,
+  "cpu_us": 20.124198717948538,
+  "user_us": 3.89498197115362,
+  "allocs": 0.0,
+  "all_rps": [
+   45903,
+   53390,
+   52965
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 64,
+  "mode": "stream",
+  "rps": 42305,
+  "cpu_us": 25.126652644230997,
+  "user_us": 7.085687099359227,
+  "allocs": 0.0,
+  "all_rps": [
+   41086,
+   41427,
+   42305
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "64k",
+  "conc": 64,
+  "mode": "web",
+  "rps": 40339,
+  "cpu_us": 26.680789262820422,
+  "user_us": 11.520082131410197,
+  "allocs": 10.0,
+  "all_rps": [
+   38622,
+   39697,
+   40339
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 1,
+  "mode": "cosmo",
+  "rps": 47596,
+  "cpu_us": 13.117550000000016,
+  "user_us": 4.907210000000006,
+  "allocs": 0.0,
+  "all_rps": [
+   46490,
+   43122,
+   47596
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 1,
+  "mode": "stream",
+  "rps": 49800,
+  "cpu_us": 12.19621999999994,
+  "user_us": 3.961619999999968,
+  "allocs": 0.0001,
+  "all_rps": [
+   49212,
+   49800,
+   45977
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 1,
+  "mode": "web",
+  "rps": 38138,
+  "cpu_us": 19.313009999999977,
+  "user_us": 9.350359999999966,
+  "allocs": 10.0,
+  "all_rps": [
+   38138,
+   37050,
+   35790
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 16,
+  "mode": "cosmo",
+  "rps": 108342,
+  "cpu_us": 9.279539999999997,
+  "user_us": 3.9697999999999922,
+  "allocs": 0.0,
+  "all_rps": [
+   101419,
+   108342,
+   104712
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 16,
+  "mode": "stream",
+  "rps": 123001,
+  "cpu_us": 8.182660000000013,
+  "user_us": 2.9209500000000332,
+  "allocs": 0.0,
+  "all_rps": [
+   119617,
+   121212,
+   123001
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 16,
+  "mode": "web",
+  "rps": 70921,
+  "cpu_us": 14.160409999999999,
+  "user_us": 7.604850000000027,
+  "allocs": 10.0,
+  "all_rps": [
+   70921,
+   68634,
+   69252
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 64,
+  "mode": "cosmo",
+  "rps": 109734,
+  "cpu_us": 9.279899567861765,
+  "user_us": 3.7699563860435172,
+  "allocs": 0.0,
+  "all_rps": [
+   109734,
+   109016,
+   103486
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 64,
+  "mode": "stream",
+  "rps": 124338,
+  "cpu_us": 8.208526728553236,
+  "user_us": 2.6127160691421674,
+  "allocs": 0.0,
+  "all_rps": [
+   124338,
+   122509,
+   122509
+  ],
+  "failed_runs": 0
+ },
+ {
+  "route": "chunked",
+  "conc": 64,
+  "mode": "web",
+  "rps": 73397,
+  "cpu_us": 13.85668413892451,
+  "user_us": 7.963838428297131,
+  "allocs": 10.0,
+  "all_rps": [
+   71507,
+   73397,
+   69858
+  ],
+  "failed_runs": 0
+ }
+]

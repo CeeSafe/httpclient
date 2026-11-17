@@ -19,6 +19,7 @@ arm64 unless an entry says otherwise.
 | F10 | no practical way to keep a hook (callback) in a long-lived struct used from async code | CeeSafe (ergonomics, not a bug) | open; needs a design answer |
 | F11 | gcc 13 warns `free` called on `ceesafe_vec_empty` in generated C (`-Wfree-nonheap-object`) | CeeSafe (build noise, no runtime fault) | open |
 | F12 | `ceesafec fmt` never wraps an interface method's signature, and wraps its `@effects(...)` instead | CeeSafe (formatter) | open |
+| F13 | web_client over HTTP/2 with 64 KiB bodies: 117 to 1,079 requests a second on Linux | CeeSafe.Web (performance) | open, not looked into |
 
 The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
@@ -325,6 +326,27 @@ public interface Http3Transport {
 
 `ceesafec fmt --check` accepts its own output, so nothing fails; the lines are just not in the style the rest of
 the file is in.
+
+## F13. web_client's HTTP/2 is very slow with 64 KiB bodies on Linux
+
+**Kind:** performance, CeeSafe.Web's web_client (or web_http2 under it). **Found:** 2026-11-17, in this package's
+benchmark on Linux x86-64 (Xeon E3-1270 v6, Ubuntu 24.04, ceesafec 0.61.0), against CeeSafe.Web's own
+`benchmarks/http` server, CeeSafe.Web `main` at `615a85d`. **Not looked into.**
+
+`python3 bench/run.py --h2`, route `64k`, mode `web2` (web_client, HTTP/2 by prior knowledge, all requests on one
+connection):
+
+| streams at once | requests a second | client CPU for a request |
+|---:|---:|---:|
+| 1 | 117 | 249 µs |
+| 16 | 329 | 562 µs |
+| 64 | 1,079 | 427 µs |
+
+The same client on the same machine does 20,708 a second for 4 KiB bodies and 22,805 for 64 KiB over HTTP/1.1,
+and cosmohttp over HTTP/2 does 13,831 to 35,154 for the same 64 KiB route against the same server, so the server
+is not what is slow. With one stream a request takes 8.5 ms of which 0.25 ms is CPU: it waits for something. With
+16 and 64 streams the CPU time is what grows. On an M1 the same rows were 2,119, 7,443 and 8,670 a second: slow
+there too, less so. No run failed.
 
 ## F2. Withdrawn: diagnostics were not printed twice
 

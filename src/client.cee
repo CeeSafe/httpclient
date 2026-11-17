@@ -136,6 +136,8 @@ public struct Client {
     private counters: RefCell<ClientStats>;
     /// HTTP/3, if the client was given a way to speak it (`withHttp3`).
     private http3: (Box<dyn Http3Transport>)?;
+    /// The proxy the connections go through, if one was set.
+    private proxy: Proxy?;
 
     /// A client for `http://` URLs; `https://` URLs fail with `NoTls`.
     public fn create(options: ClientOptions) -> Client => Client {
@@ -166,6 +168,7 @@ public struct Client {
             },
         ),
         http3: null,
+        proxy: null,
     };
 
     /// A client that also makes `https://` connections with `tls` (a web_tls `TlsConfig.client()` with its trust
@@ -199,6 +202,7 @@ public struct Client {
             },
         ),
         http3: null,
+        proxy: null,
     };
 
     /// A client as `withTls` makes, which also speaks HTTP/3 through `transport` (cosmohttp3's `Http3Pool`): for
@@ -210,6 +214,20 @@ public struct Client {
         client.http3 = Some(transport);
         return client;
     }
+
+    /// Sends the client's connections through `proxy` from now on. A SOCKS5 proxy carries everything; an HTTP proxy
+    /// tunnels `https` origins and WebSockets (CONNECT) and is sent `http` requests with their whole URL, over
+    /// HTTP/1.1. HTTP/3 is not used through a proxy. Set it before the first request: connections already open
+    /// stay as they are.
+    public fn setProxy(borrow mut this, proxy: Proxy) {
+        this.proxy = Some(proxy);
+    }
+
+    /// Whether requests to an `http` origin go to an HTTP proxy with their whole URL (and so over HTTP/1.1).
+    fn viaHttpProxy(borrow this, parts: borrow UrlParts) -> bool => match (borrow this.proxy) {
+        Some(p) => p.kind is ProxyKind.Http && !parts.secure,
+        null => false,
+    };
 
     /// GET `url`; the whole response is read before this returns.
     public async fn get(borrow this, url: StringView) -> Result<Response, HttpError> {
@@ -336,8 +354,8 @@ public struct Client {
         let all = guard.data();
         let o = borrow all.list[origin];
         let now = Timer.now();
-        if (now < o.h3BadUntil) {
-            return null;
+        if (now < o.h3BadUntil || this.proxy != null) {
+            return null; // it failed lately, or a proxy is in the way: QUIC does not go through one
         }
         if (o.h3Port != 0 && now < o.h3Until) {
             return Some(o.h3Port);
@@ -1189,7 +1207,9 @@ async fn roundTrip<region c>(
     let length: u64? = if (body.length > 0 || Methods.sendsLength(method)) Some(body.length as u64) else null;
     // HTTP/2 is possible when the client has sessions and the origin may speak it: https (by ALPN), or http by
     // prior knowledge.
-    let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge);
+    let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge) && !client.viaHttpProxy(
+        parts,
+    );
     // A buffered response may come compressed when the client is to decompress it, unless the request says itself
     // what codings it takes.
     let coded = options.decompress && buffered && !namesField(fields, "accept-encoding".bytes());
@@ -1209,6 +1229,19 @@ async fn roundTrip<region c>(
         match (client.cookiesFor(url, parts, mut cookieLine, mut cookiePacked)) {
             Ok() => {}
             Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+    }
+    // To an HTTP proxy an `http` request goes with its whole URL, and the proxy's credentials.
+    let absolute = client.viaHttpProxy(parts);
+    if (absolute) {
+        match (borrow client.proxy) {
+            Some(p) => {
+                match (p.authorization(mut cookieLine)) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+            }
+            null => {}
         }
     }
     // HTTP/3 first, for a buffered request to an origin that speaks it; any other way if that fails.
@@ -1373,7 +1406,17 @@ async fn roundTrip<region c>(
             null => {
                 var link = conn!;
                 link.out.clear();
-                match (writeRequestHead(mut link.out, method, url, parts, fields, cookieLine.view(), length, coded)) {
+                match (writeRequestHead(
+                    mut link.out,
+                    method,
+                    url,
+                    parts,
+                    fields,
+                    cookieLine.view(),
+                    length,
+                    coded,
+                    absolute,
+                )) {
                     Ok() => {}
                     Err(_) => { return Err(HttpErrors.noMemory()); }
                 }
@@ -1502,7 +1545,7 @@ async fn connect(
         }
     }
     if (place == null && conn == null) {
-        let wire = await dial(client, url, parts)?;
+        let wire = await dial(client, url, parts, false)?;
         let speaksH2 = mayH2 && (if (parts.secure) wireAlpn(wire) is Alpn.Http2 else true);
         if (speaksH2) {
             let index = match (client.freeSession()) {
@@ -1571,7 +1614,9 @@ async fn h2Answer(session: borrow H2Session, slot: usize, body: Slice<u8>, buffe
 }
 
 /// A new connection to `url`'s origin: each of the host's addresses in turn until one connects, then TLS for https.
-async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<Wire, HttpError> {
+/// A connection for requests to the URL's origin: to it, or to the client's proxy and through that. `tunnel`: an
+/// HTTP proxy is asked for a tunnel even to an `http` origin (a WebSocket needs the connection to itself).
+async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts, tunnel: bool) -> Result<Wire, HttpError> {
     let options = borrow client.options;
     let host = match (StringView.fromUtf8(parts.host(url))) {
         Some(h) => h,
@@ -1585,9 +1630,22 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<
     if (plain == null && client.isOffline()) {
         return Err(HttpError.Net(NetError.Closed)); // a test's scripts have run out
     }
+    // Where the TCP connection goes: the origin, or the proxy.
+    var toHost = host;
+    var toPort = parts.port;
+    match (borrow client.proxy) {
+        Some(p) => {
+            toHost = match (StringView.fromUtf8(p.host.view())) {
+                Some(h) => h,
+                null => { return Err(HttpError.BadUrl); },
+            };
+            toPort = p.port;
+        }
+        null => {}
+    }
     if (plain == null) {
         var addresses = Vector<SocketAddress>.create();
-        match (SocketAddresses.parseIp(host, parts.port)) {
+        match (SocketAddresses.parseIp(toHost, toPort)) {
             Some(a) => {
                 match (addresses.push(a)) {
                     Ok() => {}
@@ -1595,7 +1653,7 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<
                 }
             }
             null => {
-                match (await AsyncDns.resolve(host, parts.port)) {
+                match (await AsyncDns.resolve(toHost, toPort)) {
                     Ok(found) => { addresses = found; }
                     Err(e) => { return Err(HttpError.Net(NetErrors.fromAsync(e))); }
                 }
@@ -1618,7 +1676,49 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts) -> Result<
             return Err(failure);
         }
     }
-    let stream = plain!;
+    var stream = plain!;
+    match (borrow client.proxy) {
+        Some(p) => {
+            let limit = options.connectMs;
+            var asked: Result<void, HttpError> = Ok();
+            if (p.kind is ProxyKind.Socks5) {
+                asked = if (limit == 0) await socksConnect(
+                    mut stream,
+                    p,
+                    parts.host(url),
+                    parts.port,
+                ) else await Async.timeout(
+                    limit,
+                    HttpError.Net(NetError.TimedOut),
+                    async () => await socksConnect(mut stream, p, parts.host(url), parts.port),
+                );
+            } else if (parts.secure || tunnel) {
+                var authority = Vector<u8>.create();
+                var built = authority.extend(parts.host(url));
+                if (built.isOk()) {
+                    built = authority.push(':');
+                }
+                if (built.isOk()) {
+                    var digits = String.create();
+                    built = digits.appendNumber(parts.port as u64);
+                    if (built.isOk()) {
+                        built = authority.extend(digits.view().bytes());
+                    }
+                }
+                match (built) {
+                    Ok() => {}
+                    Err(_) => { return Err(HttpErrors.noMemory()); }
+                }
+                asked = if (limit == 0) await httpConnect(mut stream, p, authority.view()) else await Async.timeout(
+                    limit,
+                    HttpError.Net(NetError.TimedOut),
+                    async () => await httpConnect(mut stream, p, authority.view()),
+                );
+            }
+            asked?;
+        }
+        null => {}
+    }
     if (parts.secure) {
         let wire = await secured(client, stream, host)?;
         client.dialed();
@@ -2114,7 +2214,9 @@ async fn beginUpload<region c>(
         null => {}
     }
     let options = borrow client.options;
-    let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge);
+    let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge) && !client.viaHttpProxy(
+        parts,
+    );
     let coded = options.decompress && !namesField(fields, "accept-encoding".bytes());
     var line = Vector<u8>.create();
     var linePacked = Vector<u8>.create();
@@ -2128,6 +2230,13 @@ async fn beginUpload<region c>(
     }
     if (ready.isOk() && length == null) {
         ready = line.extend("Transfer-Encoding: chunked\r\n".bytes()); // only HTTP/1.1 reads `line`
+    }
+    let absolute = client.viaHttpProxy(parts);
+    if (ready.isOk() && absolute) {
+        match (borrow client.proxy) {
+            Some(p) => { ready = p.authorization(mut line); }
+            null => {}
+        }
     }
     match (ready) {
         Ok() => {}
@@ -2163,7 +2272,17 @@ async fn beginUpload<region c>(
             match (borrow mut conn) {
                 Some(link) => {
                     link.out.clear();
-                    match (writeRequestHead(mut link.out, method, url, parts, fields, line.view(), length, coded)) {
+                    match (writeRequestHead(
+                        mut link.out,
+                        method,
+                        url,
+                        parts,
+                        fields,
+                        line.view(),
+                        length,
+                        coded,
+                        absolute,
+                    )) {
                         Ok() => {}
                         Err(_) => { return Err(HttpErrors.noMemory()); }
                     }

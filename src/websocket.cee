@@ -405,7 +405,7 @@ async fn openWebSocket(
     options: WebSocketOptions,
     key: Slice<u8>,
 ) -> Result<WebSocket, HttpError> {
-    let wire = await dial(client, url, parts)?;
+    let wire = await dial(client, url, parts, true)?;
     if (wireAlpn(wire) is Alpn.Http2) {
         return Err(HttpError.NotSwitched(0)); // the TLS configuration chose h2: no upgrade is possible there
     }
@@ -424,6 +424,7 @@ async fn openWebSocket(
         fields,
         extra.view(),
         null,
+        false,
         false,
     ) else built;
     match (written) {

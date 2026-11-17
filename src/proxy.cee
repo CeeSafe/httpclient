@@ -1,0 +1,255 @@
+// Proxies: SOCKS5 (RFC 1928, with RFC 1929's name and password), and an HTTP proxy, which is asked for a tunnel
+// (CONNECT, RFC 9110 §9.3.6) to an `https` origin and is sent the whole URL for an `http` one.
+import web_core;
+import web_transport;
+import encoding;
+
+public enum ProxyKind {
+    Http,
+    Socks5,
+}
+
+/// A proxy the client's connections go through (`Client.setProxy`). Names are looked up by the proxy, not here.
+@noncopy
+public struct Proxy {
+    kind: ProxyKind;
+    host: Vector<u8>;
+    port: u16;
+    user: Vector<u8>;
+    password: Vector<u8>;
+
+    fn create(kind: ProxyKind, host: StringView, port: u16) -> Result<Proxy, HttpError> {
+        var name = Vector<u8>.create();
+        match (name.extend(host.bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        if (host.length == 0 || port == 0) {
+            return Err(HttpError.BadUrl);
+        }
+        return Ok(
+            Proxy { kind: kind, host: name, port: port, user: Vector<u8>.create(), password: Vector<u8>.create() },
+        );
+    }
+
+    /// An HTTP proxy at `host:port`, reached without TLS.
+    public fn http(host: StringView, port: u16) -> Result<Proxy, HttpError> => Proxy.create(ProxyKind.Http, host, port);
+
+    /// A SOCKS5 proxy at `host:port`.
+    public fn socks5(host: StringView, port: u16) -> Result<Proxy, HttpError> =>
+        Proxy.create(ProxyKind.Socks5, host, port);
+
+    /// The same proxy, which is given this name and password: as `Proxy-Authorization: Basic` by an HTTP proxy, by
+    /// RFC 1929 by a SOCKS5 one (each at most 255 bytes there).
+    public fn withCredentials(this, user: StringView, password: StringView) -> Result<Proxy, HttpError> {
+        var me = this;
+        me.user.clear();
+        me.password.clear();
+        let kept = me.user.extend(user.bytes());
+        let both = if (kept.isOk()) me.password.extend(password.bytes()) else kept;
+        match (both) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        return Ok(me);
+    }
+
+    /// Appends `Proxy-Authorization: Basic ...\r\n` to `out`, if the proxy has credentials.
+    fn authorization(borrow this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        if (this.user.length == 0 && this.password.length == 0) {
+            return Ok();
+        }
+        var plain = Vector<u8>.create();
+        plain.extend(this.user.view())?;
+        plain.push(':')?;
+        plain.extend(this.password.view())?;
+        out.extend("Proxy-Authorization: Basic ".bytes())?;
+        Base64.encode(plain.view(), mut out)?;
+        return out.extend("\r\n".bytes());
+    }
+}
+
+/// Reads exactly `into.length` bytes.
+async fn readAll(stream: borrow mut PlainStream, into: SliceMut<u8>) -> Result<void, HttpError> {
+    var have: usize = 0;
+    while (have < into.length) {
+        match (await stream.read(mut into[have..])) {
+            Ok(n) => {
+                if (n == 0) {
+                    return Err(HttpError.Net(NetError.Closed));
+                }
+                have += n;
+            }
+            Err(e) => { return Err(HttpError.Net(e)); }
+        }
+    }
+    return Ok();
+}
+
+async fn writeAll(stream: borrow mut PlainStream, bytes: Slice<u8>) -> Result<void, HttpError> {
+    match (await stream.write(bytes)) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Err(HttpError.Net(e)); }
+    }
+}
+
+/// Asks the SOCKS5 proxy on `stream` for a connection to `host:port`; afterwards the stream is that connection.
+/// `Proxy(code)` if it refuses: its reply code, or 255 if no way to log in suits both.
+async fn socksConnect(
+    stream: borrow mut PlainStream,
+    proxy: borrow Proxy,
+    host: Slice<u8>,
+    port: u16,
+) -> Result<void, HttpError> {
+    if (host.length == 0 || host.length > 255 || proxy.user.length > 255 || proxy.password.length > 255) {
+        return Err(HttpError.BadUrl);
+    }
+    let login = proxy.user.length > 0;
+    var out = Vector<u8>.create();
+    // The ways to log in this client knows: none, and a name with a password if it has them.
+    let ways = [5u8, 2, 0, 2];
+    let none = [5u8, 1, 0];
+    var built = out.extend(if (login) ways[..] else none[..]);
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    await writeAll(stream, out.view())?;
+    var two = [0u8; 2];
+    await readAll(stream, mut two[..])?;
+    if (two[0] != 5 || (two[1] != 0 && !(two[1] == 2 && login))) {
+        return Err(HttpError.Proxy(255));
+    }
+    if (two[1] == 2) {
+        out.clear();
+        built = out.push(1);
+        if (built.isOk()) {
+            built = out.push(truncate<u8>(proxy.user.length));
+        }
+        if (built.isOk()) {
+            built = out.extend(proxy.user.view());
+        }
+        if (built.isOk()) {
+            built = out.push(truncate<u8>(proxy.password.length));
+        }
+        if (built.isOk()) {
+            built = out.extend(proxy.password.view());
+        }
+        match (built) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        await writeAll(stream, out.view())?;
+        await readAll(stream, mut two[..])?;
+        if (two[1] != 0) {
+            return Err(HttpError.Proxy(255));
+        }
+    }
+    // CONNECT to a name: the proxy looks it up.
+    out.clear();
+    let connect = [5u8, 1, 0, 3];
+    built = out.extend(connect[..]);
+    if (built.isOk()) {
+        built = out.push(truncate<u8>(host.length));
+    }
+    if (built.isOk()) {
+        built = out.extend(host);
+    }
+    if (built.isOk()) {
+        built = out.push(truncate<u8>(port >> 8));
+    }
+    if (built.isOk()) {
+        built = out.push(truncate<u8>(port));
+    }
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    await writeAll(stream, out.view())?;
+    var four = [0u8; 4];
+    await readAll(stream, mut four[..])?;
+    if (four[0] != 5) {
+        return Err(HttpError.Proxy(255));
+    }
+    if (four[1] != 0) {
+        return Err(HttpError.Proxy(four[1] as u16));
+    }
+    // The address the proxy bound, which nobody needs: 4 or 16 bytes or a name, then a port.
+    var rest = [0u8; 257];
+    var length: usize = 0;
+    if (four[3] == 1) {
+        length = 6;
+    } else if (four[3] == 4) {
+        length = 18;
+    } else if (four[3] == 3) {
+        await readAll(stream, mut rest[0..1])?;
+        length = rest[0] as usize + 2;
+    } else {
+        return Err(HttpError.Proxy(255));
+    }
+    return await readAll(stream, mut rest[0..length]);
+}
+
+/// Asks the HTTP proxy on `stream` for a tunnel to `authority` (`host:port`); afterwards the stream is that
+/// connection. `Proxy(status)` if it answers anything but 2xx.
+async fn httpConnect(
+    stream: borrow mut PlainStream,
+    proxy: borrow Proxy,
+    authority: Slice<u8>,
+) -> Result<void, HttpError> {
+    var out = Vector<u8>.create();
+    var built = out.extend("CONNECT ".bytes());
+    if (built.isOk()) {
+        built = out.extend(authority);
+    }
+    if (built.isOk()) {
+        built = out.extend(" HTTP/1.1\r\nHost: ".bytes());
+    }
+    if (built.isOk()) {
+        built = out.extend(authority);
+    }
+    if (built.isOk()) {
+        built = out.extend("\r\n".bytes());
+    }
+    if (built.isOk()) {
+        built = proxy.authorization(mut out);
+    }
+    if (built.isOk()) {
+        built = out.extend("\r\n".bytes());
+    }
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    await writeAll(stream, out.view())?;
+    // The answer's head, to its empty line. The origin says nothing before it is spoken to, so nothing of its
+    // can come with it.
+    var head = [0u8; 4096];
+    var have: usize = 0;
+    loop {
+        if (have == head.length) {
+            return Err(HttpError.Response(Fault.HeadTooLarge));
+        }
+        match (await stream.read(mut head[have..])) {
+            Ok(n) => {
+                if (n == 0) {
+                    return Err(HttpError.Net(NetError.Closed));
+                }
+                have += n;
+            }
+            Err(e) => { return Err(HttpError.Net(e)); }
+        }
+        if (head[0..have].indexOf("\r\n\r\n".bytes()) != null) {
+            break;
+        }
+    }
+    // `HTTP/1.1 200 ...`
+    if (have < 12 || head[0..5] != "HTTP/".bytes() || head[8] != ' ') {
+        return Err(HttpError.Response(Fault.BadStatusLine));
+    }
+    let status = head[9..12].parseInt<u16>() ?? 0;
+    if (status < 200 || status > 299) {
+        return Err(HttpError.Proxy(status));
+    }
+    return Ok();
+}

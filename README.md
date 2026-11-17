@@ -202,6 +202,11 @@ not the same measurement.
   and simply ends over HTTP/2, where a write waits for the server's window. Nothing of the body is kept, so nothing
   is sent again: no redirect is followed and no retry made, and a pooled HTTP/1.1 connection the server had closed
   meanwhile is the caller's error. An upload dropped before `finish` closes its connection or resets its stream.
+- **Proxies** (`client.setProxy(Proxy.socks5(host, port)?)` or `Proxy.http(host, port)?`, with
+  `.withCredentials(user, password)`). SOCKS5 carries everything, and the proxy looks names up. An HTTP proxy is
+  asked for a tunnel (CONNECT) to `https` origins and for WebSockets, and gets `http` requests with their whole
+  URL over HTTP/1.1. A refusal is `HttpError.Proxy(code)`. HTTP/3 is not used through a proxy; the proxy itself is
+  reached without TLS.
 - **A name with several addresses** is not tried one address at a time: the first gets a head start (`raceMs`,
   250 ms), then the first address of the other family (IPv4 or IPv6) is tried beside it, and whichever connects
   first is used. A first address that fails outright ends its head start at once.
@@ -260,7 +265,7 @@ not the same measurement.
 
 Of CosmoHttpClient's surface: HTTP/3 for streamed responses and uploads (buffered requests have it, through
 [cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
-the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache.  In HTTP/2: no PING keep-alive, no request
+the cache kept on disk; `Expect: 100-continue`; a proxy reached over TLS, and proxy settings from the environment; TLS session resumption; a DNS cache.  In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
 in flight with `maxPerOrigin`).
 
@@ -268,7 +273,7 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 97 tests, over scripted connections and loopback listeners; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 99 tests, over scripted connections and loopback listeners; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
 python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib

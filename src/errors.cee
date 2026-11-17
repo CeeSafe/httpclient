@@ -50,6 +50,9 @@ public enum HttpError {
     /// The server did not switch to WebSocket: its status, or 0 for a connection that negotiated HTTP/2, over which
     /// this client opens no WebSocket.
     NotSwitched(u16),
+    /// The proxy did not make the connection: an HTTP proxy's status, a SOCKS5 proxy's reply code (255 if the two
+    /// could not agree how to log in).
+    Proxy(u16),
     /// More redirects than `ClientOptions.maxRedirects`.
     TooManyRedirects,
     /// The client was closed.
@@ -68,6 +71,7 @@ public struct HttpErrors {
         HttpError.Response(f) => HttpErrors.fault(f),
         HttpError.Reset(_) => "the server reset the stream",
         HttpError.NotSwitched(_) => "the server did not switch to WebSocket",
+        HttpError.Proxy(_) => "the proxy refused the connection",
         HttpError.TooManyRedirects => "too many redirects",
         HttpError.Closed => "the client is closed",
     };

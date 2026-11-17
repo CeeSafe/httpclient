@@ -1,0 +1,167 @@
+// Proxies, over scripted connections: the script is the proxy's side, then the origin's through it.
+import web_core;
+import web_transport;
+
+fn proxied(proxy: Result<Proxy, HttpError>) -> Result<Client, TestFailure> {
+    var client = Client.create(ClientOptions.defaults());
+    match (proxy) {
+        Ok(p) => { client.setProxy(p); }
+        Err(e) => { return Err(failed(e)); }
+    }
+    return Ok(client);
+}
+
+/// The proxy's refusal code, 0 for another error, 1000 for a response.
+async fn refusal(client: borrow Client, url: StringView) -> u64 {
+    return match (await client.get(url)) {
+        Ok(_) => 1000,
+        Err(e) => match (e) {
+            HttpError.Proxy(code) => code as u64,
+            _ => 0,
+        },
+    };
+}
+
+/// A script: the bytes of `hex`, then `text`.
+fn scripted(hex: StringView, text: StringView) -> Result<Vector<u8>, TestFailure> {
+    var bytes = raw(hex)?;
+    made(bytes.extend(text.bytes()))?;
+    return Ok(bytes);
+}
+
+@test
+async fn throughSocks5() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    // No login: the proxy picks "none" (05 00), then says the connection is made, bound to 127.0.0.1:1080.
+    {
+        let client = proxied(Proxy.socks5("proxy.test", 1080))?;
+        let server = scripted("0500050000017f0000010438", answer)?;
+        scriptBytes(client, server.view(), 0, 0, copies)?;
+        let response = match (await client.get("http://example.com:8080/a")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("ok".bytes(), response.body())?;
+        // The greeting, then CONNECT to the name `example.com` (11 bytes), port 8080, then the request as to the
+        // origin itself.
+        var expected = scripted("050100050100030b", "example.com")?;
+        made(expected.extend(raw("1f90")?.view()))?;
+        made(expected.extend("GET /a HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".bytes()))?;
+        Check.equalBytes(expected.view(), written(copies)?.view())?;
+    }
+    // A name and a password: the proxy picks that way (05 02), agrees (01 00), and names what it bound (`abc`).
+    {
+        let made2 = match (Proxy.socks5("proxy.test", 1080)) {
+            Ok(p) => p.withCredentials("user", "pass"),
+            Err(e) => Err(e),
+        };
+        let client = proxied(made2)?;
+        let server = scripted("0502010005000003036162630050", answer)?;
+        scriptBytes(client, server.view(), 1, 0, copies)?;
+        let response = match (await client.get("http://example.com/")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("ok".bytes(), response.body())?;
+        var expected = scripted("050200020104", "user")?;
+        made(expected.push(4))?;
+        made(expected.extend("pass".bytes()))?;
+        made(expected.extend(raw("050100030b")?.view()))?;
+        made(expected.extend("example.com".bytes()))?;
+        made(expected.extend(raw("0050")?.view()))?;
+        made(expected.extend("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes()))?;
+        Check.equalBytes(expected.view(), written(copies)?.view())?;
+    }
+    // Refusals: the connection is not allowed (reply 2); no way to log in suits both (ff); a wrong password.
+    {
+        let client = proxied(Proxy.socks5("proxy.test", 1080))?;
+        scriptBytes(client, raw("050005020001000000000000")?.view(), 0, 0, copies)?;
+        Check.equalU64(2, await refusal(client, "http://example.com/"))?;
+        let strict = proxied(Proxy.socks5("proxy.test", 1080))?;
+        scriptBytes(strict, raw("05ff")?.view(), 0, 0, copies)?;
+        Check.equalU64(255, await refusal(strict, "http://example.com/"))?;
+        let wrong = match (Proxy.socks5("proxy.test", 1080)) {
+            Ok(p) => p.withCredentials("user", "nope"),
+            Err(e) => Err(e),
+        };
+        let denied = proxied(wrong)?;
+        scriptBytes(denied, raw("05020101")?.view(), 0, 0, copies)?;
+        Check.equalU64(255, await refusal(denied, "http://example.com/"))?;
+        let cut = proxied(Proxy.socks5("proxy.test", 1080))?;
+        scriptBytes(cut, raw("0500050000")?.view(), 0, 0, copies)?;
+        Check.equalU64(0, await refusal(cut, "http://example.com/"))?; // the proxy went away: a network error
+    }
+    Check.isTrue(Proxy.socks5("", 1080).isErr() && Proxy.http("proxy.test", 0).isErr(), "a proxy has a place")?;
+    return Ok();
+}
+
+@test
+async fn throughAnHttpProxy() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    // An `http` request goes to the proxy with its whole URL, and the proxy's credentials.
+    {
+        let known = match (Proxy.http("proxy.test", 3128)) {
+            Ok(p) => p.withCredentials("user", "pass"),
+            Err(e) => Err(e),
+        };
+        let client = proxied(known)?;
+        script(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 0, copies)?;
+        let response = match (await client.get("http://example.com:8080/a?b=1#c")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("ok".bytes(), response.body())?;
+        Check.equalBytes(
+            "GET http://example.com:8080/a?b=1 HTTP/1.1\r\nHost: example.com:8080\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n".bytes(),
+            written(copies)?.view(),
+        )?;
+    }
+    {
+        let client = proxied(Proxy.http("proxy.test", 3128))?;
+        script(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", 0, copies)?;
+        let response = match (await client.get("http://example.com")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes(), written(copies)?.view())?;
+    }
+    // A WebSocket needs the connection to itself: the proxy is asked for a tunnel, and the upgrade goes through it
+    // as to the origin. The proxy's answer comes in a read of its own, as it does when the origin has yet to speak.
+    {
+        let client = proxied(Proxy.http("proxy.test", 3128))?;
+        let established = "HTTP/1.1 200 Connection established\r\nVia: 1.1 proxy.test\r\n\r\n";
+        var server = Vector<u8>.create();
+        made(server.extend(established.bytes()))?;
+        switching(mut server, "")?;
+        serverFrame(mut server, 0x81, "through".bytes())?;
+        scriptBytes(client, server.view(), established.length, 0, copies)?;
+        let request = wsRequest("ws://example.com/chat")?;
+        var ws = await opened(client, request)?;
+        var into = Vector<u8>.create();
+        Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+        Check.equalBytes("through".bytes(), into.view())?;
+        let wire = written(copies)?;
+        let asked = "CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\nGET /chat HTTP/1.1\r\nHost: example.com\r\n";
+        Check.isTrue(wire.length > asked.length, "the tunnel and the upgrade")?;
+        Check.equalBytes(asked.bytes(), wire[0..asked.length])?;
+    }
+    // A proxy that wants credentials it was not given.
+    {
+        let client = proxied(Proxy.http("proxy.test", 3128))?;
+        script(client, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n", 0, copies)?;
+        let request = wsRequest("ws://example.com/chat")?;
+        let key = [0u8; 16];
+        match (await client.webSocketWithKey(request, WebSocketOptions.defaults(), key[..])) {
+            Ok(_) => { return Check.fail("no tunnel was made"); }
+            Err(e) => {
+                match (e) {
+                    HttpError.Proxy(status) => { Check.equalU64(407, status as u64)?; }
+                    _ => { return Err(failed(e)); }
+                }
+            }
+        }
+    }
+    return Ok();
+}

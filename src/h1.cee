@@ -479,13 +479,21 @@ public fn writeRequestHead(
     extra: Slice<u8>,
     length: u64?,
     coded: bool,
+    absolute: bool,
 ) -> Result<void, AllocError> {
     let token = Methods.token(method).bytes();
     let target = parts.target(url);
     let authority = parts.authority(url);
     out.reserve(token.length + target.length + authority.length + fields.length + extra.length + 96)?;
     out.extend(token)?;
-    if (target.length == 0 || target[0] != '/') {
+    if (absolute) {
+        // To a proxy: the whole URL (RFC 9112 §3.2.2).
+        out.extend(if (parts.secure) " https://".bytes() else " http://".bytes())?;
+        out.extend(authority)?;
+        if (target.length == 0 || target[0] != '/') {
+            out.extend("/".bytes())?;
+        }
+    } else if (target.length == 0 || target[0] != '/') {
         out.extend(" /".bytes())?;
     } else {
         out.extend(" ".bytes())?;

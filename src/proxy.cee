@@ -17,6 +17,8 @@ public struct Proxy {
     port: u16;
     user: Vector<u8>;
     password: Vector<u8>;
+    /// Hosts reached directly, not through the proxy: names separated by commas, as `NO_PROXY` has them.
+    bypass: Vector<u8>;
 
     fn create(kind: ProxyKind, host: StringView, port: u16) -> Result<Proxy, HttpError> {
         var name = Vector<u8>.create();
@@ -27,9 +29,14 @@ public struct Proxy {
         if (host.length == 0 || port == 0) {
             return Err(HttpError.BadUrl);
         }
-        return Ok(
-            Proxy { kind: kind, host: name, port: port, user: Vector<u8>.create(), password: Vector<u8>.create() },
-        );
+        return Ok(Proxy {
+            kind: kind,
+            host: name,
+            port: port,
+            user: Vector<u8>.create(),
+            password: Vector<u8>.create(),
+            bypass: Vector<u8>.create(),
+        });
     }
 
     /// An HTTP proxy at `host:port`, reached without TLS.
@@ -52,6 +59,156 @@ public struct Proxy {
             Err(_) => { return Err(HttpErrors.noMemory()); }
         }
         return Ok(me);
+    }
+
+    /// The same proxy, which is not used for the hosts in `list`: names separated by commas, as in `NO_PROXY`. A
+    /// name stands for itself and everything under it (`example.com` for `api.example.com` too); `*` for every host.
+    public fn withBypass(this, list: StringView) -> Result<Proxy, HttpError> {
+        var me = this;
+        me.bypass.clear();
+        match (me.bypass.extend(list.bytes())) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        return Ok(me);
+    }
+
+    /// A proxy from its URL: `http://host:port`, `socks5://host:port` (or `socks5h://`), with `user:password@`
+    /// before the host if it wants them. Without a port: 80 for http, 1080 for SOCKS5. A host alone is an HTTP
+    /// proxy.
+    public fn parse(text: StringView) -> Result<Proxy, HttpError> {
+        var rest = text.bytes().trim();
+        var kind = ProxyKind.Http;
+        var port: u32 = 80;
+        match (rest.indexOf("://".bytes())) {
+            Some(i) => {
+                let scheme = rest[0..i];
+                if (scheme.equalsIgnoreAsciiCase("socks5".bytes()) || scheme.equalsIgnoreAsciiCase("socks5h".bytes())) {
+                    kind = ProxyKind.Socks5;
+                    port = 1080;
+                } else if (!scheme.equalsIgnoreAsciiCase("http".bytes())) {
+                    return Err(HttpError.BadUrl);
+                }
+                rest = rest[i + 3..];
+            }
+            null => {}
+        }
+        match (rest.indexOfByte('/')) {
+            Some(i) => { rest = rest[0..i]; }
+            null => {}
+        }
+        var user = rest[0..0];
+        var password = rest[0..0];
+        match (rest.lastIndexOf("@".bytes())) {
+            Some(i) => {
+                let login = rest[0..i];
+                rest = rest[i + 1..];
+                match (login.indexOfByte(':')) {
+                    Some(c) => {
+                        user = login[0..c];
+                        password = login[c + 1..];
+                    }
+                    null => { user = login; }
+                }
+            }
+            null => {}
+        }
+        var host = rest;
+        // A port after the last colon, unless that colon is inside an IPv6 literal's brackets.
+        match (rest.lastIndexOf(":".bytes())) {
+            Some(c) => {
+                let bracket = rest.lastIndexOf("]".bytes());
+                let outside = match (bracket) {
+                    Some(b) => b < c,
+                    null => rest.indexOfByte('[') == null,
+                };
+                if (outside) {
+                    port = rest[c + 1..].parseInt<u32>() ?? 0;
+                    host = rest[0..c];
+                }
+            }
+            null => {}
+        }
+        if (host.length >= 2 && host[0] == '[' && host[host.length - 1] == ']') {
+            host = host[1..host.length - 1];
+        }
+        if (port == 0 || port > 65535) {
+            return Err(HttpError.BadUrl);
+        }
+        let name = match (StringView.fromUtf8(host)) {
+            Some(h) => h,
+            null => { return Err(HttpError.BadUrl); },
+        };
+        var proxy = Proxy.create(kind, name, truncate<u16>(port))?;
+        let kept = proxy.user.extend(user);
+        let both = if (kept.isOk()) proxy.password.extend(password) else kept;
+        match (both) {
+            Ok() => {}
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+        return Ok(proxy);
+    }
+
+    /// The proxy the environment names, or null if it names none: `ALL_PROXY`, else `HTTPS_PROXY`, else
+    /// `HTTP_PROXY` (each also in lowercase, which is looked at first), with `NO_PROXY` as its bypass list. One
+    /// proxy serves both schemes here, so a different one for each is not followed.
+    public fn fromEnvironment() -> Result<Proxy?, HttpError> {
+        let names = ["all_proxy", "ALL_PROXY", "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"];
+        var found: StringView? = null;
+        for (i in 0..names.length) {
+            match (Environment.variable(names[i])) {
+                Some(v) => {
+                    if (found == null && v.length > 0) {
+                        found = Some(v);
+                    }
+                }
+                null => {}
+            }
+        }
+        let url = match (found) {
+            Some(u) => u,
+            null => { return Ok(null); },
+        };
+        let proxy = Proxy.parse(url)?;
+        let direct = match (Environment.variable("no_proxy")) {
+            Some(v) => v,
+            null => Environment.variable("NO_PROXY") ?? "",
+        };
+        return Ok(Some(proxy.withBypass(direct)?));
+    }
+
+    /// Whether connections to `host` go through the proxy: it is not on the bypass list.
+    fn covers(borrow this, host: Slice<u8>) -> bool {
+        let list = this.bypass.view();
+        var at: usize = 0;
+        while (at < list.length) {
+            var end = at;
+            while (end < list.length && list[end] != ',') {
+                end += 1;
+            }
+            var entry = list[at..end].trim();
+            at = end + 1;
+            if (entry.length == 1 && entry[0] == '*') {
+                return false;
+            }
+            // `.example.com` and `example.com:8080` are read as `example.com`.
+            if (entry.length > 0 && entry[0] == '.') {
+                entry = entry[1..];
+            }
+            match (entry.indexOfByte(':')) {
+                Some(c) => { entry = entry[0..c]; }
+                null => {}
+            }
+            if (entry.length == 0 || entry.length > host.length) {
+                continue;
+            }
+            let tail = host[host.length - entry.length..];
+            if (tail.equalsIgnoreAsciiCase(entry) &&
+                (entry.length == host.length || host[host.length - entry.length - 1] == '.')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /// Appends `Proxy-Authorization: Basic ...\r\n` to `out`, if the proxy has credentials.

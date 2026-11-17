@@ -224,8 +224,15 @@ public struct Client {
     }
 
     /// Whether requests to an `http` origin go to an HTTP proxy with their whole URL (and so over HTTP/1.1).
-    fn viaHttpProxy(borrow this, parts: borrow UrlParts) -> bool => match (borrow this.proxy) {
-        Some(p) => p.kind is ProxyKind.Http && !parts.secure,
+    fn viaHttpProxy(borrow this, url: Slice<u8>, parts: borrow UrlParts) -> bool => match (borrow this.proxy) {
+        Some(p) => p.kind is ProxyKind.Http && !parts.secure && p.covers(parts.host(url)),
+        null => false,
+    };
+
+    /// Whether connections to `host` go through the client's proxy: it has one, and the host is not on its list of
+    /// those to reach directly.
+    fn proxyCovers(borrow this, host: Slice<u8>) -> bool => match (borrow this.proxy) {
+        Some(p) => p.covers(host),
         null => false,
     };
 
@@ -354,7 +361,7 @@ public struct Client {
         let all = guard.data();
         let o = borrow all.list[origin];
         let now = Timer.now();
-        if (now < o.h3BadUntil || this.proxy != null) {
+        if (now < o.h3BadUntil || this.proxyCovers(o.host.view())) {
             return null; // it failed lately, or a proxy is in the way: QUIC does not go through one
         }
         if (o.h3Port != 0 && now < o.h3Until) {
@@ -1210,6 +1217,7 @@ async fn roundTrip<region c>(
     // HTTP/2 is possible when the client has sessions and the origin may speak it: https (by ALPN), or http by
     // prior knowledge.
     let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge) && !client.viaHttpProxy(
+        url,
         parts,
     );
     // A buffered response may come compressed when the client is to decompress it, unless the request says itself
@@ -1234,7 +1242,7 @@ async fn roundTrip<region c>(
         }
     }
     // To an HTTP proxy an `http` request goes with its whole URL, and the proxy's credentials.
-    let absolute = client.viaHttpProxy(parts);
+    let absolute = client.viaHttpProxy(url, parts);
     if (absolute) {
         match (borrow client.proxy) {
             Some(p) => {
@@ -1661,13 +1669,16 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts, tunnel: bo
     // Where the TCP connection goes: the origin, or the proxy.
     var toHost = host;
     var toPort = parts.port;
+    let through = client.proxyCovers(parts.host(url));
     match (borrow client.proxy) {
         Some(p) => {
-            toHost = match (StringView.fromUtf8(p.host.view())) {
-                Some(h) => h,
-                null => { return Err(HttpError.BadUrl); },
-            };
-            toPort = p.port;
+            if (through) {
+                toHost = match (StringView.fromUtf8(p.host.view())) {
+                    Some(h) => h,
+                    null => { return Err(HttpError.BadUrl); },
+                };
+                toPort = p.port;
+            }
         }
         null => {}
     }
@@ -1709,7 +1720,9 @@ async fn dial(client: borrow Client, url: Slice<u8>, parts: UrlParts, tunnel: bo
         Some(p) => {
             let limit = options.connectMs;
             var asked: Result<void, HttpError> = Ok();
-            if (p.kind is ProxyKind.Socks5) {
+            if (!through) {
+                // The host is one to reach directly.
+            } else if (p.kind is ProxyKind.Socks5) {
                 asked = if (limit == 0) await socksConnect(
                     mut stream,
                     p,
@@ -2276,6 +2289,7 @@ async fn beginUpload<region c>(
     }
     let options = borrow client.options;
     let mayH2 = client.sessions.length > 0 && (parts.secure || options.http2PriorKnowledge) && !client.viaHttpProxy(
+        url,
         parts,
     );
     let coded = options.decompress && !namesField(fields, "accept-encoding".bytes());
@@ -2292,7 +2306,7 @@ async fn beginUpload<region c>(
     if (ready.isOk() && length == null) {
         ready = line.extend("Transfer-Encoding: chunked\r\n".bytes()); // only HTTP/1.1 reads `line`
     }
-    let absolute = client.viaHttpProxy(parts);
+    let absolute = client.viaHttpProxy(url, parts);
     if (ready.isOk() && absolute) {
         match (borrow client.proxy) {
             Some(p) => { ready = p.authorization(mut line); }

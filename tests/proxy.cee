@@ -165,3 +165,58 @@ async fn throughAnHttpProxy() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+fn parsed(text: StringView) -> Result<Proxy, TestFailure> {
+    return match (Proxy.parse(text)) {
+        Ok(p) => Ok(p),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+@test
+async fn proxiesFromUrlsAndHostsReachedDirectly() -> Result<void, TestFailure> {
+    let a = parsed("http://user:pa@ss@proxy.test:3128/")?;
+    Check.isTrue(a.kind is ProxyKind.Http && a.port == 3128, "an HTTP proxy and its port")?;
+    Check.equalBytes("proxy.test".bytes(), a.host.view())?;
+    Check.equalBytes("user".bytes(), a.user.view())?;
+    Check.equalBytes("pa@ss".bytes(), a.password.view())?;
+    let b = parsed(" SOCKS5h://[::1]:1081 ")?;
+    Check.isTrue(b.kind is ProxyKind.Socks5 && b.port == 1081 && b.user.length == 0, "SOCKS5 at an IPv6 address")?;
+    Check.equalBytes("::1".bytes(), b.host.view())?;
+    let c = parsed("proxy.test")?;
+    Check.isTrue(c.kind is ProxyKind.Http && c.port == 80, "a host alone")?;
+    let d = parsed("socks5://[2001:db8::1]")?;
+    Check.isTrue(d.port == 1080, "SOCKS5's own port")?;
+    Check.equalBytes("2001:db8::1".bytes(), d.host.view())?;
+    Check.isTrue(Proxy.parse("ftp://proxy.test").isErr(), "another scheme")?;
+    Check.isTrue(Proxy.parse("http://proxy.test:0").isErr() && Proxy.parse("http://proxy.test:99999").isErr(), "no such port")?;
+    Check.isTrue(Proxy.parse("http://:3128").isErr(), "no host")?;
+    Check.isTrue(Proxy.fromEnvironment().isOk(), "whatever the environment says, it is read")?;
+    // The list of hosts reached directly.
+    let listed = match (parsed("http://proxy.test:3128")?.withBypass("localhost, .internal.example ,Example.ORG:8080,,")) {
+        Ok(p) => p,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue(!listed.covers("localhost".bytes()), "a name on the list")?;
+    Check.isTrue(!listed.covers("api.internal.example".bytes()) && !listed.covers("internal.example".bytes()), "under a name")?;
+    Check.isTrue(listed.covers("notinternal.example".bytes()), "only whole labels")?;
+    Check.isTrue(!listed.covers("example.org".bytes()), "any case, a port ignored")?;
+    Check.isTrue(listed.covers("example.com".bytes()) && listed.covers("org".bytes()), "not on the list")?;
+    let never = match (parsed("http://proxy.test:3128")?.withBypass("*")) {
+        Ok(p) => p,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue(!never.covers("example.com".bytes()), "every host directly")?;
+    Check.isTrue(parsed("http://proxy.test:3128")?.covers("example.com".bytes()), "no list")?;
+    // Through the client: a listed host gets the request as an origin does, another gets the whole URL.
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = proxied(parsed("http://proxy.test:3128")?.withBypass("example.com"))?;
+    let answer = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    script(client, answer, 0, copies)?;
+    Check.equalU64(1000, await refusal(client, "http://www.example.com/a"))?;
+    Check.equalBytes("GET /a HTTP/1.1\r\nHost: www.example.com\r\n\r\n".bytes(), written(copies)?.view())?;
+    script(client, answer, 0, copies)?;
+    Check.equalU64(1000, await refusal(client, "http://other.test/a"))?;
+    Check.equalBytes("GET http://other.test/a HTTP/1.1\r\nHost: other.test\r\n\r\n".bytes(), written(copies)?.view())?;
+    return Ok();
+}

@@ -212,11 +212,11 @@ not the same measurement.
   first is used. A first address that fails outright ends its head start at once.
 - **HTTP/3**, through the [cosmohttp3](cosmohttp3) package (`Client.withHttp3(options, tls, transport)` with its
   `Http3Pool`): this package has no QUIC in it, only the place where a transport plugs in (`Http3Transport`). A
-  buffered request to an `https` origin that advertised HTTP/3 (`Alt-Svc`) goes over it, or every one with
+  request to an `https` origin that advertised HTTP/3 (`Alt-Svc`) goes over it, or every one with
   `http3PriorKnowledge`; `response.isHttp3()` says so. It sits below redirects, retries, the cache, cookies and
   decompression, which work the same. If HTTP/3 fails for an origin, the request goes over TCP (unless the server
   may have acted on it and it is not safe to repeat) and the origin stays on TCP for `http3RetryMs` (5 minutes).
-  Streamed responses, uploads and WebSockets stay on TCP.
+  Streamed responses (`open`) go over it too; uploads and WebSockets stay on TCP.
 - **gRPC** (`grpcRequest(url)`, `grpcUnary(client, request, message)`, `grpcNext(response.body(), mut at)`,
   `grpcStatus(response)`, `grpcMessage(response, mut text)`; `GrpcReader` for a server that streams). Messages are
   bytes: encoding them is the caller's. Over HTTP/2 only; no compressed messages; no call where both sides stream at
@@ -263,8 +263,8 @@ not the same measurement.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 for streamed responses and uploads (buffered requests have it, through
-[cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
+Of CosmoHttpClient's surface: HTTP/3 for uploads (requests with a body in hand and their responses, buffered or
+streamed, have it, through [cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; a proxy reached over TLS, and proxy settings from the environment; TLS session resumption; a DNS cache.  In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
 in flight with `maxPerOrigin`).

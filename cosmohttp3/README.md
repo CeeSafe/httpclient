@@ -58,7 +58,7 @@ await conn.close();
 
 ## What is not here yet
 
-Through the client, only buffered requests go over HTTP/3. No 0-RTT or session resumption, no connection
+Through the client, uploads written piece by piece and WebSockets do not go over HTTP/3. No 0-RTT or session resumption, no connection
 migration, no keep-alive of idle connections, no server push (never allowed), no request bodies written piece by
 piece. A name's addresses are tried one after another, not raced. When every place in the pool is taken by servers
 with requests in flight, a request for another server goes over TCP. The request body is copied once into the

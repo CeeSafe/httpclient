@@ -382,6 +382,50 @@ public struct H3Connection {
         }
     }
 
+    /// One request, and its response's head into `answer`: the slot its body is then read from (`read`), held until
+    /// `release`. For a client that speaks HTTP/3 through a pool.
+    async fn openInto(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<usize, Http3Failure> {
+        let slot = match (this.reserve(method, url, parts, fields, body, false, 0xFFFFFFFFFFFFFFFF)) {
+            Ok(s) => s,
+            Err(e) => { return Err(Http3Failure { error: e, unsent: true }); },
+        };
+        let done = if (responseMs == 0) await this.progress(slot, WANT_HEAD) else await Async.timeout(
+            responseMs,
+            HttpError.Net(NetError.TimedOut),
+            async () => await this.progress(slot, WANT_HEAD),
+        );
+        match (done) {
+            Ok() => {
+                let taken = this.take(slot, mut answer.head, mut answer.spans, mut answer.body);
+                answer.status = taken.status;
+                answer.trailers = taken.trailers;
+                return Ok(slot);
+            }
+            Err(e) => {
+                let failure = Http3Failure { error: e, unsent: this.wasRefused(slot) };
+                this.giveBack(slot);
+                return Err(failure);
+            }
+        }
+    }
+
+    /// Gives back a slot whose response keeps the buffers it took.
+    fn giveBack(borrow this, slot: usize) {
+        var head = Vector<u8>.create();
+        var spans = Vector<HeaderSpan>.create();
+        var data = Vector<u8>.create();
+        this.release(slot, mut head, mut spans, mut data);
+    }
+
     /// One request and its whole response into `answer`, for a client that speaks HTTP/3 through a pool
     /// (cosmohttp's `Http3Transport`).
     async fn fetch(

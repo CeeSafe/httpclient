@@ -18,6 +18,7 @@ arm64 unless an entry says otherwise.
 | F9 | a `bool` field read inside a returned struct literal is taken as a loan (N0245) | CeeSafe | open |
 | F10 | no practical way to keep a hook (callback) in a long-lived struct used from async code | CeeSafe (ergonomics, not a bug) | open; needs a design answer |
 | F11 | gcc 13 warns `free` called on `ceesafe_vec_empty` in generated C (`-Wfree-nonheap-object`) | CeeSafe (build noise, no runtime fault) | open |
+| F12 | `ceesafec fmt` never wraps an interface method's signature, and wraps its `@effects(...)` instead | CeeSafe (formatter) | open |
 
 The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
@@ -302,6 +303,28 @@ goes with it. The tests and both sweeps pass on that build.
 
 **What would help:** a drop that tests the pointer against the sentinel (which gcc can follow), or the warning
 switched off for generated code on gcc, so a user's build is quiet.
+
+## F12. The formatter does not wrap an interface method's signature
+
+**Kind:** formatter. **Found:** 2026-11-17, ceesafec 0.61.0. **Not reduced** (the file is small: `src/alt.cee`).
+
+A method declared in an `interface` with many parameters is put on one line however long it is (here 230
+columns), where the same signature on a function or in an `impl` is wrapped one parameter to a line. A trailing
+comma written by hand stays, giving `answer: borrow mut Http3Answer,) -> ...`. With an attribute before it, the
+attribute's argument list is what gets broken:
+
+```ceesafe
+public interface Http3Transport {
+    async fn fetch(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, maxBodyBytes: u64, answer: borrow mut Http3Answer,) -> Result<void, Http3Failure>;
+
+    @effects(
+        alloc,
+    ) fn trailers(borrow this, stream: u64, head: borrow mut Vector<u8>, spans: borrow mut Vector<HeaderSpan>) -> Result<usize, AllocError>;
+}
+```
+
+`ceesafec fmt --check` accepts its own output, so nothing fails; the lines are just not in the style the rest of
+the file is in.
 
 ## F2. Withdrawn: diagnostics were not printed twice
 

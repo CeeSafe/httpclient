@@ -97,21 +97,10 @@ public struct Http3Pool {
     }
 }
 
-fn unsent(e: HttpError) -> Http3Failure => Http3Failure { error: e, unsent: true };
-
-impl Http3Transport for Http3Pool {
-    async fn fetch(
-        borrow this,
-        method: Method,
-        url: Slice<u8>,
-        parts: UrlParts,
-        port: u16,
-        fields: Slice<u8>,
-        body: Slice<u8>,
-        responseMs: u64,
-        maxBodyBytes: u64,
-        answer: borrow mut Http3Answer,
-    ) -> Result<void, Http3Failure> {
+impl Http3Pool {
+    /// The place of a connection to the URL's host at UDP `port`: one in use, or a new one whose handshake is
+    /// done.
+    async fn acquire(borrow this, url: Slice<u8>, parts: UrlParts, port: u16) -> Result<usize, Http3Failure> {
         let host = match (StringView.fromUtf8(parts.host(url))) {
             Some(h) => h,
             null => { return Err(unsent(HttpError.BadUrl)); },
@@ -181,7 +170,65 @@ impl Http3Transport for Http3Pool {
                 return Err(unsent(failure));
             }
         }
-        let i = index!;
+        return Ok(index!);
+    }
+}
+
+fn unsent(e: HttpError) -> Http3Failure => Http3Failure { error: e, unsent: true };
+
+impl Http3Transport for Http3Pool {
+    async fn fetch(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        maxBodyBytes: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, Http3Failure> {
+        let i = await this.acquire(url, parts, port)?;
         return await this.conns[i].fetch(method, url, parts, fields, body, responseMs, maxBodyBytes, mut answer);
+    }
+
+    async fn open(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure> {
+        let i = await this.acquire(url, parts, port)?;
+        let slot = await this.conns[i].openInto(method, url, parts, fields, body, responseMs, mut answer)?;
+        // The stream's name: its connection's place, and its slot there.
+        return Ok(((i as u64) << 32) | slot as u64);
+    }
+
+    async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError> =>
+        await this.conns[truncate<usize>(stream >> 32)].read(truncate<usize>(stream & 0xFFFFFFFF), buffer);
+
+    fn trailers(
+        borrow this,
+        stream: u64,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+    ) -> Result<usize, AllocError> =>
+        this.conns[truncate<usize>(stream >> 32)].takeTrailers(
+            truncate<usize>(stream & 0xFFFFFFFF),
+            mut head,
+            mut spans,
+        );
+
+    fn isComplete(borrow this, stream: u64) -> bool =>
+        this.conns[truncate<usize>(stream >> 32)].isComplete(truncate<usize>(stream & 0xFFFFFFFF));
+
+    fn release(borrow this, stream: u64) {
+        this.conns[truncate<usize>(stream >> 32)].giveBack(truncate<usize>(stream & 0xFFFFFFFF));
     }
 }

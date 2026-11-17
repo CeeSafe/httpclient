@@ -31,6 +31,8 @@ fn altSvcValues() -> Result<void, TestFailure> {
 /// A stand-in for HTTP/3: it answers by the URL's path, and can fail its first call.
 struct FakeH3 {
     calls: RefCell<u32>;
+    /// How many reads the streamed response has had; 100 once it was given back.
+    reads: RefCell<u32>;
     failFirst: bool;
     /// The first failure is one the server may have acted on.
     sent: bool;
@@ -93,6 +95,66 @@ impl Http3Transport for FakeH3 {
             Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
         };
     }
+
+    /// A streamed response: `streamed`, in two reads, with a trailer; its stream is number 7.
+    async fn open(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure> {
+        answer.status = 200;
+        match (field(mut answer, ":status", "200")) {
+            Ok() => {}
+            Err(_) => { return Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }); }
+        }
+        var guard = this.reads.write();
+        let n = guard.data();
+        *n = 0;
+        return Ok(7);
+    }
+
+    async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
+        if (stream != 7) {
+            return Err(HttpError.Closed);
+        }
+        var guard = this.reads.write();
+        let n = guard.data();
+        *n += 1;
+        let piece = if (*n == 1) "stre" else if (*n == 2) "amed" else "";
+        buffer[0..piece.length].copyFrom(piece.bytes());
+        return Ok(piece.length);
+    }
+
+    fn trailers(
+        borrow this,
+        stream: u64,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+    ) -> Result<usize, AllocError> {
+        let nameStart = head.length;
+        head.extend("x-end".bytes())?;
+        let nameEnd = head.length;
+        head.extend("yes".bytes())?;
+        spans.push(HeaderSpan { nameStart: nameStart, nameEnd: nameEnd, valueStart: nameEnd, valueEnd: head.length })?;
+        return Ok(1);
+    }
+
+    fn isComplete(borrow this, stream: u64) -> bool {
+        let guard = this.reads.read();
+        return *guard.data() >= 3;
+    }
+
+    fn release(borrow this, stream: u64) {
+        var guard = this.reads.write();
+        let n = guard.data();
+        *n = 100; // given back
+    }
 }
 
 fn withFake(options: ClientOptions, failFirst: bool, sent: bool) -> Result<Client, TestFailure> {
@@ -101,7 +163,7 @@ fn withFake(options: ClientOptions, failFirst: bool, sent: bool) -> Result<Clien
         Err(_) => { return Err(TestFailure.create("the TLS configuration")); },
     };
     let fake: Box<dyn Http3Transport> =
-        made(Box.create(FakeH3 { calls: RefCell<u32>.create(0), failFirst: failFirst, sent: sent }))?;
+        made(Box.create(FakeH3 { calls: RefCell<u32>.create(0), reads: RefCell<u32>.create(0), failFirst: failFirst, sent: sent }))?;
     return Ok(Client.withHttp3(options, tls, fake));
 }
 
@@ -141,7 +203,36 @@ async fn requestsGoOverTheGivenTransport() -> Result<void, TestFailure> {
     let stats = client.stats();
     Check.equalU64(6, stats.overHttp3)?;
     Check.equalU64(0, stats.connections)?;
-    // Only https, and only buffered responses: an http URL goes to a connection (here there is none to dial).
+    // A streamed response: read through the transport, its trailers at the end.
+    {
+        let request = match (Request.create(Method.Get, "https://example.com:444/stream")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var response = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.isHttp3() && !response.isComplete(), "streamed over HTTP/3")?;
+        Check.equalU64(0, response.body().length as u64)?;
+        var got = Vector<u8>.create();
+        var piece = [0u8; 16];
+        loop {
+            let n = match (await response.read(mut piece[..])) {
+                Ok(n) => n,
+                Err(e) => { return Err(failed(e)); },
+            };
+            if (n == 0) {
+                break;
+            }
+            made(got.extend(piece[0..n]))?;
+        }
+        Check.equalBytes("streamed".bytes(), got.view())?;
+        Check.isTrue(response.isComplete(), "read to its end")?;
+        Check.equalBytes("yes".bytes(), response.trailer("x-end") ?? "".bytes())?;
+        Check.equalU64(0, response.headerCount() as u64)?;
+    }
+    // Only https: an http URL goes to a connection (here there is none to dial).
     let copies = made(Channel<u8>.create(4096))?;
     script(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 0, copies)?;
     let response = match (await client.get("http://example.com/plain")) {

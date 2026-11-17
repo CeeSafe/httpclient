@@ -38,6 +38,49 @@ async fn throughTheClient(client: borrow Client, port: u16, silent: u16) -> Resu
     })?;
     let stats = client.stats();
     Check.equalU64(10, stats.overHttp3)?; // each redirect is two
+    // A streamed response, three megabytes read through the client; then one dropped half read.
+    {
+        let url = urlFor(port, "/big")?;
+        let request = match (Request.create(Method.Get, url.view())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var response = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.isHttp3() && !response.isComplete(), "streamed over HTTP/3")?;
+        var piece = [0u8; 20000];
+        var total: usize = 0;
+        var good = true;
+        loop {
+            let n = match (await response.read(mut piece[..])) {
+                Ok(n) => n,
+                Err(e) => { return Err(failed(e)); },
+            };
+            if (n == 0) {
+                break;
+            }
+            for (i in 0..n) {
+                if (piece[i] != pattern(total + i)) {
+                    good = false;
+                }
+            }
+            total += n;
+        }
+        Check.equalU64(3145728, total as u64)?;
+        Check.isTrue(good && response.isComplete(), "the streamed body, to its end")?;
+        var half = match (await client.open(request, "".bytes())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        let n = match (await half.read(mut piece[..])) {
+            Ok(n) => n,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(n > 0, "some of it")?;
+    }
+    await fetched(client, port, "/hello", 200, "hello over h3")?;
     Check.equalU64(0, stats.connections)?; // no TCP connection was opened
     // A server that does not answer on UDP: found out within the handshake's time, then TCP is tried (nothing
     // listens there either), and the origin is left alone.

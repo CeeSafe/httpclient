@@ -30,11 +30,30 @@ public struct Http3Failure {
     public unsent: bool;
 }
 
-/// Carries a request over HTTP/3.
+/// Carries a request over HTTP/3. The methods that are not async are called where a task may not wait (a response
+/// being dropped): they may allocate, and nothing more.
 public interface Http3Transport {
     /// Sends the request to the URL's host at UDP port `port` and reads the whole response into `answer`. `fields`
     /// are lines, `name: value\r\n` each; `responseMs` (0: no limit) and `maxBodyBytes` are the client's limits.
     async fn fetch(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, maxBodyBytes: u64, answer: borrow mut Http3Answer,) -> Result<void, Http3Failure>;
+
+    /// Sends the request and reads the response's head into `answer` (its status and fields; no body): a name for
+    /// the response's stream, with which its body is `read`. The stream is held until `release`.
+    async fn open(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, answer: borrow mut Http3Answer) -> Result<u64, Http3Failure>;
+
+    /// The next bytes of the body of `stream` into `buffer`: at least one, or 0 at its end.
+    async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError>;
+
+    /// After `read` gave 0: appends the trailers of `stream` to `head` and `spans`; how many.
+    @effects(
+        alloc,
+    ) fn trailers(borrow this, stream: u64, head: borrow mut Vector<u8>, spans: borrow mut Vector<HeaderSpan>) -> Result<usize, AllocError>;
+
+    /// Whether the body of `stream` has been read to its end.
+    @effects() fn isComplete(borrow this, stream: u64) -> bool;
+
+    /// Gives `stream` up; if its body was not read to the end, the request is cancelled.
+    @effects(alloc) fn release(borrow this, stream: u64);
 }
 
 /// What an `Alt-Svc` value says about HTTP/3 on the same host.

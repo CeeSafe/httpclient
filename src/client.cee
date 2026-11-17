@@ -913,6 +913,8 @@ fn storedResponse<region c>(client: borrow(c) Client, entry: borrow CacheEntry) 
         permit: Permit { slot: null },
         viaH2: false,
         viaH3: false,
+        h3Stream: 0,
+        h3Open: false,
         session: 0,
         slot: 0,
         generation: 0,
@@ -1245,7 +1247,7 @@ async fn roundTrip<region c>(
         }
     }
     // HTTP/3 first, for a buffered request to an origin that speaks it; any other way if that fails.
-    if (buffered && parts.secure) {
+    if (parts.secure) {
         match (borrow client.http3) {
             Some(transport) => {
                 match (client.http3Port(origin, parts.port)) {
@@ -1263,17 +1265,35 @@ async fn roundTrip<region c>(
                             Err(_) => { return Err(HttpErrors.noMemory()); }
                         }
                         var answer = Http3Answer.create();
-                        let went = await transport.fetch(
-                            method,
-                            url,
-                            parts,
-                            port,
-                            lines.view(),
-                            body,
-                            options.responseMs,
-                            options.maxBodyBytes,
-                            mut answer,
-                        );
+                        var stream: u64 = 0;
+                        var went: Result<void, Http3Failure> = Ok();
+                        if (buffered) {
+                            went = await transport.fetch(
+                                method,
+                                url,
+                                parts,
+                                port,
+                                lines.view(),
+                                body,
+                                options.responseMs,
+                                options.maxBodyBytes,
+                                mut answer,
+                            );
+                        } else {
+                            match (await transport.open(
+                                method,
+                                url,
+                                parts,
+                                port,
+                                lines.view(),
+                                body,
+                                options.responseMs,
+                                mut answer,
+                            )) {
+                                Ok(name) => { stream = name; }
+                                Err(f) => { went = Err(f); }
+                            }
+                        }
                         match (went) {
                             Ok() => {
                                 let filled = answer.body.length;
@@ -1284,6 +1304,8 @@ async fn roundTrip<region c>(
                                     permit: permit,
                                     viaH2: false,
                                     viaH3: true,
+                                    h3Stream: 0,
+                                    h3Open: false,
                                     session: 0,
                                     slot: 0,
                                     generation: 0,
@@ -1292,11 +1314,13 @@ async fn roundTrip<region c>(
                                     spans: answer.spans,
                                     data: answer.body,
                                     filled: filled,
-                                    streamed: false,
+                                    streamed: !buffered,
                                     decoded: false,
                                     cached: false,
                                     trailers: answer.trailers,
                                 };
+                                response.h3Stream = stream;
+                                response.h3Open = !buffered;
                                 {
                                     var guard = client.counters.write();
                                     let c = guard.data();
@@ -1306,7 +1330,7 @@ async fn roundTrip<region c>(
                                 if (options.cookies) {
                                     client.keepCookies(response, url, parts);
                                 }
-                                if (options.decompress) {
+                                if (options.decompress && buffered) {
                                     response.decode()?;
                                 }
                                 return Ok(response);
@@ -1364,6 +1388,8 @@ async fn roundTrip<region c>(
                     permit: permit,
                     viaH2: true,
                     viaH3: false,
+                    h3Stream: 0,
+                    h3Open: false,
                     session: at.session,
                     slot: at.slot,
                     generation: 0,
@@ -1440,6 +1466,8 @@ async fn roundTrip<region c>(
                             permit: permit,
                             viaH2: false,
                             viaH3: false,
+                            h3Stream: 0,
+                            h3Open: false,
                             session: 0,
                             slot: 0,
                             generation: 0,
@@ -1754,6 +1782,9 @@ public struct Response<region c> {
     private permit: Permit;
     private viaH2: bool;
     private viaH3: bool;
+    /// A streamed response over HTTP/3: its stream with the client's transport, until it is given back.
+    private h3Stream: u64;
+    private h3Open: bool;
     private session: usize;
     private slot: usize;
     private generation: u64;
@@ -1904,6 +1935,24 @@ public struct Response<region c> {
             Some(c) => { return await c.readSome(buffer); }
             null => {}
         }
+        if (this.h3Open) {
+            let n = match (borrow this.client.http3) {
+                Some(transport) => await transport.read(this.h3Stream, buffer)?,
+                null => 0,
+            };
+            if (n == 0 && this.trailers == 0) {
+                match (borrow this.client.http3) {
+                    Some(transport) => {
+                        match (transport.trailers(this.h3Stream, mut this.head, mut this.spans)) {
+                            Ok(count) => { this.trailers = count; }
+                            Err(_) => { return Err(HttpErrors.noMemory()); }
+                        }
+                    }
+                    null => {}
+                }
+            }
+            return Ok(n);
+        }
         if (!this.viaH2 || !this.streamed) {
             return Ok(0);
         }
@@ -1950,6 +1999,12 @@ public struct Response<region c> {
             Some(c) => { return c.complete; }
             null => {}
         }
+        if (this.h3Open) {
+            return match (borrow this.client.http3) {
+                Some(transport) => transport.isComplete(this.h3Stream),
+                null => true,
+            };
+        }
         if (!this.viaH2 || !this.streamed) {
             return true;
         }
@@ -1971,6 +2026,12 @@ public struct Response<region c> {
                 }
             }
             null => {}
+        }
+        if (this.h3Open) {
+            match (borrow this.client.http3) {
+                Some(transport) => { transport.release(this.h3Stream); }
+                null => {}
+            }
         }
         if (this.viaH2) {
             this.client.sessions[this.session].release(
@@ -2305,6 +2366,8 @@ async fn beginUpload<region c>(
             permit: permit,
             viaH2: viaH2,
             viaH3: false,
+            h3Stream: 0,
+            h3Open: false,
             session: session,
             slot: slot,
             generation: generation,

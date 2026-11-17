@@ -1,0 +1,104 @@
+// The compressor: what it writes is checked against RFC 7692's example, and by decoding it with the inflater, which
+// has its own tests against zlib's output.
+import encoding;
+
+fn deflated(z: borrow mut Deflater, input: Slice<u8>) -> Result<Vector<u8>, TestFailure> {
+    var out = Vector<u8>.create();
+    match (z.message(input, mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("out of memory")); }
+    }
+    return Ok(out);
+}
+
+/// `input` compressed as a message, then read back as a reader of permessage-deflate does: its size compressed.
+fn readBack(z: borrow mut Deflater, input: Slice<u8>) -> Result<usize, TestFailure> {
+    var packed = deflated(mut z, input)?;
+    let size = packed.length;
+    let tail = [0u8, 0, 0xFF, 0xFF, 1, 0, 0, 0xFF, 0xFF];
+    if (packed.extend(tail[..]).isErr()) {
+        return Err(TestFailure.create("out of memory"));
+    }
+    var inflater = Inflater.create();
+    var back = Vector<u8>.create();
+    match (inflater.inflateRaw(packed.view(), mut back, 0x7FFFFFFF)) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("what was compressed does not decode")); }
+    }
+    Check.equalBytes(input, back.view())?;
+    return Ok(size);
+}
+
+@test
+fn deflateOfTheRfcExample() -> Result<void, TestFailure> {
+    var z = match (Deflater.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    // RFC 7692 §7.2.3.1: "Hello" in one block with the fixed codes, not the last.
+    let hello = deflated(mut z, "Hello".bytes())?;
+    var expected = Vector<u8>.create();
+    Check.isTrue(Hex.decode("f248cdc9c90700".bytes(), mut expected).isOk(), "the example's hex")?;
+    Check.equalBytes(expected.view(), hello.view())?;
+    // Nothing: the block's three bits, its end, and the stored block's three, in two bytes.
+    let nothing = deflated(mut z, "".bytes())?;
+    Check.equalBytes([2u8, 0][..], nothing.view())?;
+    // Five bytes four times: five literals and one match of 15 at distance 5. By hand from RFC 1951 §3.2.5 and
+    // §3.2.6: after the block's bits (0, then 01) and the literals as above, the length is code 267 (15 or 16:
+    // 0001011, extra bit 0) and the distance code 4 (5 or 6: 00100, extra bit 0); then the end of the block
+    // (0000000) and the stored block's three bits. 67 bits; packed from each byte's low bit, the codes from their
+    // top bit, the sixth byte holds the last three bits of `o` (111) and 00010, the seventh 11, 0, 00100.
+    let again = deflated(mut z, "HelloHelloHelloHello".bytes())?;
+    expected.clear();
+    Check.isTrue(Hex.decode("f248cdc9c947230000".bytes(), mut expected).isOk(), "the hex")?;
+    Check.equalBytes(expected.view(), again.view())?;
+    return Ok();
+}
+
+@test
+fn deflateReadsBack() -> Result<void, TestFailure> {
+    var z = match (Deflater.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("out of memory")); },
+    };
+    Check.equalU64(2, readBack(mut z, embed("data/empty.raw"))? as u64)?;
+    let _ = readBack(mut z, "a".bytes())?;
+    let _ = readBack(mut z, "ab".bytes())?;
+    let _ = readBack(mut z, "abc".bytes())?;
+    let _ = readBack(mut z, embed("data/hello.raw"))?;
+    let _ = readBack(mut z, embed("data/small.raw"))?;
+    let _ = readBack(mut z, embed("data/flags.raw"))?;
+    // Text compresses to less than half, a run of one byte to almost nothing, and noise grows by at most the ninth
+    // bit of the bytes from 144.
+    let text = readBack(mut z, embed("data/text.raw"))?;
+    Check.isTrue(text < 100000, "text, 200,000 bytes")?;
+    let run = readBack(mut z, embed("data/run.raw"))?;
+    Check.isTrue(run < 1500, "a run, 100,000 bytes")?;
+    let noise = readBack(mut z, embed("data/noise.raw"))?;
+    Check.isTrue(noise <= 65536 + 65536 / 8 + 2, "noise, 65,536 bytes")?;
+    let _ = readBack(mut z, embed("data/skew.raw"))?;
+    let _ = readBack(mut z, embed("data/stored.raw"))?;
+    // A message does not refer to the one before it: the same bytes again compress to the same size.
+    Check.equalU64(text as u64, readBack(mut z, embed("data/text.raw"))? as u64)?;
+    // Matches at every distance up to the window's, and one beyond it that cannot be used.
+    var far = Vector<u8>.create();
+    var seed: u32 = 12345;
+    for (i in 0..40000) {
+        seed = truncate<u32>((seed as u64 * 1103515245 + 12345) & 0x7FFFFFFF);
+        if (far.push(truncate<u8>(seed >> 16)).isErr()) {
+            return Err(TestFailure.create("out of memory"));
+        }
+    }
+    let once = far.length;
+    for (i in 0..once) {
+        let b = far[i];
+        if (far.push(b).isErr()) {
+            return Err(TestFailure.create("out of memory"));
+        }
+    }
+    let beyond = readBack(mut z, far.view())?;
+    Check.isTrue(beyond > 80000, "a repeat 40,000 back is out of reach")?;
+    let within = readBack(mut z, far[10000..50000])?;
+    Check.isTrue(within > 30000 && within < 46000, "a repeat 30,000 back is found")?;
+    return Ok();
+}

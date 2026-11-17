@@ -83,6 +83,8 @@ struct H2Stream {
     declared: u64;
     received: u64;
     maxBody: u64;
+    /// The request has not been ended: its body is still being sent, or was given up.
+    sendOpen: bool;
     /// What the peer may still take of the request's body.
     sendWindow: i64;
     /// Received bytes for which the peer has not been given room back.
@@ -114,6 +116,7 @@ struct H2Stream {
         declared: 0,
         received: 0,
         maxBody: 0,
+        sendOpen: false,
         sendWindow: 0,
         unacked: 0,
         waiting: false,
@@ -166,6 +169,8 @@ struct H2State {
     peerMaxFrame: usize;
     peerInitialWindow: i64;
     peerMaxStreams: usize;
+    /// The server takes extended CONNECT requests (SETTINGS_ENABLE_CONNECT_PROTOCOL, RFC 8441 §3).
+    peerConnect: bool;
     sendWindow: i64;
     unacked: u32;
     /// A DATA frame whose payload is arriving: its stream's slot (or none: discarded), the data and padding bytes
@@ -230,6 +235,7 @@ struct H2Session {
             peerMaxFrame: MAX_FRAME,
             peerInitialWindow: 65535,
             peerMaxStreams: 0xFFFFFFFF,
+            peerConnect: false,
             sendWindow: 65535,
             unacked: 0,
             dataSlot: NO_SLOT,
@@ -266,6 +272,14 @@ struct H2Session {
         let guard = this.state.read();
         let st = guard.data();
         return st.open && !st.broken && !st.draining && st.origin == origin;
+    }
+
+    /// Whether the session has a connection to `origin` whose server takes extended CONNECT requests: a WebSocket
+    /// may be a stream of it (RFC 8441).
+    fn tunnels(borrow this, origin: usize) -> bool {
+        let guard = this.state.read();
+        let st = guard.data();
+        return st.open && !st.broken && !st.draining && st.origin == origin && st.peerConnect;
     }
 
     /// Whether the connection has had no request for longer than `idleMs`.
@@ -325,6 +339,7 @@ struct H2Session {
         st.peerMaxFrame = MAX_FRAME;
         st.peerInitialWindow = 65535;
         st.peerMaxStreams = 0xFFFFFFFF;
+        st.peerConnect = false;
         st.sendWindow = 65535;
         st.unacked = 0;
         st.live = 0;
@@ -345,7 +360,8 @@ struct H2Session {
     }
 
     /// Opens a stream for a request and queues its HEADERS: the slot, or null if the connection cannot take one
-    /// more now (it is draining or broken, at its own limit or the server's).
+    /// more now (it is draining or broken, at its own limit or the server's). With `protocol` the request is an
+    /// extended CONNECT for it (RFC 8441 §4), whatever `method` is.
     fn open(
         borrow this,
         method: Method,
@@ -358,6 +374,7 @@ struct H2Session {
         maxBody: u64,
         coded: bool,
         extra: Slice<u8>,
+        protocol: Slice<u8>,
     ) -> Result<usize?, AllocError> {
         var guard = this.state.write();
         let st = guard.data();
@@ -382,6 +399,7 @@ struct H2Session {
             endStream,
             coded,
             st.peerMaxFrame,
+            protocol,
         )) {
             Ok() => {}
             Err(e) => {
@@ -409,11 +427,12 @@ struct H2Session {
         s.refused = false;
         s.answered = false;
         s.buffered = buffered;
-        s.headOnly = method is Method.Head;
+        s.headOnly = method is Method.Head && protocol.length == 0;
         s.hasDeclared = false;
         s.declared = 0;
         s.received = 0;
         s.maxBody = maxBody;
+        s.sendOpen = !endStream;
         s.sendWindow = window;
         s.unacked = 0;
         s.waiting = false;
@@ -464,6 +483,9 @@ struct H2Session {
                     }
                     st.sendWindow -= truncate<i64>(n);
                     st.streams[slot].sendWindow -= truncate<i64>(n);
+                    if (last) {
+                        st.streams[slot].sendOpen = false;
+                    }
                     at += n;
                     if (st.leading) {
                         this.outSignal.raise();
@@ -492,6 +514,7 @@ struct H2Session {
             Ok() => {}
             Err(_) => { return Err(HttpErrors.noMemory()); }
         }
+        st.streams[slot].sendOpen = false;
         if (st.leading) {
             this.outSignal.raise();
         }
@@ -1011,6 +1034,11 @@ struct H2Session {
                                 return Err(Fault.BadFrame);
                             }
                             st.peerMaxFrame = value as usize;
+                        } else if (setting == 8) {
+                            if (value > 1) {
+                                return Err(Fault.BadFrame);
+                            }
+                            st.peerConnect = value == 1;
                         }
                     }
                     grown(frameHeader(mut st.out, 0, FRAME_SETTINGS, FLAG_ACK, 0))?;
@@ -1319,7 +1347,9 @@ struct H2Session {
         return s.failed && (s.refused || (!s.answered && Methods.idempotent(method)));
     }
 
-    /// Gives a slot back, with the buffers its response held. A stream the server has not finished is reset.
+    /// Gives a slot back, with the buffers its response held. A stream the server has not finished is reset, and
+    /// so is one whose request was never ended (the server answered before the body's end, or a tunnel was given
+    /// up): to the server it would stay open otherwise (RFC 9113 §8.1).
     fn release(
         borrow this,
         slot: usize,
@@ -1334,14 +1364,16 @@ struct H2Session {
             return;
         }
         let id = st.streams[slot].id;
-        if (!st.streams[slot].ended) {
+        let unfinished = !st.streams[slot].ended;
+        let halfSent = st.streams[slot].sendOpen && !st.streams[slot].failed;
+        if (unfinished) {
             st.streams[slot].ended = true;
             st.live -= 1;
-            if (!st.broken) {
-                let queued = resetStream(mut st.out, id, 8); // CANCEL
-                if (st.leading) {
-                    this.outSignal.raise();
-                }
+        }
+        if ((unfinished || halfSent) && !st.broken) {
+            let queued = resetStream(mut st.out, id, 8); // CANCEL
+            if (st.leading) {
+                this.outSignal.raise();
             }
         }
         let s = borrow mut st.streams[slot];
@@ -1428,7 +1460,8 @@ fn resetStream(out: borrow mut Vector<u8>, stream: u32, code: u32) -> Result<voi
 
 /// Appends a request's HEADERS frame to `out` (and CONTINUATION frames, if its field block is longer than
 /// `maxFrame`): the pseudo-fields (RFC 9113 §8.3.1), the request's own `fields` (already HPACK), and
-/// `content-length`.
+/// `content-length`. With `protocol` it is an extended CONNECT for it: `:method` is CONNECT, and `:protocol` follows
+/// the other pseudo-fields (RFC 8441 §4).
 fn writeHeaders(
     out: borrow mut Vector<u8>,
     id: u32,
@@ -1441,14 +1474,19 @@ fn writeHeaders(
     endStream: bool,
     coded: bool,
     maxFrame: usize,
+    protocol: Slice<u8>,
 ) -> Result<void, AllocError> {
     let frame = out.length;
     frameHeader(mut out, 0, FRAME_HEADERS, 0, id)?;
     let block = out.length;
-    match (method) {
-        Method.Get => { out.push(0x82)?; }
-        Method.Post => { out.push(0x83)?; }
-        _ => { hpackLiteral(mut out, 2, "".bytes(), Methods.token(method).bytes(), false)?; }
+    if (protocol.length > 0) {
+        hpackLiteral(mut out, 2, "".bytes(), "CONNECT".bytes(), false)?;
+    } else {
+        match (method) {
+            Method.Get => { out.push(0x82)?; }
+            Method.Post => { out.push(0x83)?; }
+            _ => { hpackLiteral(mut out, 2, "".bytes(), Methods.token(method).bytes(), false)?; }
+        }
     }
     out.push(if (parts.secure) 0x87 else 0x86)?;
     hpackLiteral(mut out, 1, "".bytes(), parts.authority(url), false)?;
@@ -1465,6 +1503,9 @@ fn writeHeaders(
         out.extend(target)?;
     } else {
         hpackLiteral(mut out, 4, "".bytes(), target, false)?;
+    }
+    if (protocol.length > 0) {
+        hpackLiteral(mut out, 0, ":protocol".bytes(), protocol, false)?;
     }
     out.extend(fields)?;
     out.extend(extra)?;

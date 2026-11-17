@@ -1,4 +1,4 @@
-# httpclient CI: check, format and tests of both packages, natively and with ASan and UBSan, and the builds of the
+# httpclient CI: check, format and tests of the three packages, natively and with ASan and UBSan, and the builds of the
 # examples and the benchmark, on macOS and Linux. The allocation and cancellation sweeps are not run here: they take
 # thousands of runs each, and are run by hand before a release (README.md, "Working on it").
 name: ci
@@ -47,7 +47,7 @@ jobs:
       - name: Check and format
         run: |
           set -e
-          for p in . httpclient3 examples/get httpclient3/examples/get3 bench; do
+          for p in . httpclient3 httpclient_json examples/get httpclient3/examples/get3 bench; do
             echo "== $p"
             (cd "$p" && ceesafec fetch && git diff --exit-code -- ceesafe.lock && ceesafec check && ceesafec fmt --check)
           done
@@ -57,12 +57,14 @@ jobs:
           set -e
           ceesafec test
           (cd httpclient3 && ceesafec test)
+          (cd httpclient_json && ceesafec test)
 
       - name: Tests with ASan and UBSan
         run: |
           set -e
           ceesafec test --cflag -fsanitize=address,undefined
           (cd httpclient3 && ceesafec test --cflag -fsanitize=address,undefined)
+          (cd httpclient_json && ceesafec test --cflag -fsanitize=address,undefined)
 
       - name: Example and benchmark builds
         run: |

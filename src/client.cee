@@ -292,8 +292,11 @@ public struct Client {
 
     /// Opens a WebSocket (RFC 6455) with `request`: a GET for a `ws://` or `wss://` URL, whose fields may offer
     /// subprotocols (`Sec-WebSocket-Protocol`) and carry an `Origin` or credentials. `NotSwitched` with the status if
-    /// the server answers otherwise. Over TLS the connection must speak HTTP/1.1: with a `TlsConfig` whose ALPN lets
-    /// the server pick `h2`, it is `NotSwitched(0)`.
+    /// the server answers otherwise. The WebSocket is a stream of an HTTP/2 connection the client already has to the
+    /// origin, if its server takes WebSockets there (RFC 8441); else of an HTTP/3 connection, with an origin the
+    /// client speaks HTTP/3 with whose server takes them (RFC 9220); else it gets an HTTP/1.1 connection of its own.
+    /// That one must speak HTTP/1.1: with a `TlsConfig` whose ALPN lets the server pick `h2`, it is
+    /// `NotSwitched(0)`.
     public async fn webSocket(
         borrow this,
         request: borrow Request,
@@ -322,15 +325,9 @@ public struct Client {
     ) -> Result<WebSocket, HttpError> {
         let url = request.text.view();
         let fields = request.fields.view();
+        let packed = request.packed.view();
         let parts = request.parts;
-        if (options.handshakeMs == 0) {
-            return await openWebSocket(this, url, parts, fields, options, key);
-        }
-        return await Async.timeout(
-            options.handshakeMs,
-            HttpError.Net(NetError.TimedOut),
-            async () => await openWebSocket(this, url, parts, fields, options, key),
-        );
+        return await openWebSocket(this, url, parts, fields, packed, options, key);
     }
 
     /// Closes the idle connections. Requests that start afterwards fail with `Closed`; responses still held close
@@ -440,6 +437,45 @@ public struct Client {
                 this.options.maxBodyBytes,
                 coded,
                 extra,
+                "".bytes(),
+            )) {
+                Ok(Some(slot)) => { return Ok(Some(H2Place { session: i, slot: slot })); }
+                Ok(null) => {}
+                Err(_) => { return Err(HttpErrors.noMemory()); }
+            }
+        }
+        return Ok(null);
+    }
+
+    /// Opens a stream with an extended CONNECT for `protocol` (RFC 8441) on an HTTP/2 connection the client has to
+    /// `origin`, if the server of one takes such requests and it has room: the session and the slot. The response
+    /// is streamed, and the request's side of the stream stays open.
+    fn openTunnel(
+        borrow this,
+        origin: usize,
+        protocol: Slice<u8>,
+        url: Slice<u8>,
+        parts: borrow UrlParts,
+        packed: Slice<u8>,
+        extra: Slice<u8>,
+    ) -> Result<H2Place?, HttpError> {
+        for (i in 0..this.sessions.length) {
+            let session = borrow this.sessions[i];
+            if (!session.tunnels(origin)) {
+                continue;
+            }
+            match (session.open(
+                Method.Get,
+                url,
+                parts,
+                packed,
+                null,
+                false,
+                false,
+                0xFFFFFFFFFFFFFFFF,
+                false,
+                extra,
+                protocol,
             )) {
                 Ok(Some(slot)) => { return Ok(Some(H2Place { session: i, slot: slot })); }
                 Ok(null) => {}
@@ -681,8 +717,10 @@ public struct Client {
         return guard.data().offline;
     }
 
-    /// Makes the next dial use `mock` instead of the network (tests).
-    fn script(borrow this, mock: MockTransport) -> Result<void, AllocError> {
+    /// Makes the next dial use `mock` (web_transport's `MockTransport`: a server's bytes written beforehand)
+    /// instead of the network, and from then on the client dials nothing else: when the scripted connections run
+    /// out a dial fails. For tests, this package's and those of code built on the client.
+    public fn script(borrow this, mock: MockTransport) -> Result<void, AllocError> {
         var guard = this.origins.write();
         let o = guard.data();
         o.offline = true;
@@ -2059,7 +2097,7 @@ public struct Response<region c> {
 }
 
 /// A request whose body is being written (`Client.upload`). Dropped before `finish`, the request is abandoned: its
-/// HTTP/1.1 connection is closed, its HTTP/2 stream reset.
+/// HTTP/1.1 connection is closed, its HTTP/2 or HTTP/3 stream reset.
 @noncopy
 public struct Upload<region c> {
     /// The response to be, which already holds the connection or the stream.
@@ -2090,6 +2128,17 @@ public struct Upload<region c> {
                 return Err(HttpError.BadRequest);
             }
             this.remaining -= bytes.length as u64;
+        }
+        if (this.response.viaH3) {
+            let client = this.response.client;
+            let wrote = match (borrow client.http3) {
+                Some(transport) => await transport.write(this.response.h3Stream, bytes),
+                null => Err(HttpError.Closed),
+            };
+            if (wrote.isErr()) {
+                this.broken = true;
+            }
+            return wrote;
         }
         if (this.response.viaH2) {
             let client = this.response.client;
@@ -2172,7 +2221,22 @@ public struct Upload<region c> {
         }
         let client = me.response.client;
         let options = borrow client.options;
-        if (me.response.viaH2) {
+        if (me.response.viaH3) {
+            var answer = Http3Answer.create();
+            let done = match (borrow client.http3) {
+                Some(transport) => await transport.finish(me.response.h3Stream, options.responseMs, mut answer),
+                null => Err(HttpError.Closed),
+            };
+            me.response.h3Open = false; // the transport has given the stream up
+            done?;
+            me.response.code = answer.status;
+            me.response.filled = answer.body.length;
+            me.response.trailers = answer.trailers;
+            swap(mut me.response.head, mut answer.head);
+            swap(mut me.response.spans, mut answer.spans);
+            swap(mut me.response.data, mut answer.body);
+            client.noteAltSvc(me.response.origin, me.response);
+        } else if (me.response.viaH2) {
             let session = borrow client.sessions[me.response.session];
             let slot = me.response.slot;
             session.endBody(slot)?;
@@ -2303,7 +2367,84 @@ async fn beginUpload<region c>(
             ready = client.cookiesFor(url, parts, mut line, mut linePacked);
         }
     }
-    if (ready.isOk() && length == null) {
+    if (ready.isErr()) {
+        return Err(HttpErrors.noMemory());
+    }
+    // HTTP/3 first, to an origin that speaks it; any other way if the stream cannot be had (nothing has left yet).
+    if (parts.secure) {
+        match (borrow client.http3) {
+            Some(transport) => {
+                match (client.http3Port(origin, parts.port)) {
+                    Some(port) => {
+                        var lines = Vector<u8>.create();
+                        var built = lines.extend(fields);
+                        if (built.isOk()) {
+                            built = lines.extend(line.view());
+                        }
+                        if (built.isOk() && coded) {
+                            built = lines.extend("Accept-Encoding: gzip, deflate\r\n".bytes());
+                        }
+                        if (built.isErr()) {
+                            return Err(HttpErrors.noMemory());
+                        }
+                        match (await transport.begin(
+                            method,
+                            url,
+                            parts,
+                            port,
+                            lines.view(),
+                            length,
+                            options.maxBodyBytes,
+                        )) {
+                            Ok(stream) => {
+                                {
+                                    var guard = client.counters.write();
+                                    let c = guard.data();
+                                    c.overHttp3 += 1;
+                                }
+                                let bounded = length != null;
+                                return Ok(Upload {
+                                    response: Response {
+                                        client: client,
+                                        conn: null,
+                                        origin: origin,
+                                        permit: permit,
+                                        viaH2: false,
+                                        viaH3: true,
+                                        h3Stream: stream,
+                                        h3Open: true, // until `finish`: dropped before, the stream is cancelled
+                                        session: 0,
+                                        slot: 0,
+                                        generation: 0,
+                                        code: 0,
+                                        head: Vector<u8>.create(),
+                                        spans: Vector<HeaderSpan>.create(),
+                                        data: Vector<u8>.create(),
+                                        filled: 0,
+                                        streamed: false,
+                                        decoded: false,
+                                        cached: false,
+                                        trailers: 0,
+                                    },
+                                    url: kept,
+                                    parts: parts,
+                                    chunked: false,
+                                    limited: bounded,
+                                    remaining: length ?? 0,
+                                    started: false,
+                                    broken: false,
+                                });
+                            }
+                            Err(_) => { client.http3Failed(origin); }
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    if (length == null) {
         ready = line.extend("Transfer-Encoding: chunked\r\n".bytes()); // only HTTP/1.1 reads `line`
     }
     let absolute = client.viaHttpProxy(url, parts);
@@ -2403,4 +2544,265 @@ async fn beginUpload<region c>(
         started: false,
         broken: false,
     });
+}
+
+/// What carries a WebSocket's frames: a connection of its own, or a stream of an HTTP/2 or HTTP/3 connection the
+/// client has. Dropped, the connection closes, or the stream is reset and its place given back.
+@noncopy
+struct Tunnel<region c> {
+    client: borrow(c) Client;
+    link: Link?;
+    viaH2: bool;
+    session: usize;
+    slot: usize;
+    generation: u64;
+    viaH3: bool;
+    h3Stream: u64;
+    /// The HTTP/2 answer's fields: the stream's buffers, which go back with its slot.
+    head: Vector<u8>;
+    spans: Vector<HeaderSpan>;
+
+    /// Some bytes into `buffer`: how many, 0 at the end.
+    async fn read(borrow mut this, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
+        if (this.viaH2) {
+            let client = this.client;
+            return await client.sessions[this.session].read(this.slot, buffer);
+        }
+        if (this.viaH3) {
+            let client = this.client;
+            return match (borrow client.http3) {
+                Some(transport) => await transport.read(this.h3Stream, buffer),
+                null => Err(HttpError.Closed),
+            };
+        }
+        return match (borrow mut this.link) {
+            Some(link) => match (await link.read(buffer)) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(HttpError.Net(e)),
+            },
+            null => Err(HttpError.Closed),
+        };
+    }
+
+    /// All of `bytes`, on the wire (or with QUIC) before this returns. Over HTTP/2, what is written after the
+    /// server ended the stream goes nowhere, as after a connection's last byte from its server.
+    async fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, HttpError> {
+        if (this.viaH2) {
+            let client = this.client;
+            let session = borrow client.sessions[this.session];
+            await session.sendBody(this.slot, bytes, false)?;
+            return await session.progress(this.slot, WANT_FLUSHED);
+        }
+        if (this.viaH3) {
+            let client = this.client;
+            return match (borrow client.http3) {
+                Some(transport) => await transport.write(this.h3Stream, bytes),
+                null => Err(HttpError.Closed),
+            };
+        }
+        return match (borrow mut this.link) {
+            Some(link) => match (await link.write(bytes)) {
+                Ok() => Ok(),
+                Err(e) => Err(HttpError.Net(e)),
+            },
+            null => Err(HttpError.Closed),
+        };
+    }
+
+    /// Nothing more will be sent: a stream's sending side is ended (RFC 8441 §5.1), so that the server sees the
+    /// WebSocket closed and not cut off. An error here changes nothing.
+    async fn shut(borrow mut this) {
+        if (this.viaH2) {
+            let client = this.client;
+            let session = borrow client.sessions[this.session];
+            if (session.endBody(this.slot).isOk()) {
+                let flushed = await session.progress(this.slot, WANT_FLUSHED);
+            }
+        }
+        if (this.viaH3) {
+            let client = this.client;
+            match (borrow client.http3) {
+                Some(transport) => { let ended = await transport.shut(this.h3Stream); }
+                null => {}
+            }
+        }
+    }
+
+    drop {
+        if (this.viaH2) {
+            var none = Vector<u8>.create();
+            this.client.sessions[this.session].release(
+                this.slot,
+                this.generation,
+                mut this.head,
+                mut this.spans,
+                mut none,
+            );
+        }
+        if (this.viaH3) {
+            match (borrow this.client.http3) {
+                Some(transport) => { transport.release(this.h3Stream); }
+                null => {}
+            }
+        }
+    }
+}
+
+/// A WebSocket as a stream of a connection the client has to the URL's origin, or null if there is none that
+/// takes one: then it needs a connection of its own.
+async fn tunnelled<region c>(
+    client: borrow(c) Client,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    packed: Slice<u8>,
+    options: WebSocketOptions,
+) -> Result<WebSocket<c>?, HttpError> {
+    if (client.sessions.length == 0 && client.http3 == null) {
+        return Ok(null);
+    }
+    let origin = client.origin(url, parts)?;
+    match (await overHttp2(client, origin, url, parts, fields, packed, options)?) {
+        Some(ws) => { return Ok(Some(ws)); }
+        null => {}
+    }
+    if (!parts.secure) {
+        return Ok(null);
+    }
+    return await overHttp3(client, origin, url, parts, fields, options);
+}
+
+/// A WebSocket as a stream of an HTTP/2 connection the client has to `origin`, or null if it has none whose
+/// server takes extended CONNECT requests, or none with room.
+async fn overHttp2<region c>(
+    client: borrow(c) Client,
+    origin: usize,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    packed: Slice<u8>,
+    options: WebSocketOptions,
+) -> Result<WebSocket<c>?, HttpError> {
+    var lines = Vector<u8>.create();
+    var extra = Vector<u8>.create();
+    let built = tunnelFields(mut lines, options.compress);
+    let made = if (built.isOk()) packFields(lines.view(), mut extra) else built;
+    match (made) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    let place = match (client.openTunnel(origin, "websocket".bytes(), url, parts, packed, extra.view())?) {
+        Some(p) => p,
+        null => { return Ok(null); },
+    };
+    let session = borrow client.sessions[place.session];
+    // From here the stream is the tunnel's: dropped, it is reset and its slot goes back.
+    var pipe = Tunnel {
+        client: client,
+        link: null,
+        viaH2: true,
+        session: place.session,
+        slot: place.slot,
+        generation: session.currentGeneration(),
+        viaH3: false,
+        h3Stream: 0,
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+    };
+    let slot = place.slot;
+    let headed = if (options.handshakeMs == 0) await session.progress(slot, WANT_HEAD) else await Async.timeout(
+        options.handshakeMs,
+        HttpError.Net(NetError.TimedOut),
+        async () => await session.progress(slot, WANT_HEAD),
+    );
+    headed?;
+    var none = Vector<u8>.create();
+    let taken = session.takeResponse(place.slot, mut pipe.head, mut pipe.spans, mut none);
+    if (taken.status < 200 || taken.status > 299) {
+        return Err(HttpError.NotSwitched(taken.status));
+    }
+    var chosen = Vector<u8>.create();
+    let deflate = settle(
+        answered(pipe.head.view(), pipe.spans.view(), "sec-websocket-extensions".bytes()),
+        answered(pipe.head.view(), pipe.spans.view(), "sec-websocket-protocol".bytes()),
+        fields,
+        options,
+        mut chosen,
+    )?;
+    let ws = assemble(pipe, Vector<u8>.create(), 0, 0, Vector<u8>.create(), chosen, deflate, options)?;
+    return Ok(Some(ws));
+}
+
+/// A WebSocket as a stream of an HTTP/3 connection to `origin`, or null: the client has no HTTP/3, does not speak
+/// it with this origin, the server there does not take extended CONNECT requests, or the connection cannot be had.
+async fn overHttp3<region c>(
+    client: borrow(c) Client,
+    origin: usize,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    options: WebSocketOptions,
+) -> Result<WebSocket<c>?, HttpError> {
+    let transport = match (borrow client.http3) {
+        Some(t) => t,
+        null => { return Ok(null); },
+    };
+    let port = match (client.http3Port(origin, parts.port)) {
+        Some(p) => p,
+        null => { return Ok(null); },
+    };
+    var lines = Vector<u8>.create();
+    let copied = lines.extend(fields);
+    let built = if (copied.isOk()) tunnelFields(mut lines, options.compress) else copied;
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    var answer = Http3Answer.create();
+    let stream = match (await transport.tunnel(
+        "websocket".bytes(),
+        url,
+        parts,
+        port,
+        lines.view(),
+        options.handshakeMs,
+        mut answer,
+    )) {
+        Ok(name) => name,
+        Err(f) => {
+            if (!f.unsent) {
+                return Err(f.error);
+            }
+            match (f.error) {
+                HttpError.NotSwitched(_) => {} // HTTP/3 works: its server takes no WebSockets
+                _ => { client.http3Failed(origin); }
+            }
+            return Ok(null);
+        },
+    };
+    let pipe = Tunnel {
+        client: client,
+        link: null,
+        viaH2: false,
+        session: 0,
+        slot: 0,
+        generation: 0,
+        viaH3: true,
+        h3Stream: stream,
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+    };
+    if (answer.status < 200 || answer.status > 299) {
+        return Err(HttpError.NotSwitched(answer.status));
+    }
+    var chosen = Vector<u8>.create();
+    let deflate = settle(
+        answered(answer.head.view(), answer.spans.view(), "sec-websocket-extensions".bytes()),
+        answered(answer.head.view(), answer.spans.view(), "sec-websocket-protocol".bytes()),
+        fields,
+        options,
+        mut chosen,
+    )?;
+    let ws = assemble(pipe, Vector<u8>.create(), 0, 0, Vector<u8>.create(), chosen, deflate, options)?;
+    return Ok(Some(ws));
 }

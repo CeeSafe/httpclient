@@ -1,5 +1,5 @@
 // HTTP/3 as a transport the client may be given. This package has no QUIC in it: the httpclient3 package implements
-// `Http3Transport`, and a client made with `Client.withHttp3` uses it for buffered requests to `https` origins that
+// `Http3Transport`, and a client made with `Client.withHttp3` uses it for requests to `https` origins that
 // have said they speak HTTP/3 (`Alt-Svc`, RFC 7838), below everything else the client does: redirects, retries, the
 // cache, cookies and decompression are the same whichever way a request goes.
 
@@ -40,6 +40,26 @@ public interface Http3Transport {
     /// Sends the request and reads the response's head into `answer` (its status and fields; no body): a name for
     /// the response's stream, with which its body is `read`. The stream is held until `release`.
     async fn open(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, answer: borrow mut Http3Answer) -> Result<u64, Http3Failure>;
+
+    /// Starts a request to the URL's host at UDP port `port` whose body is written piece by piece: a name for its
+    /// stream, for `write` and `finish`, held until `finish` or `release`. With `length` the request declares it.
+    async fn begin(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, length: u64?, maxBodyBytes: u64) -> Result<u64, Http3Failure>;
+
+    /// Sends the next bytes of the body of `stream`, waiting while the path takes no more.
+    async fn write(borrow this, stream: u64, bytes: Slice<u8>) -> Result<void, HttpError>;
+
+    /// Ends the body of `stream`, reads the whole response into `answer` and gives the stream up, whether or not
+    /// that went well.
+    async fn finish(borrow this, stream: u64, responseMs: u64, answer: borrow mut Http3Answer) -> Result<void, HttpError>;
+
+    /// Opens a tunnel to the URL's host at UDP port `port` with an extended CONNECT for `protocol` (RFC 9220:
+    /// `websocket`): sends the request, leaves its stream open, and reads the response's head into `answer`. The
+    /// stream's name: what is sent goes with `write`, what the server sends comes with `read`, until `release`. If
+    /// the server has not said it takes such requests, the failure is `NotSwitched(0)`, and `unsent`.
+    async fn tunnel(borrow this, protocol: Slice<u8>, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, responseMs: u64, answer: borrow mut Http3Answer) -> Result<u64, Http3Failure>;
+
+    /// Ends what is written on `stream`, a tunnel's, when that has all left; what the server sends is still read.
+    async fn shut(borrow this, stream: u64) -> Result<void, HttpError>;
 
     /// The next bytes of the body of `stream` into `buffer`: at least one, or 0 at its end.
     async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError>;

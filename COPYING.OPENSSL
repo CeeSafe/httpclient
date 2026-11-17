@@ -2,14 +2,14 @@ httpclient OpenSSL exception
 
 Copyright (C) 2026 Veeran Puthumkara.
 
-httpclient and httpclient3 are licensed under the GNU General Public License, version 2 only (COPYING). Through
-CeeSafe.Web's web_tls and web_quic they link the OpenSSL library, which is licensed under the Apache License 2.0
-(OpenSSL 3.0 and later) or the OpenSSL and SSLeay licences (earlier versions). Those licences are not compatible with
-the GPL, so the exception below permits the combination.
+httpclient, httpclient3 and httpclient_json are licensed under the GNU General Public License, version 2 only
+(COPYING). Through CeeSafe.Web's web_tls and web_quic they link the OpenSSL library, which is licensed under the
+Apache License 2.0 (OpenSSL 3.0 and later) or the OpenSSL and SSLeay licences (earlier versions). Those licences are
+not compatible with the GPL, so the exception below permits the combination.
 
-In addition, as a special exception, the copyright holder gives permission to link the code of httpclient and
-httpclient3 with the OpenSSL library (or with modified versions of OpenSSL that use the same licence as OpenSSL), and
-to distribute linked combinations including the two. You must obey the GNU General Public License in all respects for
-all of the code used other than OpenSSL. If you modify httpclient or httpclient3, you may extend this exception to
-your version, but you are not obliged to do so. If you do not wish to do so, delete this exception statement from
-your version.
+In addition, as a special exception, the copyright holder gives permission to link the code of httpclient,
+httpclient3 and httpclient_json with the OpenSSL library (or with modified versions of OpenSSL that use the same
+licence as OpenSSL), and to distribute linked combinations including the two. You must obey the GNU General Public
+License in all respects for all of the code used other than OpenSSL. If you modify httpclient, httpclient3 or
+httpclient_json, you may extend this exception to your version, but you are not obliged to do so. If you do not wish
+to do so, delete this exception statement from your version.

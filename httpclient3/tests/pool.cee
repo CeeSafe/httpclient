@@ -24,6 +24,82 @@ async fn fetched(client: borrow Client, port: u16, path: StringView, status: u64
     return Check.equalBytes(body.bytes(), response.body());
 }
 
+/// A WebSocket is a stream of the HTTP/3 connection the client already has: no other connection is made.
+async fn socketsThroughTheClient(client: borrow Client, port: u16) -> Result<void, TestFailure> {
+    let before = client.stats().connections;
+    var url = String.create();
+    let built = url.append("wss://localhost:").isOk() && url.appendNumber(port as u64).isOk() && url.append("/ws").isOk();
+    Check.isTrue(built, "the URL")?;
+    let request = match (Request.create(Method.Get, url.view())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        var ws = match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(w) => w,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var into = Vector<u8>.create();
+        Check.isTrue((await ws.sendText("hello")).isOk(), "a text message")?;
+        match (await ws.receive(mut into)) {
+            Ok(Message.Text) => { Check.equalBytes("hello".bytes(), into.view())?; }
+            Ok(_) => { return Check.fail("a text message comes back"); }
+            Err(e) => { return Err(failed(e)); }
+        }
+        // More than the stream's first window both ways, with a ping on the way whose pong is dropped.
+        var large = Vector<u8>.create();
+        for (i in 0..1500000) {
+            if (large.push(pattern(i)).isErr()) {
+                return Err(TestFailure.create("out of memory"));
+            }
+        }
+        Check.isTrue((await ws.ping("p".bytes())).isOk(), "a ping")?;
+        match (await ws.sendBinary(large.view())) {
+            Ok() => {}
+            Err(e) => { return Err(failed(e)); }
+        }
+        match (await ws.receive(mut into)) {
+            Ok(Message.Binary) => { Check.equalBytes(large.view(), into.view())?; }
+            Ok(_) => { return Check.fail("a binary message comes back"); }
+            Err(e) => { return Err(failed(e)); }
+        }
+        Check.isTrue((await ws.close(1000, "bye")).isOk(), "the close")?;
+        match (await ws.receive(mut into)) {
+            Ok(Message.Close(code)) => {
+                Check.equalU64(1000, code as u64)?;
+                Check.equalBytes("bye".bytes(), into.view())?;
+            }
+            Ok(_) => { return Check.fail("the close comes back"); }
+            Err(e) => { return Err(failed(e)); }
+        }
+    }
+    // One given up without a close: its stream is cancelled, and the connection goes on.
+    {
+        var ws = match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(w) => w,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await ws.sendText("unanswered")).isOk(), "a message")?;
+    }
+    // A server that answers the CONNECT with 403.
+    var elsewhere = String.create();
+    let made = elsewhere.append("wss://localhost:").isOk() && elsewhere.appendNumber(port as u64).isOk() &&
+        elsewhere.append("/nowhere").isOk();
+    Check.isTrue(made, "the URL")?;
+    let refused = match (Request.create(Method.Get, elsewhere.view())) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (await client.webSocket(refused, WebSocketOptions.defaults())) {
+        Ok(_) => { return Check.fail("403 opens nothing"); }
+        Err(e) => {
+            Check.equalBytes(HttpErrors.describe(HttpError.NotSwitched(403)).bytes(), HttpErrors.describe(e).bytes())?;
+        }
+    }
+    Check.equalU64(before, client.stats().connections)?;
+    return await fetched(client, port, "/hello", 200, "hello over h3");
+}
+
 async fn throughTheClient(client: borrow Client, port: u16, silent: u16) -> Result<void, TestFailure> {
     await fetched(client, port, "/hello", 200, "hello over h3")?;
     // The client's own work happens above the transport: a redirect is followed, over HTTP/3 again.
@@ -82,6 +158,73 @@ async fn throughTheClient(client: borrow Client, port: u16, silent: u16) -> Resu
     }
     await fetched(client, port, "/hello", 200, "hello over h3")?;
     Check.equalU64(0, stats.connections)?; // no TCP connection was opened
+    // An upload of two and a half megabytes with its length, more than QUIC holds at once, so the writer waits
+    // for the path; then one without a length, and one given up.
+    {
+        let url = urlFor(port, "/sum")?;
+        let request = match (Request.create(Method.Post, url.view())) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var upload = match (await client.upload(request, Some(2500000))) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var piece = Vector<u8>.create();
+        var sent: usize = 0;
+        var sum: u64 = 0;
+        while (sent < 2500000) {
+            piece.clear();
+            while (piece.length < 70000 && sent + piece.length < 2500000) {
+                let b = pattern(sent + piece.length);
+                sum += b as u64;
+                if (piece.push(b).isErr()) {
+                    return Err(TestFailure.create("out of memory"));
+                }
+            }
+            match (await upload.write(piece.view())) {
+                Ok() => {}
+                Err(e) => { return Err(failed(e)); }
+            }
+            sent += piece.length;
+        }
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var expected = String.create();
+        let built = expected.appendNumber(2500000).isOk() && expected.append(" ").isOk() && expected.appendNumber(sum).isOk();
+        Check.isTrue(built && response.isHttp3(), "an upload over HTTP/3")?;
+        Check.equalU64(200, response.status() as u64)?;
+        Check.equalBytes(expected.view().bytes(), response.body())?;
+        match (response.header("x-declared")) {
+            Some(v) => { Check.equalBytes("2500000".bytes(), v)?; }
+            null => { return Check.fail("the declared length"); }
+        }
+
+        var open = match (await client.upload(request, null)) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await open.write("ab".bytes())).isOk() && (await open.write("c".bytes())).isOk(), "two pieces")?;
+        let counted = match (await open.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("3 294".bytes(), counted.body())?; // 97 + 98 + 99
+        match (counted.header("x-declared")) {
+            Some(v) => { Check.equalBytes("".bytes(), v)?; }
+            null => { return Check.fail("no declared length"); }
+        }
+
+        var given = match (await client.upload(request, Some(10))) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await given.write("half".bytes())).isOk(), "a piece of what was promised")?;
+    }
+    await fetched(client, port, "/hello", 200, "hello over h3")?;
+    await socketsThroughTheClient(client, port)?;
     // A server that does not answer on UDP: found out within the handshake's time, then TCP is tried (nothing
     // listens there either), and the origin is left alone.
     let started = Timer.now();
@@ -126,7 +269,7 @@ async fn theClientOverHttp3() -> Result<void, TestFailure> {
         Ok(t) => t,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { unused: 0 })) {
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { tunnels: true })) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };

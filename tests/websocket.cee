@@ -91,7 +91,7 @@ fn clientFrame(wire: Slice<u8>, at: borrow mut usize, payload: borrow mut Vector
     return Ok(first);
 }
 
-async fn opened(client: borrow Client, request: borrow Request) -> Result<WebSocket, TestFailure> {
+async fn opened<region c>(client: borrow(c) Client, request: borrow Request) -> Result<WebSocket<c>, TestFailure> {
     let key = [0u8; 16];
     return match (await client.webSocketWithKey(request, WebSocketOptions.defaults(), key[..])) {
         Ok(ws) => Ok(ws),
@@ -334,8 +334,7 @@ async fn framesThatBreakTheProtocol() -> Result<void, TestFailure> {
 }
 
 /// A socket opened with compression offered, to a server that sends `frames` after agreeing to it.
-async fn compressing(frames: Slice<u8>, limit: usize, copies: borrow Channel<u8>) -> Result<WebSocket, TestFailure> {
-    let client = Client.create(ClientOptions.defaults());
+async fn compressing<region c>(client: borrow(c) Client, frames: Slice<u8>, limit: usize, from: usize, copies: borrow Channel<u8>) -> Result<WebSocket<c>, TestFailure> {
     var server = Vector<u8>.create();
     switching(mut server, "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n")?;
     made(server.extend(frames))?;
@@ -343,6 +342,7 @@ async fn compressing(frames: Slice<u8>, limit: usize, copies: borrow Channel<u8>
     let request = wsRequest("ws://example.com/")?;
     var options = WebSocketOptions.defaults();
     options.compress = true;
+    options.compressMinBytes = from;
     options.maxMessageBytes = limit;
     let key = [0u8; 16];
     return match (await client.webSocketWithKey(request, options, key[..])) {
@@ -373,7 +373,8 @@ async fn compressedMessages() -> Result<void, TestFailure> {
     serverFrame(mut frames, 0x80, many[7..])?;
     serverFrame(mut frames, 0x88, raw("03e8")?.view())?;
     let copies = made(Channel<u8>.create(8192))?;
-    var ws = await compressing(frames.view(), 65536, copies)?;
+    let client = Client.create(ClientOptions.defaults());
+    var ws = await compressing(client, frames.view(), 65536, 128, copies)?;
     var into = Vector<u8>.create();
     Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
     var expected = Vector<u8>.create();
@@ -393,7 +394,7 @@ async fn compressedMessages() -> Result<void, TestFailure> {
     }
     Check.isTrue(same, "three thousand x")?;
     Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
-    // The offer is in the upgrade, and what the client sends is not compressed.
+    // The offer is in the upgrade.
     let wire = written(copies)?;
     let offer = "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
     Check.isTrue(wire.view().indexOf(offer.bytes()) != null, "the offer")?;
@@ -403,7 +404,8 @@ async fn compressedMessages() -> Result<void, TestFailure> {
 /// As `faultCode`, on a socket where compression was agreed.
 async fn deflateFault(frames: Slice<u8>, limit: usize) -> Result<u64, TestFailure> {
     let copies = made(Channel<u8>.create(8192))?;
-    var ws = await compressing(frames, limit, copies)?;
+    let client = Client.create(ClientOptions.defaults());
+    var ws = await compressing(client, frames, limit, 128, copies)?;
     var into = Vector<u8>.create();
     loop {
         match (await ws.receive(mut into)) {
@@ -427,5 +429,247 @@ async fn compressedMessagesThatAreWrong() -> Result<void, TestFailure> {
     Check.equalU64(1002, await deflateFault(raw("020161c00161")?.view(), 1000)?)?; // marked on a continuation
     Check.equalU64(1002, await deflateFault(raw("c900")?.view(), 1000)?)?; // marked on a ping
     Check.equalU64(1002, await deflateFault(raw("a10161")?.view(), 1000)?)?; // the second reserved bit
+    return Ok();
+}
+
+@test
+async fn messagesSentCompressed() -> Result<void, TestFailure> {
+    var frames = Vector<u8>.create();
+    serverFrame(mut frames, 0x88, raw("03e8")?.view())?;
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = Client.create(ClientOptions.defaults());
+    var ws = await compressing(client, frames.view(), 65536, 8, copies)?;
+    // Noise that no compressor shortens, for a message that goes as it is.
+    var noise = Vector<u8>.create();
+    var seed: u32 = 7;
+    for (i in 0..200) {
+        seed = truncate<u32>((seed as u64 * 1103515245 + 12345) & 0x7FFFFFFF);
+        made(noise.push(truncate<u8>(seed >> 16)))?;
+    }
+    var many = Vector<u8>.create();
+    made(many.resize(3000, 'x'))?;
+    let sent = (await ws.sendText("Hello")).isOk() && (await ws.sendText("HelloHelloHelloHello")).isOk() &&
+        (await ws.sendBinary(many.view())).isOk() && (await ws.sendBinary(noise.view())).isOk() &&
+        (await ws.ping("HelloHelloHelloHello".bytes())).isOk();
+    Check.isTrue(sent, "five frames")?;
+    var into = Vector<u8>.create();
+    Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+    let wire = written(copies)?;
+    var at = (wire.view().indexOf("\r\n\r\n".bytes()) ?? 0) + 4;
+    var payload = Vector<u8>.create();
+    // Below `compressMinBytes`: as it is.
+    Check.equalU64(0x81, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("Hello".bytes(), payload.view())?;
+    // Five literals and a match of 15 at distance 5, by RFC 1951's fixed codes (the bytes are worked out in
+    // tests/deflate.cee).
+    Check.equalU64(0xC1, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(raw("f248cdc9c947230000")?.view(), payload.view())?;
+    // A run compresses to a few bytes, which the inflater turns back into it.
+    Check.equalU64(0xC2, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.isTrue(payload.length < 40, "three thousand x in a few bytes")?;
+    let tail = [0u8, 0, 0xFF, 0xFF, 1, 0, 0, 0xFF, 0xFF];
+    made(payload.extend(tail[..]))?;
+    var inflater = Inflater.create();
+    var back = Vector<u8>.create();
+    Check.isTrue(inflater.inflateRaw(payload.view(), mut back, 65536).isOk(), "it decodes")?;
+    Check.equalBytes(many.view(), back.view())?;
+    // What would not get shorter goes as it is, and a ping is never compressed.
+    Check.equalU64(0x82, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(noise.view(), payload.view())?;
+    Check.equalU64(0x89, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("HelloHelloHelloHello".bytes(), payload.view())?;
+    return Ok();
+}
+
+/// An HTTP/2 server's first bytes: its SETTINGS, which allow extended CONNECT if `connect`, and the answer to a GET
+/// on stream 1.
+fn h2Greeting(server: borrow mut Vector<u8>, connect: bool) -> Result<void, TestFailure> {
+    if (connect) {
+        frame(mut server, 4, 0, 0, raw("000800000001")?.view())?;
+    } else {
+        settings(mut server)?;
+    }
+    headers(mut server, 1, "200", [], 4)?;
+    return data(mut server, 1, "ok", true);
+}
+
+async fn gotOk(client: borrow Client, url: StringView) -> Result<void, TestFailure> {
+    let response = match (await client.get(url)) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    return Check.equalU64(200, response.status() as u64);
+}
+
+@test
+async fn overAnHttp2Connection() -> Result<void, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    // One connection: a GET on stream 1, then the WebSocket on stream 3, whose server sends a message, a ping
+    // and its close. The first read gives the first part alone.
+    var server = Vector<u8>.create();
+    h2Greeting(mut server, true)?;
+    let first = server.length;
+    let chosen = ["sec-websocket-protocol", "chat"];
+    headers(mut server, 3, "200", chosen[..], 4)?;
+    var frames = Vector<u8>.create();
+    serverFrame(mut frames, 0x81, "hi".bytes())?;
+    serverFrame(mut frames, 0x89, "p".bytes())?;
+    serverFrame(mut frames, 0x88, raw("03e8")?.view())?;
+    frame(mut server, 0, 0, 3, frames.view())?;
+    scriptBytes(client, server.view(), first, 0, copies)?;
+    await gotOk(client, "http://example.com/")?;
+    var request = wsRequest("ws://example.com/chat")?;
+    match (request.header("Sec-WebSocket-Protocol", "chat")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    {
+        var ws = match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(w) => w,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("chat".bytes(), ws.protocol())?;
+        Check.isTrue((await ws.sendText("yo")).isOk(), "a message")?;
+        var into = Vector<u8>.create();
+        Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+        Check.equalBytes("hi".bytes(), into.view())?;
+        Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+        Check.isTrue((await ws.sendText("late")).isErr(), "nothing after the close")?;
+    }
+    Check.equalU64(1, client.stats().connections)?;
+    // What went out on stream 3: the extended CONNECT, then the frames as DATA (the message, the pong, the close
+    // echoed), and the stream's end.
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var decoder = HpackDecoder.create(4096);
+    var tunnel = Vector<u8>.create();
+    var opened = false;
+    var ended = false;
+    for (i in 0..sent.length) {
+        let f = sent[i];
+        if (f.id != 3) {
+            continue;
+        }
+        if (f.kind == 1) {
+            let expected = [
+                ":method", "CONNECT", ":scheme", "http", ":authority", "example.com", ":path", "/chat", ":protocol",
+                "websocket", "sec-websocket-protocol", "chat", "sec-websocket-version", "13",
+            ];
+            expectRequest(mut decoder, wire.view(), f, expected[..])?;
+            Check.equalU64(4, f.flags as u64)?; // END_HEADERS only: the stream stays open
+            opened = true;
+        } else if (f.kind == 0) {
+            Check.isTrue(!ended, "nothing after the end")?;
+            made(tunnel.extend(wire[f.start..f.end]))?;
+            ended = (f.flags & 1) != 0;
+        }
+    }
+    Check.isTrue(opened && ended, "opened, and ended")?;
+    var at: usize = 0;
+    var payload = Vector<u8>.create();
+    Check.equalU64(0x81, clientFrame(tunnel.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("yo".bytes(), payload.view())?;
+    Check.equalU64(0x8A, clientFrame(tunnel.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes("p".bytes(), payload.view())?;
+    Check.equalU64(0x88, clientFrame(tunnel.view(), mut at, mut payload)? as u64)?;
+    Check.equalBytes(raw("03e8")?.view(), payload.view())?;
+    Check.equalU64(tunnel.length as u64, at as u64)?;
+    return Ok();
+}
+
+@test
+async fn http2ConnectionsThatTakeNone() -> Result<void, TestFailure> {
+    // A server that answers the CONNECT with 404: that is the answer.
+    {
+        let copies = made(Channel<u8>.create(8192))?;
+        let client = h2Client();
+        var server = Vector<u8>.create();
+        h2Greeting(mut server, true)?;
+        let first = server.length;
+        headers(mut server, 3, "404", [], 5)?;
+        scriptBytes(client, server.view(), first, 0, copies)?;
+        await gotOk(client, "http://example.com/")?;
+        let request = wsRequest("ws://example.com/chat")?;
+        match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(_) => { return Check.fail("404 opens nothing"); }
+            Err(e) => {
+                Check.equalBytes(
+                    HttpErrors.describe(HttpError.NotSwitched(404)).bytes(),
+                    HttpErrors.describe(e).bytes(),
+                )?;
+            }
+        }
+        // The stream's place went back: the connection takes the next request.
+        Check.equalU64(1, client.stats().connections)?;
+    }
+    // A server whose SETTINGS do not allow it: the WebSocket gets a connection of its own, over HTTP/1.1.
+    {
+        let copies = made(Channel<u8>.create(8192))?;
+        let client = h2Client();
+        var server = Vector<u8>.create();
+        h2Greeting(mut server, false)?;
+        scriptBytes(client, server.view(), 0, 0, copies)?;
+        var upgraded = Vector<u8>.create();
+        switching(mut upgraded, "")?;
+        serverFrame(mut upgraded, 0x81, "hi".bytes())?;
+        scriptBytes(client, upgraded.view(), 0, 0, copies)?;
+        await gotOk(client, "http://example.com/")?;
+        let request = wsRequest("ws://example.com/chat")?;
+        var ws = await opened(client, request)?;
+        var into = Vector<u8>.create();
+        Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+        Check.equalBytes("hi".bytes(), into.view())?;
+        Check.equalU64(2, client.stats().connections)?;
+    }
+    return Ok();
+}
+
+@test
+async fn anHttp2StreamTheServerEnds() -> Result<void, TestFailure> {
+    // The server's close ends its side of the stream at once. The client's echo has nowhere to go; its side is
+    // reset when the WebSocket is dropped, and the next request on the connection carries that out.
+    let copies = made(Channel<u8>.create(8192))?;
+    let client = h2Client();
+    var server = Vector<u8>.create();
+    h2Greeting(mut server, true)?;
+    let first = server.length;
+    headers(mut server, 3, "200", [], 4)?;
+    // A reason that makes this part as long as the first: each is one read.
+    var close = raw("03e8")?;
+    made(close.resize(2 + (first - 27), '.'))?;
+    var frames = Vector<u8>.create();
+    serverFrame(mut frames, 0x88, close.view())?;
+    frame(mut server, 0, 1, 3, frames.view())?;
+    Check.equalU64((first * 2) as u64, server.length as u64)?;
+    headers(mut server, 5, "200", [], 4)?;
+    data(mut server, 5, "ok", true)?;
+    scriptBytes(client, server.view(), first, 0, copies)?;
+    await gotOk(client, "http://example.com/")?;
+    {
+        let request = wsRequest("ws://example.com/chat")?;
+        var ws = match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(w) => w,
+            Err(e) => { return Err(failed(e)); },
+        };
+        var into = Vector<u8>.create();
+        Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+        Check.equalU64((first - 27) as u64, into.length as u64)?;
+    }
+    await gotOk(client, "http://example.com/")?;
+    let wire = written(copies)?;
+    let sent = sentFrames(wire.view(), true)?;
+    var resets: u64 = 0;
+    var bodies: u64 = 0;
+    for (i in 0..sent.length) {
+        if (sent[i].id == 3 && sent[i].kind == 3) {
+            resets += 1;
+            Check.equalU64(8, wire.readBE<u32>(sent[i].start) as u64)?; // CANCEL
+        } else if (sent[i].id == 3 && sent[i].kind == 0) {
+            bodies += 1;
+        }
+    }
+    Check.equalU64(1, resets)?;
+    Check.equalU64(0, bodies)?;
     return Ok();
 }

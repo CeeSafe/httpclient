@@ -1,13 +1,14 @@
 # httpclient
 
 An HTTP client for [CeeSafe](https://ceesafe.github.io/CeeSafe/): HTTP/1.1 and HTTP/2 here, HTTP/3 through the
-[httpclient3](httpclient3) package beside it. It is written for speed: a request is one write, the response is
+[httpclient3](httpclient3) package beside it, and typed JSON calls through [httpclient_json](httpclient_json). It is written for speed: a request is one write, the response is
 parsed in buffers that are reused, and a request on a warm connection allocates nothing. It is a new design after
 the .NET library CosmoHttpClient, not a translation of it.
 
 **Status:** HTTP/1.1 and HTTP/2 over TCP and TLS, connection pooling, buffered and streamed responses, redirects,
-retries, gzip and deflate, cookies, a response cache, WebSockets, streamed request bodies. Not yet: HTTP/3
-(see [What is not here yet](#what-is-not-here-yet)).
+retries, gzip and deflate, cookies, a response cache, WebSockets, streamed request bodies, proxies, gRPC framing;
+HTTP/3 and JSON in the two packages beside it. What is missing is listed under
+[What is not here yet](#what-is-not-here-yet).
 
 ```ceesafe
 import web_core;
@@ -222,7 +223,7 @@ not the same measurement.
 - **Streamed request bodies** (`client.upload(request, length)`, then `upload.write(bytes)` as often as needed and
   `upload.finish()` for the buffered response). With a length the body goes under `content-length` and must be
   exactly as long; without one it is chunked over HTTP/1.1, each chunk's size line and bytes in one vectored write,
-  and simply ends over HTTP/2, where a write waits for the server's window. Nothing of the body is kept, so nothing
+  and simply ends over HTTP/2 and HTTP/3, where a write waits for the server's window or the path. Nothing of the body is kept, so nothing
   is sent again: no redirect is followed and no retry made, and a pooled HTTP/1.1 connection the server had closed
   meanwhile is the caller's error. An upload dropped before `finish` closes its connection or resets its stream.
 - **Proxies** (`client.setProxy(Proxy.socks5(host, port)?)` or `Proxy.http(host, port)?`, with
@@ -235,13 +236,18 @@ not the same measurement.
 - **A name with several addresses** is not tried one address at a time: the first gets a head start (`raceMs`,
   250 ms), then the first address of the other family (IPv4 or IPv6) is tried beside it, and whichever connects
   first is used. A first address that fails outright ends its head start at once.
+- **JSON**, through the [httpclient_json](httpclient_json) package: `getJson<T>(client, url)` and
+  `postJson<B, T>(client, url, value)` for types that implement the `json` package's `ToJson` and `FromJson`.
+- **Tests without a network** (`client.script(mock)` with web_transport's `MockTransport`): the next dial gets a
+  connection whose server's bytes were written beforehand, and the client then dials nothing else. This package's
+  tests use it, and code built on the client can.
 - **HTTP/3**, through the [httpclient3](httpclient3) package (`Client.withHttp3(options, tls, transport)` with its
   `Http3Pool`): this package has no QUIC in it, only the place where a transport plugs in (`Http3Transport`). A
   request to an `https` origin that advertised HTTP/3 (`Alt-Svc`) goes over it, or every one with
   `http3PriorKnowledge`; `response.isHttp3()` says so. It sits below redirects, retries, the cache, cookies and
   decompression, which work the same. If HTTP/3 fails for an origin, the request goes over TCP (unless the server
   may have acted on it and it is not safe to repeat) and the origin stays on TCP for `http3RetryMs` (5 minutes).
-  Streamed responses (`open`) go over it too; uploads and WebSockets stay on TCP.
+  Streamed responses (`open`), uploads and WebSockets go over it too.
 - **gRPC** (`grpcRequest(url)`, `grpcUnary(client, request, message)`, `grpcNext(response.body(), mut at)`,
   `grpcStatus(response)`, `grpcMessage(response, mut text)`; `GrpcReader` for a server that streams). Messages are
   bytes: encoding them is the caller's. Over HTTP/2 only; no compressed messages; no call where both sides stream at
@@ -252,7 +258,7 @@ not the same measurement.
   records, server-sent events, logs. No JSON is parsed here.
 - **Counters** (`client.stats()`): requests ended, responses, errors, cache hits, retries, connections opened and
   the milliseconds taken. There are no hooks (finding F10): time and log around your own calls.
-- **WebSockets** (`client.webSocket(request, WebSocketOptions.defaults())`; RFC 6455, over HTTP/1.1). The request
+- **WebSockets** (`client.webSocket(request, WebSocketOptions.defaults())`; RFC 6455). The request
   is a GET for a `ws://` or `wss://` URL; its fields may offer subprotocols, and `ws.protocol()` is the one chosen.
   `sendText`, `sendBinary`, `ping`, `close(code, reason)` and `receive(mut into)`, which gives `Message.Text`,
   `Message.Binary` or `Message.Close(code)` with the bytes in the caller's vector, reused from message to message.
@@ -262,8 +268,16 @@ not the same measurement.
   a large frame's payload is read straight into the message. One task both sends and receives: `receive` may be
   cancelled (raced against something to send) and called again without losing anything. With
   `WebSocketOptions.compress` the server may compress its messages (permessage-deflate, RFC 7692, each message on
-  its own); what the client sends is never compressed. Not done: WebSockets over HTTP/2 (RFC 8441): a `TlsConfig`
-  for `wss` must offer only `http/1.1`.
+  its own), and the client compresses its own text and binary messages from `compressMinBytes` (128) up, when
+  that makes them shorter: `src/deflate.cee`, hash chains over the last 32 KiB and the fixed Huffman codes, with
+  nothing allocated for a message but its output. A WebSocket is a stream of an HTTP/2 connection the client
+  already has to the origin, if its server takes them there (an extended CONNECT, RFC 8441:
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`); else a stream of an HTTP/3 connection, to an origin the client speaks
+  HTTP/3 with whose server takes them (RFC 9220); else it gets an HTTP/1.1 connection of its own. The frames and
+  the API are the same on all three, and the `WebSocket` refers to the client that opened it. A new connection is
+  never made over HTTP/2 for a WebSocket: if the client has none to the origin, a `TlsConfig` for `wss` must let
+  the server pick `http/1.1`, or the answer is `NotSwitched(0)`. Dropped without its closing handshake, a
+  WebSocket's stream is reset, which the server learns with the connection's next write.
 - **Cookies** (`cookies`, off by default; RFC 6265). What `Set-Cookie` sets is kept in memory for the client's
   lifetime and sent back to the hosts and paths it belongs to, over both protocols and on each request a redirect
   leads to: `Domain` (the host and its subdomains, never a bare top-level name or another host), `Path`, `Secure`
@@ -288,8 +302,7 @@ not the same measurement.
 
 ## What is not here yet
 
-Of CosmoHttpClient's surface: HTTP/3 for uploads (requests with a body in hand and their responses, buffered or
-streamed, have it, through [httpclient3](httpclient3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
+Of CosmoHttpClient's surface: telemetry hooks (there are counters); Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; a proxy reached over TLS, and a different proxy for each scheme; TLS session resumption; a DNS cache.  In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
 in flight with `maxPerOrigin`).
@@ -298,7 +311,7 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 100 tests, over scripted connections and loopback listeners; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 108 tests, over scripted connections and loopback listeners; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
 python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib
@@ -315,6 +328,6 @@ OpenSSL 3 (Homebrew's `openssl@3` on macOS). CeeSafe bugs and gaps met on the wa
 
 ## License
 
-httpclient and httpclient3 are licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
+httpclient, httpclient3 and httpclient_json are licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
 as CeeSafe and CeeSafe.Web are, with an exception that permits linking them with OpenSSL
 ([COPYING.OPENSSL](COPYING.OPENSSL)), which they do through `web_tls` and `web_quic`.

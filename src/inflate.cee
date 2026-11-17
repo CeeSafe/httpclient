@@ -152,7 +152,9 @@ public struct Inflater {
         for (n in 0..256) {
             var c = truncate<u32>(n);
             for (k in 0..8) {
-                c = if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1;
+                // Not `if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1`: gcc 15.2's CRC optimisation (-O2)
+                // compiles that loop, as ceesafec writes it in C, to nothing at all (CEESAFE_FINDINGS.md, F14).
+                c = (c >> 1) ^ ((c & 1) * 0xEDB88320);
             }
             table[n] = c;
         }

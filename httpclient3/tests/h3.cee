@@ -17,11 +17,18 @@ struct Asked {
     outAt: usize;
     started: bool;
     done: bool;
+    /// A WebSocket (an extended CONNECT that was accepted): `input[parsed..]` is still to be looked at, `frames`
+    /// are the WebSocket's bytes that are not yet a whole frame, and `closing` says the stream ends after `out`.
+    tunnel: bool;
+    parsed: usize;
+    frames: Vector<u8>;
+    closing: bool;
 }
 
-/// The test server's application: one HTTP/3 connection.
+/// The test server's application: one HTTP/3 connection. With `tunnels` its SETTINGS allow extended CONNECT, and
+/// a WebSocket opened at `/ws` gets its messages back.
 struct Responder {
-    unused: u8;
+    tunnels: bool;
 }
 
 fn quicMade<T>(r: Result<T, AllocError>) -> Result<T, QuicError> {
@@ -54,6 +61,141 @@ fn dataFrame(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, Alloc
     return out.extend(bytes);
 }
 
+/// Looks at the first frame of a request: if it is whole and an extended CONNECT, the stream becomes a tunnel
+/// (200 at `/ws`) or is refused (403 elsewhere).
+fn tunnelOpening(a: borrow mut Asked) -> Result<void, AllocError> {
+    var at: usize = 0;
+    let kind = getVarint(a.input.view(), mut at) ?? 99;
+    let length = match (getVarint(a.input.view(), mut at)) {
+        Some(l) => truncate<usize>(l),
+        null => { return Ok(); },
+    };
+    if (kind != 1 || a.input.length - at < length) {
+        return Ok();
+    }
+    var head = Vector<u8>.create();
+    var spans = Vector<HeaderSpan>.create();
+    let decoded = qpackDecode(a.input[at..at + length], mut head, mut spans, 65536, 100);
+    var connect = false;
+    var websocket = false;
+    var version = false;
+    var path = "".bytes();
+    for (i in 0..spans.length) {
+        let name = head[spans[i].nameStart..spans[i].nameEnd];
+        let value = head[spans[i].valueStart..spans[i].valueEnd];
+        if (name == ":method".bytes()) {
+            connect = value == "CONNECT".bytes();
+        } else if (name == ":protocol".bytes()) {
+            websocket = value == "websocket".bytes();
+        } else if (name == "sec-websocket-version".bytes()) {
+            version = value == "13".bytes();
+        } else if (name == ":path".bytes()) {
+            path = value;
+        }
+    }
+    if (!connect) {
+        return Ok();
+    }
+    a.started = true;
+    a.parsed = at + length;
+    if (websocket && version && path == "/ws".bytes()) {
+        a.tunnel = true;
+        return headersFrame(mut a.out, "200", []);
+    }
+    a.closing = true;
+    return headersFrame(mut a.out, "403", []);
+}
+
+/// A WebSocket frame from the server: not masked.
+fn socketFrame(out: borrow mut Vector<u8>, first: u8, payload: Slice<u8>) -> Result<void, AllocError> {
+    out.push(first)?;
+    if (payload.length < 126) {
+        out.push(truncate<u8>(payload.length))?;
+    } else if (payload.length < 65536) {
+        out.push(126)?;
+        out.pushBE(truncate<u16>(payload.length))?;
+    } else {
+        out.push(127)?;
+        out.pushBE(payload.length as u64)?;
+    }
+    return out.extend(payload);
+}
+
+/// What a tunnel's client has sent so far, answered: a message comes back as it is, a ping as a pong, and a close
+/// is echoed and ends the stream.
+fn tunnelAnswer(a: borrow mut Asked) -> Result<void, AllocError> {
+    loop {
+        var at = a.parsed;
+        let kind = match (getVarint(a.input.view(), mut at)) {
+            Some(k) => k,
+            null => { break; },
+        };
+        let length = match (getVarint(a.input.view(), mut at)) {
+            Some(l) => truncate<usize>(l),
+            null => { break; },
+        };
+        if (a.input.length - at < length) {
+            break;
+        }
+        if (kind == 0) {
+            var piece = Vector<u8>.create();
+            piece.extend(a.input[at..at + length])?;
+            a.frames.extend(piece.view())?;
+        }
+        a.parsed = at + length;
+    }
+    var used: usize = 0;
+    var payload = Vector<u8>.create();
+    var frame = Vector<u8>.create();
+    loop {
+        let w = a.frames.view();
+        if (w.length - used < 6) {
+            break;
+        }
+        let first = w[used];
+        var length = (w[used + 1] & 127) as usize;
+        var p = used + 2;
+        if (length == 126) {
+            length = w.readBE<u16>(p) as usize;
+            p += 2;
+        } else if (length == 127) {
+            if (w.length - p < 12) {
+                break;
+            }
+            length = truncate<usize>(w.readBE<u64>(p));
+            p += 8;
+        }
+        if (w.length < p + 4 + length) {
+            break;
+        }
+        payload.clear();
+        payload.extend(w[p + 4..p + 4 + length])?;
+        for (i in 0..length) {
+            payload[i] = payload[i] ^ w[p + i % 4];
+        }
+        used = p + 4 + length;
+        let opcode = first & 15;
+        frame.clear();
+        if (opcode == 8) {
+            socketFrame(mut frame, 0x88, payload.view())?;
+            a.closing = true;
+        } else if (opcode == 9) {
+            socketFrame(mut frame, 0x8A, payload.view())?;
+        } else if (opcode == 1 || opcode == 2) {
+            socketFrame(mut frame, 0x80 | opcode, payload.view())?;
+        }
+        if (frame.length > 0) {
+            dataFrame(mut a.out, frame.view())?;
+        }
+    }
+    if (used > 0) {
+        let rest = a.frames.length - used;
+        a.frames.copyWithin(used, 0, rest);
+        a.frames.truncate(rest);
+    }
+    return Ok();
+}
+
 /// The answer to the request in `input` into `out`; false if the stream is to be reset instead.
 fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
     var head = Vector<u8>.create();
@@ -77,6 +219,7 @@ fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocErr
     var method = "".bytes();
     var agent = "".bytes();
     var authority = "".bytes();
+    var declared = "".bytes();
     for (i in 0..spans.length) {
         let name = head[spans[i].nameStart..spans[i].nameEnd];
         let value = head[spans[i].valueStart..spans[i].valueEnd];
@@ -88,6 +231,8 @@ fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocErr
             agent = value;
         } else if (name == ":authority".bytes()) {
             authority = value;
+        } else if (name == "content-length".bytes()) {
+            declared = value;
         }
     }
     if (path == "/hello".bytes()) {
@@ -139,6 +284,18 @@ fn answer(input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocErr
         headersFrame(mut out, "204", [])?;
     } else if (path == "/moved".bytes()) {
         headersFrame(mut out, "302", ["location", "/hello", "content-length", "0"][..])?;
+    } else if (path == "/sum".bytes()) {
+        // What an upload brought: how many bytes and their sum, and the length it declared.
+        var sum: u64 = 0;
+        for (k in 0..body.length) {
+            sum += body[k] as u64;
+        }
+        var text = String.create();
+        text.appendNumber(body.length as u64)?;
+        text.append(" ")?;
+        text.appendNumber(sum)?;
+        headersFrame(mut out, "200", ["x-declared", StringView.fromUtf8(declared) ?? ""][..])?;
+        dataFrame(mut out, text.view().bytes())?;
     } else if (path == "/reset".bytes()) {
         return Ok(false);
     } else {
@@ -161,10 +318,11 @@ impl QuicApplication for Responder {
                 Err(e) => { return Err(e); },
             };
             if (!control && link.handshakeDone()) {
-                // The control stream, with empty SETTINGS.
+                // The control stream, with SETTINGS: empty, or SETTINGS_ENABLE_CONNECT_PROTOCOL = 1.
                 let id = link.openUniStream()?;
-                let first = [0u8, 4, 0];
-                let _ = link.writeStream(id, first[..], false)?;
+                let empty = [0u8, 4, 0];
+                let connect = [0u8, 4, 2, 8, 1];
+                let _ = link.writeStream(id, if (this.tunnels) connect[..] else empty[..], false)?;
                 control = true;
             }
             match (event) {
@@ -184,10 +342,22 @@ impl QuicApplication for Responder {
                                 outAt: 0,
                                 started: false,
                                 done: false,
+                                tunnel: false,
+                                parsed: 0,
+                                frames: Vector<u8>.create(),
+                                closing: false,
                             }))?;
                         }
                         quicMade(asked[k].input.extend(buffer.view()[0..n]))?;
-                        if (fin && !asked[k].started) {
+                        if (!asked[k].started && this.tunnels) {
+                            quicMade(tunnelOpening(mut asked[k]))?;
+                        }
+                        if (asked[k].tunnel) {
+                            quicMade(tunnelAnswer(mut asked[k]))?;
+                            if (fin) {
+                                asked[k].closing = true;
+                            }
+                        } else if (fin && !asked[k].started) {
                             asked[k].started = true;
                             var out = Vector<u8>.create();
                             let answered = quicMade(answer(asked[k].input.view(), mut out))?;
@@ -204,9 +374,14 @@ impl QuicApplication for Responder {
             }
             for (i in 0..asked.length) {
                 if (asked[i].started && !asked[i].done) {
-                    let n = link.writeStream(asked[i].stream, asked[i].out[asked[i].outAt..], true)?;
+                    // A tunnel stays open until its close; anything else ends with its answer.
+                    let ends = !asked[i].tunnel || asked[i].closing;
+                    if (!ends && asked[i].outAt == asked[i].out.length) {
+                        continue;
+                    }
+                    let n = link.writeStream(asked[i].stream, asked[i].out[asked[i].outAt..], ends)?;
                     asked[i].outAt += n;
-                    if (asked[i].outAt == asked[i].out.length) {
+                    if (ends && asked[i].outAt == asked[i].out.length) {
                         asked[i].done = true;
                     }
                 }
@@ -417,6 +592,29 @@ async fn scenarios(tls: borrow QuicTls, server: SocketAddress) -> Result<void, T
         s.spawn(async () => await getOne(conn, "https://localhost/nothing", 204, ""));
     })?;
     Check.equalU64(0, conn.inFlight() as u64)?;
+    // This server's SETTINGS do not allow extended CONNECT: a tunnel is not asked for, and nothing was sent.
+    {
+        let request = asking(Method.Get, "https://localhost/ws")?;
+        var answer = Http3Answer.create();
+        match (await conn.tunnelInto(
+            "websocket".bytes(),
+            request.url(),
+            request.urlParts(),
+            request.fieldLines(),
+            2000,
+            mut answer,
+        )) {
+            Ok(_) => { return Check.fail("no tunnel on this server"); }
+            Err(f) => {
+                Check.isTrue(f.unsent, "nothing was sent")?;
+                Check.equalBytes(
+                    HttpErrors.describe(HttpError.NotSwitched(0)).bytes(),
+                    HttpErrors.describe(f.error).bytes(),
+                )?;
+            }
+        }
+        Check.equalU64(0, conn.inFlight() as u64)?;
+    }
     await conn.close();
     let late = asking(Method.Get, "https://localhost/hello")?;
     Check.isTrue((await conn.send(late, "".bytes())).isErr(), "nothing after close")?;
@@ -446,7 +644,7 @@ async fn requestsOverHttp3() -> Result<void, TestFailure> {
         Ok(t) => t,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };
-    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { unused: 0 })) {
+    let boxed: Box<dyn QuicApplication + Send + Share> = match (Box.create(Responder { tunnels: false })) {
         Ok(b) => b,
         Err(_) => { return Err(TestFailure.create("out of memory")); },
     };

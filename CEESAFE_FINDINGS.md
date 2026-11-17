@@ -20,6 +20,8 @@ arm64 unless an entry says otherwise.
 | F11 | gcc 13 warns `free` called on `ceesafe_vec_empty` in generated C (`-Wfree-nonheap-object`) | CeeSafe (build noise, no runtime fault) | open |
 | F12 | `ceesafec fmt` never wraps an interface method's signature, and wraps its `@effects(...)` instead | CeeSafe (formatter) | open |
 | F13 | web_client over HTTP/2 with 64 KiB bodies: 117 to 1,079 requests a second on Linux | CeeSafe.Web (performance) | open, not looked into |
+| F14 | gcc 15.2 at `-O2` compiles a bitwise CRC loop in ceesafec's C to an empty function (`-foptimize-crc`) | gcc; ceesafec could pass `-fno-optimize-crc` | open; worked around here, reduced to C |
+| F15 | `Async.timeout` and `Async.race` cannot wrap a call whose result borrows what the closure captures (N0245) | CeeSafe (ergonomics, not a bug) | open; worked around here |
 
 The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
@@ -348,8 +350,95 @@ is not what is slow. With one stream a request takes 8.5 ms of which 0.25 ms is 
 16 and 64 streams the CPU time is what grows. On an M1 the same rows were 2,119, 7,443 and 8,670 a second: slow
 there too, less so. No run failed.
 
+## F14. gcc 15.2 at `-O2` compiles a bitwise CRC loop, as ceesafec writes it in C, to an empty function
+
+ceesafec 0.62.2, gcc 15.2.0 (Ubuntu 26.04's `15.2.0-16ubuntu1`, x86-64). Not seen with gcc 13.3 (Ubuntu 24.04) or
+Apple clang. **A gcc bug, not a CeeSafe one, but ceesafec's C is what meets it**, and a CeeSafe program has no way
+to see it coming. **Worked around here** in `src/inflate.cee`.
+
+The CRC-32 table of `Inflater.create` was built the usual way:
+
+```
+for (n in 0..256) {
+    var c = truncate<u32>(n);
+    for (k in 0..8) {
+        c = if ((c & 1) != 0) 0xEDB88320 ^ (c >> 1) else c >> 1;
+    }
+    table[n] = c;
+}
+```
+
+On GitHub's `ubuntu-26.04` runner 68 of the 100 tests then crashed (SIGSEGV), every one that makes a `Client`;
+a debug build (`-g`, so `-O0`) passed. In the binary `ceeM_8Inflater_create` had no code at all: its symbol had
+the address of the next function, and its caller fell into that one. gcc 15 has a new pass that recognises bitwise
+CRC loops (`-foptimize-crc`, on at `-O2`); with `--cflag -fno-optimize-crc` the code is right, and so it is at
+`-O1` and `-O3`. The same loop written by hand in C the short way (`for (int k = 0; k < 8; k++) c = (c & 1) ? ... `)
+is compiled correctly; the shape ceesafec emits is not. Reduced to plain C (`gcc -O2 r.c && ./a.out` crashes;
+it should print `77073096 2d02ef8d`):
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+typedef struct { uint32_t e[256]; } A;
+__attribute__((noinline)) A create(void) {
+    A table;
+    uint64_t t7 = 0;
+    for (;;) {
+        if (!(t7 < 256)) break;
+        uint32_t c = (uint32_t)t7;
+        int32_t t10 = 0;
+        for (;;) {
+            if (!(t10 < 8)) break;
+            uint32_t t13;
+            if ((c & 1u) != 0) { t13 = 3988292384u ^ (c >> 1); } else { t13 = c >> 1; }
+            c = t13;
+            t10 = t10 + 1;
+        }
+        table.e[t7] = c;
+        t7 = t7 + 1;
+    }
+    return table;
+}
+int main(void) { A a = create(); printf("%08x %08x\n", a.e[1], a.e[255]); return 0; }
+```
+
+The workaround is a step without a branch, which the pass does not take for a CRC:
+`c = (c >> 1) ^ ((c & 1) * 0xEDB88320);`. For CeeSafe: ceesafec could pass `-fno-optimize-crc` to gcc 15, and the
+reduction is ready to be reported to gcc. Any CeeSafe program with a bit-at-a-time CRC loop is exposed.
+
 ## F2. Withdrawn: diagnostics were not printed twice
 
 Reported as "`ceesafec check <file>` prints each diagnostic twice". It does not. The commands that showed it ran
 `ceesafec check` and then `ceesafec run --interp` (or `ceesafec test`) on the same file in one line, and each printed
 the error once. Checked again with 0.57.1 and 0.60.0: one diagnostic for each error.
+
+## F15. A time limit cannot go around a call whose result borrows from the caller
+
+Found with ceesafec 0.62.2. `WebSocket<region c>` refers to its client (it may be a stream of the client's HTTP/2
+or HTTP/3 connection), as `Response<c>` and `Upload<c>` do. Opening one under a time limit was
+
+```
+return await Async.timeout(
+    options.handshakeMs,
+    HttpError.Net(NetError.TimedOut),
+    async () => await openWebSocket(this, url, parts, fields, packed, options, key),
+);
+```
+
+and the compiler says
+
+```
+error[N0245]: this closure's result may hold a reference derived from what the closure captures, and a closure's
+result cannot borrow from the closure; a type parameter without a 'Send' bound may be a reference, so return a
+value of a type known to own its data (type-system.md §36.2, §25.7)
+```
+
+The rule is the documented one, and the message is clear. The gap is that nothing in lib/std puts a time limit (or
+a race) around an async call that returns a value of the caller's own region, although the borrow the result holds
+is the caller's (`this`, region `c`), not the closure's: the closure only copies it.
+
+What this package does instead: the limit goes around each part that waits and returns something owned (the new
+connection with the answer's head read, `Result<Connection, HttpError>`; the wait for an HTTP/2 stream's head,
+`Result<void, HttpError>`), and the `WebSocket<c>` is put together outside the closure, where nothing waits. The
+same shape was already used for `Response<c>` (`h2Answer`, `answer`). It costs a split of every such function in
+two, and the limit covers each part by itself, not the whole.

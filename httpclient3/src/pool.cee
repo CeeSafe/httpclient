@@ -210,6 +210,54 @@ impl Http3Transport for Http3Pool {
         return Ok(((i as u64) << 32) | slot as u64);
     }
 
+    async fn begin(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        length: u64?,
+        maxBodyBytes: u64,
+    ) -> Result<u64, Http3Failure> {
+        let i = await this.acquire(url, parts, port)?;
+        let slot = this.conns[i].begin(method, url, parts, fields, length, maxBodyBytes)?;
+        return Ok(((i as u64) << 32) | slot as u64);
+    }
+
+    async fn tunnel(
+        borrow this,
+        protocol: Slice<u8>,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure> {
+        let i = await this.acquire(url, parts, port)?;
+        let slot = await this.conns[i].tunnelInto(protocol, url, parts, fields, responseMs, mut answer)?;
+        return Ok(((i as u64) << 32) | slot as u64);
+    }
+
+    async fn shut(borrow this, stream: u64) -> Result<void, HttpError> =>
+        await this.conns[truncate<usize>(stream >> 32)].endBody(truncate<usize>(stream & 0xFFFFFFFF));
+
+    async fn write(borrow this, stream: u64, bytes: Slice<u8>) -> Result<void, HttpError> =>
+        await this.conns[truncate<usize>(stream >> 32)].sendBody(truncate<usize>(stream & 0xFFFFFFFF), bytes);
+
+    async fn finish(
+        borrow this,
+        stream: u64,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, HttpError> =>
+        await this.conns[truncate<usize>(stream >> 32)].finishInto(
+            truncate<usize>(stream & 0xFFFFFFFF),
+            responseMs,
+            mut answer,
+        );
+
     async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError> =>
         await this.conns[truncate<usize>(stream >> 32)].read(truncate<usize>(stream & 0xFFFFFFFF), buffer);
 

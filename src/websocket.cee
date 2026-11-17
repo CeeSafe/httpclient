@@ -1,10 +1,13 @@
-// WebSockets (RFC 6455) over HTTP/1.1: the opening handshake, then messages both ways.
+// WebSockets (RFC 6455): the opening handshake, then messages both ways.
 //
-// A WebSocket owns its connection, which never goes back to a pool. Sending and receiving both need the connection,
-// so one task does both; `receive` may be cancelled (raced against something to send) and called again with the same
+// A WebSocket is a stream of an HTTP/2 connection the client already has to the origin, if its server takes them
+// there (an extended CONNECT, RFC 8441); else a stream of an HTTP/3 connection, to an origin the client speaks
+// HTTP/3 with and whose server takes them (RFC 9220); else it has an HTTP/1.1 connection of its own, which never
+// goes back to a pool. The frames are the same on all three. Sending and receiving both need the connection or the
+// stream, so one task does both; `receive` may be cancelled (raced against something to send) and called again with the same
 // vector, and loses nothing: what has arrived stays in the socket's buffers and the message so far in the vector.
-// With `WebSocketOptions.compress` the server may compress its messages (permessage-deflate); this client's are
-// never compressed.
+// With `WebSocketOptions.compress` the server may compress its messages (permessage-deflate), and this client
+// compresses its own from `compressMinBytes` up.
 import web_core;
 import web_transport;
 import web_tls;
@@ -16,14 +19,17 @@ public struct WebSocketOptions {
     public handshakeMs: u64;
     /// The longest message `receive` accepts; a longer one closes the connection (1009).
     public maxMessageBytes: usize;
-    /// Offer permessage-deflate (RFC 7692), so that the server may compress its messages. Each message is then
-    /// compressed on its own (`server_no_context_takeover`): nothing is kept between messages. What this client
-    /// sends is never compressed.
+    /// Offer permessage-deflate (RFC 7692). If the server agrees, it may compress its messages and this client
+    /// compresses its own. Each message is compressed on its own (`server_no_context_takeover`,
+    /// `client_no_context_takeover`): nothing is kept between messages.
     public compress: bool;
+    /// The shortest text or binary message this client compresses; a message that would not get shorter goes as
+    /// it is.
+    public compressMinBytes: usize;
 
-    /// 10 s for the handshake, messages up to 16 MiB, no compression.
+    /// 10 s for the handshake, messages up to 16 MiB, no compression (with it, messages from 128 bytes).
     public fn defaults() -> WebSocketOptions =>
-        WebSocketOptions { handshakeMs: 10000, maxMessageBytes: 16777216, compress: false };
+        WebSocketOptions { handshakeMs: 10000, maxMessageBytes: 16777216, compress: false, compressMinBytes: 128 };
 }
 
 /// What `WebSocket.receive` got.
@@ -44,10 +50,10 @@ const OP_CLOSE: u8 = 8;
 const OP_PING: u8 = 9;
 const OP_PONG: u8 = 10;
 
-/// An open WebSocket.
+/// An open WebSocket. It refers to the client that opened it, whose connection it may share.
 @noncopy
-public struct WebSocket {
-    private link: Link;
+public struct WebSocket<region c> {
+    private pipe: Tunnel<c>;
     /// What has been read and not used: `inbuf[start..end]`.
     private inbuf: Vector<u8>;
     private start: usize;
@@ -71,17 +77,47 @@ public struct WebSocket {
     private compressed: bool;
     private inflater: Inflater?;
     private packed: Vector<u8>;
+    /// What compresses the messages sent, the shortest it is tried on, and the compressed bytes of the one going out.
+    private deflater: Deflater?;
+    private compressFrom: usize;
+    private squeezed: Vector<u8>;
 
     /// The subprotocol the server chose among those the request offered (`Sec-WebSocket-Protocol`), empty if none.
     public fn protocol(borrow this) -> Slice<u8> => this.chosen.view();
 
     /// Sends a text message.
     public async fn sendText(borrow mut this, text: StringView) -> Result<void, HttpError> =>
-        await this.send(OP_TEXT, text.bytes());
+        await this.sendMessage(OP_TEXT, text.bytes());
 
     /// Sends a binary message.
     public async fn sendBinary(borrow mut this, bytes: Slice<u8>) -> Result<void, HttpError> =>
-        await this.send(OP_BINARY, bytes);
+        await this.sendMessage(OP_BINARY, bytes);
+
+    /// A message in one frame, compressed if that was agreed, it is long enough, and it gets shorter that way.
+    async fn sendMessage(borrow mut this, opcode: u8, payload: Slice<u8>) -> Result<void, HttpError> {
+        if (this.closeSent) {
+            return Err(HttpError.Closed);
+        }
+        if (payload.length < this.compressFrom) {
+            return await this.frame(opcode, payload);
+        }
+        var squeezed = replace(mut this.squeezed, Vector<u8>.create());
+        squeezed.clear();
+        let packed = match (borrow mut this.deflater) {
+            Some(z) => z.message(payload, mut squeezed),
+            null => Ok(),
+        };
+        // The first reserved bit says the message is compressed (RFC 7692 §6).
+        var sent: Result<void, HttpError> = Err(HttpErrors.noMemory());
+        if (packed.isOk()) {
+            sent = if (squeezed.length > 0 && squeezed.length < payload.length) await this.frame(
+                0x40 | opcode,
+                squeezed.view(),
+            ) else await this.frame(opcode, payload);
+        }
+        swap(mut this.squeezed, mut squeezed);
+        return sent;
+    }
 
     /// Sends a ping with up to 125 bytes of `payload`; the server's pong is dropped by `receive`.
     public async fn ping(borrow mut this, payload: Slice<u8>) -> Result<void, HttpError> {
@@ -145,7 +181,7 @@ public struct WebSocket {
                         Ok() => {}
                         Err(_) => { return Err(HttpErrors.noMemory()); }
                     }
-                    let got = await this.link.read(mut into[old..]);
+                    let got = await this.pipe.read(mut into[old..]);
                     match (got) {
                         Ok(n) => {
                             into.truncate(old + n);
@@ -156,7 +192,7 @@ public struct WebSocket {
                         }
                         Err(e) => {
                             into.truncate(old);
-                            return Err(HttpError.Net(e));
+                            return Err(e);
                         }
                     }
                 }
@@ -250,6 +286,7 @@ public struct WebSocket {
                         let echoed = await this.send(OP_CLOSE, payload[0..echoLength]);
                         this.closeSent = true;
                     }
+                    await this.pipe.shut();
                     into.clear();
                     this.inMessage = false;
                     if (size > 2) {
@@ -302,14 +339,14 @@ public struct WebSocket {
                     Err(_) => { return Err(HttpErrors.noMemory()); }
                 }
             }
-            match (await this.link.read(mut this.inbuf[this.end..])) {
+            match (await this.pipe.read(mut this.inbuf[this.end..])) {
                 Ok(n) => {
                     if (n == 0) {
                         return Err(HttpError.Net(NetError.Closed));
                     }
                     this.end += n;
                 }
-                Err(e) => { return Err(HttpError.Net(e)); }
+                Err(e) => { return Err(e); }
             }
         }
         return Ok();
@@ -324,15 +361,22 @@ public struct WebSocket {
             this.closeSent = true;
         }
         this.closeReceived = true;
+        await this.pipe.shut();
         return Err(HttpError.Response(fault));
     }
 
-    /// One frame with the whole of `payload`, masked with a fresh key (§5.3): the header and the payload's first
-    /// 64 KiB in one write, the rest 64 KiB at a time.
+    /// One frame with the whole of `payload`, unless the closing frame has gone.
     async fn send(borrow mut this, opcode: u8, payload: Slice<u8>) -> Result<void, HttpError> {
         if (this.closeSent) {
             return Err(HttpError.Closed);
         }
+        return await this.frame(opcode, payload);
+    }
+
+    /// One frame with the whole of `payload`, masked with a fresh key (§5.3): the header and the payload's first
+    /// 64 KiB in one write, the rest 64 KiB at a time. `lead` is the opcode, with the first reserved bit for a
+    /// compressed message.
+    async fn frame(borrow mut this, lead: u8, payload: Slice<u8>) -> Result<void, HttpError> {
         var key = [0u8; 4];
         match (Random.fill(mut key[..])) {
             Ok() => {}
@@ -340,7 +384,7 @@ public struct WebSocket {
         }
         this.out.clear();
         var header = [0u8; 14];
-        header[0] = 0x80 | opcode;
+        header[0] = 0x80 | lead;
         var used: usize = 2;
         if (payload.length < 126) {
             header[1] = 0x80 | truncate<u8>(payload.length);
@@ -382,10 +426,7 @@ public struct WebSocket {
                 this.out[base + i] = this.out[base + i] ^ key[i % 4];
                 i += 1;
             }
-            match (await this.link.write(this.out.view())) {
-                Ok() => {}
-                Err(e) => { return Err(HttpError.Net(e)); }
-            }
+            await this.pipe.write(this.out.view())?;
             this.out.clear();
             at += n;
             first = false;
@@ -395,44 +436,40 @@ public struct WebSocket {
 }
 
 /// Opens a WebSocket with `request` (a GET for a `ws://` or `wss://` URL; any `Sec-WebSocket-Protocol`, `Origin`
-/// or credentials are its fields): connects, sends the upgrade with `key` (16 bytes), and checks the answer
-/// (RFC 6455 §4.1, §4.2.2).
-async fn openWebSocket(
-    client: borrow Client,
+/// or credentials are its fields, `fields` as lines and `packed` as HPACK): on a stream of a connection the client
+/// has, if the server takes WebSockets there; else it connects, sends the upgrade with `key` (16 bytes), and checks
+/// the answer (RFC 6455 §4.1, §4.2.2).
+async fn openWebSocket<region c>(
+    client: borrow(c) Client,
     url: Slice<u8>,
     parts: UrlParts,
     fields: Slice<u8>,
+    packed: Slice<u8>,
     options: WebSocketOptions,
     key: Slice<u8>,
-) -> Result<WebSocket, HttpError> {
-    let wire = await dial(client, url, parts, true)?;
-    if (wireAlpn(wire) is Alpn.Http2) {
-        return Err(HttpError.NotSwitched(0)); // the TLS configuration chose h2: no upgrade is possible there
+) -> Result<WebSocket<c>, HttpError> {
+    match (await tunnelled(client, url, parts, fields, packed, options)?) {
+        Some(ws) => { return Ok(ws); }
+        null => {}
     }
-    var conn = match (Connection.create(wire, 16384)) {
-        Ok(c) => c,
-        Err(_) => { return Err(HttpErrors.noMemory()); },
-    };
     var keyText = Vector<u8>.create();
     var extra = Vector<u8>.create();
-    let built = buildUpgrade(key, mut keyText, mut extra, options.compress);
-    let written = if (built.isOk()) writeRequestHead(
-        mut conn.out,
-        Method.Get,
+    match (buildUpgrade(key, mut keyText, mut extra, options.compress)) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    let upgrading = if (options.handshakeMs == 0) await upgrade(
+        client,
         url,
         parts,
         fields,
         extra.view(),
-        null,
-        false,
-        false,
-    ) else built;
-    match (written) {
-        Ok() => {}
-        Err(_) => { return Err(HttpErrors.noMemory()); }
-    }
-    let limits = ClientOptions.defaults();
-    await conn.exchange("".bytes(), false, limits)?;
+    ) else await Async.timeout(
+        options.handshakeMs,
+        HttpError.Net(NetError.TimedOut),
+        async () => await upgrade(client, url, parts, fields, extra.view()),
+    );
+    var conn = upgrading?;
     let status = conn.parser.status;
     if (status != 101) {
         return Err(HttpError.NotSwitched(status));
@@ -458,43 +495,150 @@ async fn openWebSocket(
     if (!upgraded || !connected || !accepted) {
         return Err(HttpError.Response(Fault.BadWebSocket));
     }
-    // An extension only if it was offered, and only as it was offered: each message compressed on its own.
+    var chosen = Vector<u8>.create();
+    let extensions: Slice<u8>? = match (conn.find("sec-websocket-extensions".bytes())) {
+        Some(i) => Some(conn.value(i)),
+        null => null,
+    };
+    let protocol: Slice<u8>? = match (conn.find("sec-websocket-protocol".bytes())) {
+        Some(i) => Some(conn.value(i)),
+        null => null,
+    };
+    let deflate = settle(extensions, protocol, fields, options, mut chosen)?;
+    // What the server sent after its answer is the first of its frames.
+    let start = conn.parser.cursor;
+    let end = conn.filled;
+    let pipe = Tunnel {
+        client: client,
+        link: Some(conn.link),
+        viaH2: false,
+        session: 0,
+        slot: 0,
+        generation: 0,
+        viaH3: false,
+        h3Stream: 0,
+        head: Vector<u8>.create(),
+        spans: Vector<HeaderSpan>.create(),
+    };
+    return assemble(pipe, conn.buffer, start, end, conn.out, chosen, deflate, options);
+}
+
+/// A new connection for a WebSocket, the upgrade (the request's `fields` and the handshake's own, `extra`) sent on
+/// it and the answer's head read.
+async fn upgrade(
+    client: borrow Client,
+    url: Slice<u8>,
+    parts: UrlParts,
+    fields: Slice<u8>,
+    extra: Slice<u8>,
+) -> Result<Connection, HttpError> {
+    let wire = await dial(client, url, parts, true)?;
+    if (wireAlpn(wire) is Alpn.Http2) {
+        // The TLS configuration chose h2 for a new connection, where no upgrade is possible; and the client has
+        // no HTTP/2 connection to this origin that takes WebSockets.
+        return Err(HttpError.NotSwitched(0));
+    }
+    var conn = match (Connection.create(wire, 16384)) {
+        Ok(c) => c,
+        Err(_) => { return Err(HttpErrors.noMemory()); },
+    };
+    match (writeRequestHead(mut conn.out, Method.Get, url, parts, fields, extra, null, false, false)) {
+        Ok() => {}
+        Err(_) => { return Err(HttpErrors.noMemory()); }
+    }
+    let limits = ClientOptions.defaults();
+    await conn.exchange("".bytes(), false, limits)?;
+    return Ok(conn);
+}
+
+/// The fields an extended CONNECT for a WebSocket has besides the request's own, as lines: the version, and the
+/// offer of permessage-deflate. There is no key and no `Upgrade` (RFC 8441 §5).
+fn tunnelFields(lines: borrow mut Vector<u8>, compress: bool) -> Result<void, AllocError> {
+    lines.extend("Sec-WebSocket-Version: 13\r\n".bytes())?;
+    if (compress) {
+        lines.extend(
+            "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n".bytes(),
+        )?;
+    }
+    return Ok();
+}
+
+/// The value of the field `name` (lowercase) in an HTTP/2 or HTTP/3 answer's fields.
+fn answered<region r>(head: Slice<r, u8>, spans: Slice<HeaderSpan>, name: Slice<u8>) -> Slice<r, u8>? {
+    for (i in 0..spans.length) {
+        let f = spans[i];
+        if (head[f.nameStart..f.nameEnd] == name) {
+            return Some(head[f.valueStart..f.valueEnd]);
+        }
+    }
+    return null;
+}
+
+/// What the server's answer agreed to: whether permessage-deflate (`extensions` is its `Sec-WebSocket-Extensions`),
+/// and into `chosen` the subprotocol (`protocol` is its `Sec-WebSocket-Protocol`). An extension only if it was
+/// offered, and only as it was offered (each message compressed on its own); a subprotocol only among those the
+/// request's `fields` offered.
+fn settle(
+    extensions: Slice<u8>?,
+    protocol: Slice<u8>?,
+    fields: Slice<u8>,
+    options: WebSocketOptions,
+    chosen: borrow mut Vector<u8>,
+) -> Result<bool, HttpError> {
     var deflate = false;
-    match (conn.find("sec-websocket-extensions".bytes())) {
-        Some(i) => {
-            if (!options.compress || !agreesDeflate(conn.value(i))) {
+    match (extensions) {
+        Some(value) => {
+            if (!options.compress || !agreesDeflate(value)) {
                 return Err(HttpError.Response(Fault.BadWebSocket));
             }
             deflate = true;
         }
         null => {}
     }
-    var chosen = Vector<u8>.create();
-    match (conn.find("sec-websocket-protocol".bytes())) {
-        Some(i) => {
+    match (protocol) {
+        Some(value) => {
             let offered = match (fieldValue(fields, "sec-websocket-protocol".bytes())) {
-                Some(list) => hasToken(list, conn.value(i)),
+                Some(list) => hasToken(list, value),
                 null => false,
             };
             if (!offered) {
                 return Err(HttpError.Response(Fault.BadWebSocket));
             }
-            match (chosen.extend(conn.value(i))) {
+            match (chosen.extend(value)) {
                 Ok() => {}
                 Err(_) => { return Err(HttpErrors.noMemory()); }
             }
         }
         null => {}
     }
-    // What the server sent after its answer is the first of its frames.
-    let start = conn.parser.cursor;
-    let end = conn.filled;
+    return Ok(deflate);
+}
+
+/// The WebSocket over `pipe`, the handshake done. `inbuf[start..end]` is what has arrived after the server's
+/// answer, the first of its frames; `out` is room for what is sent.
+fn assemble<region c>(
+    pipe: Tunnel<c>,
+    inbuf: Vector<u8>,
+    start: usize,
+    end: usize,
+    out: Vector<u8>,
+    chosen: Vector<u8>,
+    deflate: bool,
+    options: WebSocketOptions,
+) -> Result<WebSocket<c>, HttpError> {
+    var deflater: Deflater? = null;
+    if (deflate) {
+        match (Deflater.create()) {
+            Ok(z) => { deflater = Some(z); }
+            Err(_) => { return Err(HttpErrors.noMemory()); }
+        }
+    }
     return Ok(WebSocket {
-        link: conn.link,
-        inbuf: conn.buffer,
+        pipe: pipe,
+        inbuf: inbuf,
         start: start,
         end: end,
-        out: conn.out,
+        out: out,
         maxMessage: options.maxMessageBytes,
         chosen: chosen,
         closeSent: false,
@@ -508,6 +652,9 @@ async fn openWebSocket(
         compressed: false,
         inflater: if (deflate) Some(Inflater.create()) else null,
         packed: Vector<u8>.create(),
+        deflater: deflater,
+        compressFrom: if (deflate) options.compressMinBytes else 0xFFFFFFFFFFFFFFFF,
+        squeezed: Vector<u8>.create(),
     });
 }
 

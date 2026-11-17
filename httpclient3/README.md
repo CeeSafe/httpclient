@@ -55,12 +55,16 @@ await conn.close();
   time limit (`handshakeMs`), and a name's addresses are tried in turn, so a server that does not answer on UDP
   costs a moment and the client goes back to TCP. A connection idle for longer than `idleMs` is not used again; a
   new one is made in its place.
+- **WebSockets** (RFC 9220). `Client.webSocket` to an origin the client speaks HTTP/3 with opens a stream of the
+  pooled connection with an extended CONNECT, once the server's SETTINGS have said it takes them
+  (`SETTINGS_ENABLE_CONNECT_PROTOCOL`); a server that does not is left to TCP for WebSockets, and HTTP/3 stays in
+  use for its requests.
 
 ## What is not here yet
 
-Through the client, uploads written piece by piece and WebSockets do not go over HTTP/3. No 0-RTT or session resumption, no connection
-migration, no keep-alive of idle connections, no server push (never allowed), no request bodies written piece by
-piece. A name's addresses are tried one after another, not raced. When every place in the pool is taken by servers
+No 0-RTT or session resumption, no connection
+migration, no keep-alive of idle connections, no server push (never allowed). On an `H3Connection` used by itself a request's body is given whole (through
+the client there is `Client.upload`). A name's addresses are tried one after another, not raced. When every place in the pool is taken by servers
 with requests in flight, a request for another server goes over TCP. The request body is copied once into the
 stream's queue.
 

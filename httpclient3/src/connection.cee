@@ -25,6 +25,8 @@ const H3_REQUEST_REJECTED: u64 = 0x10b;
 const H3_REQUEST_CANCELLED: u64 = 0x10c;
 
 const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 6;
+/// The server takes extended CONNECT requests (RFC 9220 §3).
+const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 8;
 
 /// A slot's stream has not been opened yet (the handshake is not done, or the server allows no more now).
 const NO_STREAM: i64 = -1;
@@ -34,6 +36,8 @@ const WANT_END: u8 = 2;
 const WANT_DATA: u8 = 3;
 /// The handshake is done and our control stream is open; it names no stream.
 const WANT_READY: u8 = 4;
+/// Everything queued on the stream has been handed to QUIC.
+const WANT_FLUSHED: u8 = 5;
 const NO_SLOT: usize = 0xFFFFFFFF;
 
 /// The limits of an HTTP/3 connection.
@@ -76,6 +80,10 @@ struct H3Stream {
     out: Vector<u8>;
     outAt: usize;
     outDone: bool;
+    /// The request's body is still being written (an upload): the stream is not ended after `out`.
+    open: bool;
+    /// An extended CONNECT: it waits for the server's SETTINGS, and goes only if they allow it (RFC 9220 §3).
+    gated: bool;
     /// QUIC took less than was offered: nothing more until it says the stream is writable.
     blocked: bool;
     /// A frame header that has arrived in part.
@@ -118,6 +126,8 @@ struct H3Stream {
         out: Vector<u8>.create(),
         outAt: 0,
         outDone: false,
+        open: false,
+        gated: false,
         blocked: false,
         partial: Vector<u8>.create(),
         inFrame: false,
@@ -168,8 +178,9 @@ struct H3State {
     leading: bool;
     /// Our control stream is open and carries our SETTINGS.
     opened: bool;
-    /// The server's SETTINGS have arrived.
+    /// The server's SETTINGS have arrived, and whether they allow extended CONNECT requests.
     settled: bool;
+    peerConnect: bool;
     broken: bool;
     failure: HttpError;
     /// The server sent GOAWAY: no new requests.
@@ -255,6 +266,7 @@ public struct H3Connection {
             leading: false,
             opened: false,
             settled: false,
+            peerConnect: false,
             broken: true,
             failure: HttpError.Closed,
             draining: false,
@@ -331,6 +343,7 @@ public struct H3Connection {
         st.unis.clear();
         st.opened = false;
         st.settled = false;
+        st.peerConnect = false;
         st.broken = false;
         st.draining = false;
         st.held = 0;
@@ -394,7 +407,18 @@ public struct H3Connection {
         responseMs: u64,
         answer: borrow mut Http3Answer,
     ) -> Result<usize, Http3Failure> {
-        let slot = match (this.reserve(method, url, parts, fields, body, false, 0xFFFFFFFFFFFFFFFF)) {
+        let slot = match (this.reserve(
+            method,
+            url,
+            parts,
+            fields,
+            body,
+            false,
+            0xFFFFFFFFFFFFFFFF,
+            false,
+            null,
+            "".bytes(),
+        )) {
             Ok(s) => s,
             Err(e) => { return Err(Http3Failure { error: e, unsent: true }); },
         };
@@ -418,6 +442,161 @@ public struct H3Connection {
         }
     }
 
+    /// Starts a request whose body is written piece by piece (`sendBody`, then `finishInto`): its slot, held until
+    /// `finishInto` or `giveBack`. With `length` the request declares it.
+    fn begin(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        fields: Slice<u8>,
+        length: u64?,
+        maxBodyBytes: u64,
+    ) -> Result<usize, Http3Failure> =>
+        match (this.reserve(method, url, parts, fields, "".bytes(), true, maxBodyBytes, true, length, "".bytes())) {
+            Ok(s) => Ok(s),
+            Err(e) => Err(Http3Failure { error: e, unsent: true }),
+        };
+
+    /// Queues more of the body of the upload in `slot` as a DATA frame, and waits until QUIC has taken everything
+    /// queued: a writer faster than the path is held here, a megabyte ahead of the server at most.
+    async fn sendBody(borrow this, slot: usize, bytes: Slice<u8>) -> Result<void, HttpError> {
+        {
+            var guard = this.state.write();
+            let st = guard.data();
+            let s = borrow mut st.streams[slot];
+            if (s.failed) {
+                return Err(s.failure);
+            }
+            if (!s.open) {
+                return Err(HttpError.Closed);
+            }
+            if (s.outAt == s.out.length) {
+                s.out.clear();
+                s.outAt = 0;
+            }
+            // The frame goes in whole or not at all: its header is taken back if the bytes find no room.
+            let before = s.out.length;
+            var built = putVarint(mut s.out, FRAME_DATA);
+            if (built.isOk()) {
+                built = putVarint(mut s.out, bytes.length as u64);
+            }
+            if (built.isOk()) {
+                built = s.out.extend(bytes);
+            }
+            if (built.isErr()) {
+                s.out.truncate(before);
+                return Err(HttpErrors.noMemory());
+            }
+            s.outDone = false;
+            if (st.leading) {
+                this.outSignal.raise();
+            }
+        }
+        return await this.progress(slot, WANT_FLUSHED);
+    }
+
+    /// Ends the body of the upload in `slot` and reads the whole response into `answer`; the slot goes back.
+    async fn finishInto(
+        borrow this,
+        slot: usize,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, HttpError> {
+        {
+            var guard = this.state.write();
+            let st = guard.data();
+            let s = borrow mut st.streams[slot];
+            s.open = false;
+            s.outDone = false;
+            if (st.leading) {
+                this.outSignal.raise();
+            }
+        }
+        let done = if (responseMs == 0) await this.progress(slot, WANT_END) else await Async.timeout(
+            responseMs,
+            HttpError.Net(NetError.TimedOut),
+            async () => await this.progress(slot, WANT_END),
+        );
+        if (done.isOk()) {
+            let taken = this.take(slot, mut answer.head, mut answer.spans, mut answer.body);
+            answer.status = taken.status;
+            answer.trailers = taken.trailers;
+        }
+        this.giveBack(slot);
+        return done;
+    }
+
+    /// Opens a tunnel with an extended CONNECT for `protocol` (RFC 9220): the request goes once the server's
+    /// SETTINGS have said it takes such requests, its stream stays open for `sendBody`, and the response's head is
+    /// read into `answer`. The slot, from which what the server sends is `read`, held until `giveBack`. A server
+    /// that does not take them is `NotSwitched(0)`, and nothing was sent.
+    async fn tunnelInto(
+        borrow this,
+        protocol: Slice<u8>,
+        url: Slice<u8>,
+        parts: UrlParts,
+        fields: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<usize, Http3Failure> {
+        let slot = match (this.reserve(
+            Method.Get,
+            url,
+            parts,
+            fields,
+            "".bytes(),
+            false,
+            0xFFFFFFFFFFFFFFFF,
+            true,
+            null,
+            protocol,
+        )) {
+            Ok(s) => s,
+            Err(e) => { return Err(Http3Failure { error: e, unsent: true }); },
+        };
+        let done = if (responseMs == 0) await this.progress(slot, WANT_HEAD) else await Async.timeout(
+            responseMs,
+            HttpError.Net(NetError.TimedOut),
+            async () => await this.progress(slot, WANT_HEAD),
+        );
+        match (done) {
+            Ok() => {
+                let taken = this.take(slot, mut answer.head, mut answer.spans, mut answer.body);
+                answer.status = taken.status;
+                answer.trailers = taken.trailers;
+                return Ok(slot);
+            }
+            Err(e) => {
+                let failure = Http3Failure { error: e, unsent: this.wasRefused(slot) };
+                this.giveBack(slot);
+                return Err(failure);
+            }
+        }
+    }
+
+    /// Ends what is sent on the stream in `slot` (a tunnel's), and waits until QUIC has taken it all. What the
+    /// server sends is still read.
+    async fn endBody(borrow this, slot: usize) -> Result<void, HttpError> {
+        {
+            var guard = this.state.write();
+            let st = guard.data();
+            let s = borrow mut st.streams[slot];
+            if (s.failed) {
+                return Err(s.failure);
+            }
+            if (!s.open) {
+                return Ok();
+            }
+            s.open = false;
+            s.outDone = false;
+            if (st.leading) {
+                this.outSignal.raise();
+            }
+        }
+        return await this.progress(slot, WANT_FLUSHED);
+    }
+
     /// Gives back a slot whose response keeps the buffers it took.
     fn giveBack(borrow this, slot: usize) {
         var head = Vector<u8>.create();
@@ -439,7 +618,7 @@ public struct H3Connection {
         maxBodyBytes: u64,
         answer: borrow mut Http3Answer,
     ) -> Result<void, Http3Failure> {
-        let slot = match (this.reserve(method, url, parts, fields, body, true, maxBodyBytes)) {
+        let slot = match (this.reserve(method, url, parts, fields, body, true, maxBodyBytes, false, null, "".bytes())) {
             Ok(s) => s,
             Err(e) => { return Err(Http3Failure { error: e, unsent: true }); },
         };
@@ -546,6 +725,9 @@ public struct H3Connection {
         body: Slice<u8>,
         buffered: bool,
         maxBodyBytes: u64,
+        upload: bool,
+        uploadLength: u64?,
+        protocol: Slice<u8>,
     ) -> Result<usize, HttpError> {
         var guard = this.state.write();
         let st = guard.data();
@@ -561,8 +743,10 @@ public struct H3Connection {
         };
         let s = borrow mut st.streams[slot];
         s.out.clear();
-        let length: u64? = if (body.length > 0 || Methods.sendsLength(method)) Some(body.length as u64) else null;
-        var built = requestHead(mut s.out, mut s.block, method, url, parts, fields, length);
+        let length: u64? = if (upload) uploadLength else if (body.length > 0 || Methods.sendsLength(method)) Some(
+            body.length as u64,
+        ) else null;
+        var built = requestHead(mut s.out, mut s.block, method, url, parts, fields, length, protocol);
         if (built.isOk() && body.length > 0) {
             built = putVarint(mut s.out, FRAME_DATA);
             if (built.isOk()) {
@@ -583,6 +767,8 @@ public struct H3Connection {
         s.id = NO_STREAM;
         s.outAt = 0;
         s.outDone = false;
+        s.open = upload;
+        s.gated = protocol.length > 0;
         s.blocked = false;
         s.partial.clear();
         s.inFrame = false;
@@ -597,7 +783,7 @@ public struct H3Connection {
         s.failed = false;
         s.refused = false;
         s.buffered = buffered;
-        s.headOnly = method is Method.Head;
+        s.headOnly = method is Method.Head && protocol.length == 0;
         s.hasDeclared = false;
         s.declared = 0;
         s.received = 0;
@@ -631,6 +817,9 @@ public struct H3Connection {
         }
         if (want == WANT_END) {
             return Ok(s.ended);
+        }
+        if (want == WANT_FLUSHED) {
+            return Ok(s.outDone || s.ended);
         }
         return Ok(s.body.length > s.taken || s.ended);
     }
@@ -814,6 +1003,8 @@ public struct H3Connection {
         }
         st.cancels.clear();
         var mayOpen = true;
+        let settled = st.settled;
+        let tunnels = st.peerConnect;
         for (i in 0..st.streams.length) {
             let s = borrow mut st.streams[i];
             if (!s.used) {
@@ -822,6 +1013,23 @@ public struct H3Connection {
             if (s.id == NO_STREAM) {
                 if (s.ended || !mayOpen) {
                     continue;
+                }
+                if (s.gated) {
+                    if (!settled) {
+                        continue; // when the server has said what it takes
+                    }
+                    if (!tunnels) {
+                        // It takes no extended CONNECT: the request does not go.
+                        s.failed = true;
+                        s.failure = HttpError.NotSwitched(0);
+                        s.refused = true;
+                        s.ended = true;
+                        if (s.waiting) {
+                            s.waiting = false;
+                            this.signals[i].raise();
+                        }
+                        continue;
+                    }
                 }
                 match (io.conn.openStream()) {
                     Ok(id) => { s.id = id; }
@@ -833,7 +1041,7 @@ public struct H3Connection {
                 }
             }
             if (!s.outDone && !s.blocked && !s.ended) {
-                match (io.conn.writeStream(s.id, s.out[s.outAt..], true)) {
+                match (io.conn.writeStream(s.id, s.out[s.outAt..], !s.open)) {
                     Ok(n) => {
                         s.outAt += n;
                         if (s.outAt == s.out.length) {
@@ -1017,6 +1225,22 @@ public struct H3Connection {
                         return Err(HttpError.Response(Fault.BadFrame)); // SETTINGS comes first (§6.2.1)
                     }
                     st.settled = true;
+                    // Pairs of an identifier and a value (§7.2.4); the ones nobody knows are passed over.
+                    let end = at + truncate<usize>(length);
+                    var k = at;
+                    while (k < end) {
+                        let setting = getVarint(u.pending[0..end], mut k) ?? 0;
+                        let value = match (getVarint(u.pending[0..end], mut k)) {
+                            Some(v) => v,
+                            null => { return Err(HttpError.Response(Fault.BadFrame)); },
+                        };
+                        if (setting == SETTINGS_ENABLE_CONNECT_PROTOCOL) {
+                            if (value > 1) {
+                                return Err(HttpError.Response(Fault.BadFrame));
+                            }
+                            st.peerConnect = value == 1;
+                        }
+                    }
                 } else if (kind == FRAME_SETTINGS || kind == FRAME_DATA || kind == FRAME_HEADERS) {
                     return Err(HttpError.Response(Fault.BadFrame));
                 } else if (kind == FRAME_GOAWAY) {
@@ -1190,7 +1414,9 @@ public struct H3Connection {
             return;
         }
         let id = st.streams[slot].id;
-        let unfinished = !st.streams[slot].ended || st.streams[slot].failed;
+        // Unfinished: the server has not ended it, or our side has not (an upload given up, a response that came early).
+        let unfinished = !st.streams[slot].ended || st.streams[slot].failed || !st.streams[slot].outDone ||
+            st.streams[slot].open;
         if (id != NO_STREAM && unfinished && !st.broken) {
             let queued = st.cancels.push(id);
             if (st.leading) {
@@ -1259,7 +1485,8 @@ async fn waitFor(
     };
 }
 
-/// Appends a request's HEADERS frame to `out`; `block` is room for the field section.
+/// Appends a request's HEADERS frame to `out`; `block` is room for the field section. With `protocol` the request
+/// is an extended CONNECT for it (RFC 9220), whatever `method` is.
 fn requestHead(
     out: borrow mut Vector<u8>,
     block: borrow mut Vector<u8>,
@@ -1268,10 +1495,16 @@ fn requestHead(
     parts: borrow UrlParts,
     fields: Slice<u8>,
     length: u64?,
+    protocol: Slice<u8>,
 ) -> Result<void, AllocError> {
     block.clear();
     qpackPrefix(mut block)?;
-    qpackField(mut block, ":method".bytes(), Methods.token(method).bytes())?;
+    if (protocol.length > 0) {
+        qpackField(mut block, ":method".bytes(), "CONNECT".bytes())?;
+        qpackField(mut block, ":protocol".bytes(), protocol)?;
+    } else {
+        qpackField(mut block, ":method".bytes(), Methods.token(method).bytes())?;
+    }
     qpackField(mut block, ":scheme".bytes(), (if (parts.secure) "https" else "http").bytes())?;
     qpackNamed(mut block, 0, parts.authority(url), false)?;
     let target = parts.target(url);
@@ -1525,7 +1758,18 @@ async fn exchange<region c>(
     body: Slice<u8>,
     buffered: bool,
 ) -> Result<H3Response<c>, HttpError> {
-    let slot = conn.reserve(method, url, parts, fields, body, buffered, conn.options.maxBodyBytes)?;
+    let slot = conn.reserve(
+        method,
+        url,
+        parts,
+        fields,
+        body,
+        buffered,
+        conn.options.maxBodyBytes,
+        false,
+        null,
+        "".bytes(),
+    )?;
     var response = H3Response {
         conn: conn,
         slot: slot,

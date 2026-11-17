@@ -1,0 +1,88 @@
+// Typed JSON over httpclient's `Client`: a request's body written from a value that implements `ToJson`, and a
+// response's body read into a type that implements `FromJson` (CeeSafeLibs' json package). The core client has no
+// JSON in it; this package is the few lines that join the two.
+import httpclient;
+import json;
+
+/// Why a JSON call gave no value.
+public enum JsonFailure {
+    /// The request did not get a response.
+    Http(HttpError),
+    /// The response's status was not 2xx: the status. Its body is not kept.
+    Status(u16),
+    /// The value to send could not be written as JSON.
+    Encode(JsonWriteError),
+    /// The response's body is not JSON, or not the JSON the type needs: where and why.
+    Decode(DecodeError),
+}
+
+/// A request for JSON: `Accept: application/json`, and `Content-Type: application/json` if it will carry a body.
+public fn jsonRequest(method: Method, url: StringView, withBody: bool) -> Result<Request, HttpError> {
+    var request = Request.create(method, url)?;
+    request.header("Accept", "application/json")?;
+    if (withBody) {
+        request.header("Content-Type", "application/json")?;
+    }
+    return Ok(request);
+}
+
+/// The body of a 2xx `response` as a `T`.
+public fn fromResponse<T: FromJson>(response: borrow Response) -> Result<T, JsonFailure> {
+    let status = response.status();
+    if (status < 200 || status > 299) {
+        return Err(JsonFailure.Status(status));
+    }
+    return match (Json.decode<T>(response.body())) {
+        Ok(value) => Ok(value),
+        Err(e) => Err(JsonFailure.Decode(e)),
+    };
+}
+
+/// Sends `request` with `body` and reads the response as a `T`: for a request with fields of its own (credentials, a
+/// method other than GET or POST). `jsonRequest` makes one with the JSON fields.
+public async fn sendJson<T: FromJson>(
+    client: borrow Client,
+    request: borrow Request,
+    body: Slice<u8>,
+) -> Result<T, JsonFailure> {
+    let response = match (await client.send(request, body)) {
+        Ok(r) => r,
+        Err(e) => { return Err(JsonFailure.Http(e)); },
+    };
+    return fromResponse<T>(response);
+}
+
+/// GETs `url` and reads the response as a `T`.
+public async fn getJson<T: FromJson>(client: borrow Client, url: StringView) -> Result<T, JsonFailure> {
+    let request = match (jsonRequest(Method.Get, url, false)) {
+        Ok(r) => r,
+        Err(e) => { return Err(JsonFailure.Http(e)); },
+    };
+    return await sendJson<T>(client, request, "".bytes());
+}
+
+/// Sends `value` as JSON to `url` with `method` (POST, PUT, PATCH) and reads the response as a `T`.
+public async fn exchangeJson<B: ToJson, T: FromJson>(
+    client: borrow Client,
+    method: Method,
+    url: StringView,
+    value: borrow B,
+) -> Result<T, JsonFailure> {
+    let request = match (jsonRequest(method, url, true)) {
+        Ok(r) => r,
+        Err(e) => { return Err(JsonFailure.Http(e)); },
+    };
+    let body = match (Json.encode<B>(value)) {
+        Ok(b) => b,
+        Err(e) => { return Err(JsonFailure.Encode(e)); },
+    };
+    return await sendJson<T>(client, request, body.view());
+}
+
+/// POSTs `value` as JSON to `url` and reads the response as a `T`.
+public async fn postJson<B: ToJson, T: FromJson>(
+    client: borrow Client,
+    url: StringView,
+    value: borrow B,
+) -> Result<T, JsonFailure> =>
+    await exchangeJson<B, T>(client, Method.Post, url, value);

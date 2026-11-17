@@ -1,0 +1,40 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "encoding"
+source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
+dir = "encoding"
+hash = "sha256:bba291a4b8e83d4a62a062e92827301ac87c67d0dc5a2f105302a1cfbc51eb4b"
+
+[[package]]
+name = "httpclient"
+source = "path+.."
+
+[[package]]
+name = "json"
+source = "git+https://github.com/CeeSafe/CeeSafeLibs.git"
+commit = "ca0a13fec248bbe192f0b61b930c8b8259175eed"
+dir = "json"
+hash = "sha256:c83d0d607d2f50248e5f8b27fc0974cababf8d37c240d3d57ac2117baf7f4617"
+
+[[package]]
+name = "web_core"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+dir = "packages/web_core"
+hash = "sha256:d06487217199835e061256cba71b91354f3b6e5dd049215e123b0eb5f423579a"
+
+[[package]]
+name = "web_tls"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+dir = "packages/web_tls"
+hash = "sha256:4fe72c14046eb079161b00ca154c9d915bd64e457f110b2faa87513c56a609fe"
+
+[[package]]
+name = "web_transport"
+source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
+commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+dir = "packages/web_transport"
+hash = "sha256:a70380914c02645dfdfb4dfc3f3f2016017d956b9ef410894a318fae944aa232"

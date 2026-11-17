@@ -36,6 +36,9 @@ struct FakeH3 {
     failFirst: bool;
     /// The first failure is one the server may have acted on.
     sent: bool;
+    /// The body of the upload on stream 9, as written so far; or what the tunnel on stream 11 was opened with and
+    /// sent. `GET /log` answers with it.
+    uploaded: RefCell<Vector<u8>>;
 }
 
 fn field(answer: borrow mut Http3Answer, name: StringView, value: StringView) -> Result<void, AllocError> {
@@ -90,6 +93,16 @@ impl Http3Transport for FakeH3 {
         if (this.failFirst && call == 1) {
             return Err(Http3Failure { error: HttpError.Net(NetError.TimedOut), unsent: !this.sent });
         }
+        if (parts.target(url) == "/log".bytes()) {
+            let guard = this.uploaded.read();
+            answer.status = 200;
+            let built = field(mut answer, ":status", "200");
+            let copied = if (built.isOk()) answer.body.extend(guard.data().view()) else built;
+            return match (copied) {
+                Ok() => Ok(),
+                Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
+            };
+        }
         return match (fakeAnswer(parts.target(url), port, fields, mut answer)) {
             Ok() => Ok(),
             Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
@@ -119,13 +132,140 @@ impl Http3Transport for FakeH3 {
         return Ok(7);
     }
 
+    /// An upload: stream 9, whose answer is the fields it was begun with, a line end, and the body written.
+    async fn begin(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        length: u64?,
+        maxBodyBytes: u64,
+    ) -> Result<u64, Http3Failure> {
+        if (this.failFirst) {
+            return Err(Http3Failure { error: HttpError.Net(NetError.TimedOut), unsent: true });
+        }
+        var guard = this.uploaded.write();
+        let held = guard.data();
+        held.clear();
+        var kept = held.extend(fields);
+        if (kept.isOk() && length != null) {
+            kept = held.extend("declared".bytes());
+        }
+        if (kept.isOk()) {
+            kept = held.extend("\r\n".bytes());
+        }
+        return match (kept) {
+            Ok() => Ok(9),
+            Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
+        };
+    }
+
+    /// A tunnel: stream 11, on which the server sends a text message and closes. `/none` is a server that takes no
+    /// tunnels, `/refused` one that answers 403; `/chat` chooses that subprotocol.
+    async fn tunnel(
+        borrow this,
+        protocol: Slice<u8>,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure> {
+        let path = parts.target(url);
+        if (path == "/none".bytes()) {
+            return Err(Http3Failure { error: HttpError.NotSwitched(0), unsent: true });
+        }
+        var guard = this.uploaded.write();
+        let held = guard.data();
+        held.clear();
+        var kept = held.extend(protocol);
+        if (kept.isOk()) {
+            kept = held.extend("\r\n".bytes());
+        }
+        if (kept.isOk()) {
+            kept = held.extend(fields);
+        }
+        if (kept.isOk()) {
+            kept = held.extend("\r\n".bytes());
+        }
+        let refused = path == "/refused".bytes();
+        answer.status = if (refused) 403 else 200;
+        if (kept.isOk()) {
+            kept = field(mut answer, ":status", if (refused) "403" else "200");
+        }
+        if (kept.isOk() && path == "/chat".bytes()) {
+            kept = field(mut answer, "sec-websocket-protocol", "chat");
+        }
+        var reads = this.reads.write();
+        let n = reads.data();
+        *n = 0;
+        return match (kept) {
+            Ok() => Ok(11),
+            Err(_) => Err(Http3Failure { error: HttpErrors.noMemory(), unsent: true }),
+        };
+    }
+
+    async fn shut(borrow this, stream: u64) -> Result<void, HttpError> {
+        var guard = this.uploaded.write();
+        let held = guard.data();
+        return match (held.extend("<shut>".bytes())) {
+            Ok() => Ok(),
+            Err(_) => Err(HttpErrors.noMemory()),
+        };
+    }
+
+    async fn write(borrow this, stream: u64, bytes: Slice<u8>) -> Result<void, HttpError> {
+        if (stream != 9 && stream != 11) {
+            return Err(HttpError.Closed);
+        }
+        var guard = this.uploaded.write();
+        let held = guard.data();
+        return match (held.extend(bytes)) {
+            Ok() => Ok(),
+            Err(_) => Err(HttpErrors.noMemory()),
+        };
+    }
+
+    async fn finish(borrow this, stream: u64, responseMs: u64, answer: borrow mut Http3Answer) -> Result<void, HttpError> {
+        if (stream != 9) {
+            return Err(HttpError.Closed);
+        }
+        let guard = this.uploaded.read();
+        let held = guard.data();
+        answer.status = 201;
+        var built = field(mut answer, ":status", "201");
+        if (built.isOk()) {
+            built = field(mut answer, "set-cookie", "up=1");
+        }
+        if (built.isOk()) {
+            built = answer.body.extend(held.view());
+        }
+        return match (built) {
+            Ok() => Ok(),
+            Err(_) => Err(HttpErrors.noMemory()),
+        };
+    }
+
     async fn read(borrow this, stream: u64, buffer: SliceMut<u8>) -> Result<usize, HttpError> {
-        if (stream != 7) {
+        if (stream != 7 && stream != 11) {
             return Err(HttpError.Closed);
         }
         var guard = this.reads.write();
         let n = guard.data();
         *n += 1;
+        if (stream == 11) {
+            // The tunnel's server: "hi" as text, then a close with code 1000.
+            let frames = [0x81u8, 2, 'h', 'i', 0x88, 2, 3, 0xE8];
+            if (*n > 2) {
+                return Ok(0);
+            }
+            let from: usize = if (*n == 1) 0 else 4;
+            buffer[0..4].copyFrom(frames[from..from + 4]);
+            return Ok(4);
+        }
         let piece = if (*n == 1) "stre" else if (*n == 2) "amed" else "";
         buffer[0..piece.length].copyFrom(piece.bytes());
         return Ok(piece.length);
@@ -163,7 +303,7 @@ fn withFake(options: ClientOptions, failFirst: bool, sent: bool) -> Result<Clien
         Err(_) => { return Err(TestFailure.create("the TLS configuration")); },
     };
     let fake: Box<dyn Http3Transport> =
-        made(Box.create(FakeH3 { calls: RefCell<u32>.create(0), reads: RefCell<u32>.create(0), failFirst: failFirst, sent: sent }))?;
+        made(Box.create(FakeH3 { calls: RefCell<u32>.create(0), reads: RefCell<u32>.create(0), failFirst: failFirst, sent: sent, uploaded: RefCell<Vector<u8>>.create(Vector<u8>.create()) }))?;
     return Ok(Client.withHttp3(options, tls, fake));
 }
 
@@ -271,5 +411,134 @@ async fn aFailedTransportIsLeftAloneForAWhile() -> Result<void, TestFailure> {
         Ok(_) => { return Check.fail("the failure is the answer"); }
         Err(e) => { Check.equalBytes(HttpErrors.describe(HttpError.Net(NetError.TimedOut)).bytes(), HttpErrors.describe(e).bytes())?; }
     }
+    return Ok();
+}
+
+@test
+async fn uploadsGoOverTheGivenTransport() -> Result<void, TestFailure> {
+    var options = ClientOptions.defaults();
+    options.http3PriorKnowledge = true;
+    options.cookies = true;
+    options.decompress = true;
+    let client = withFake(options, false, false)?;
+    let request = match (Request.create(Method.Post, "https://example.com/up")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    {
+        var upload = match (await client.upload(request, Some(9))) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await upload.write("first".bytes())).isOk(), "the first piece")?;
+        Check.isTrue((await upload.write(" and more".bytes())).isErr(), "more than the length")?;
+        Check.isTrue((await upload.write(" two".bytes())).isOk(), "the second piece")?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue(response.isHttp3(), "over HTTP/3")?;
+        Check.equalU64(201, response.status() as u64)?;
+        Check.equalBytes("Accept-Encoding: gzip, deflate\r\ndeclared\r\nfirst two".bytes(), response.body())?;
+    }
+    // Without a length nothing says how it is framed (no Transfer-Encoding over HTTP/3), and the cookie set by the
+    // first answer goes with the second.
+    {
+        var upload = match (await client.upload(request, null)) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await upload.write("x".bytes())).isOk(), "a piece")?;
+        let response = match (await upload.finish()) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("Cookie: up=1\r\nAccept-Encoding: gzip, deflate\r\n\r\nx".bytes(), response.body())?;
+    }
+    // An upload given up before its end gives its stream back.
+    {
+        var upload = match (await client.upload(request, null)) {
+            Ok(u) => u,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.isTrue((await upload.write("x".bytes())).isOk(), "a piece")?;
+    }
+    let stats = client.stats();
+    Check.equalU64(3, stats.overHttp3)?;
+    Check.equalU64(0, stats.connections)?;
+    return Ok();
+}
+
+@test
+async fn webSocketsGoOverTheGivenTransport() -> Result<void, TestFailure> {
+    var options = ClientOptions.defaults();
+    options.http3PriorKnowledge = true;
+    let client = withFake(options, false, false)?;
+    var request = match (Request.create(Method.Get, "wss://example.com/chat")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (request.header("Sec-WebSocket-Protocol", "chat, other")) {
+        Ok() => {}
+        Err(e) => { return Err(failed(e)); }
+    }
+    {
+        var ws = match (await client.webSocket(request, WebSocketOptions.defaults())) {
+            Ok(w) => w,
+            Err(e) => { return Err(failed(e)); },
+        };
+        Check.equalBytes("chat".bytes(), ws.protocol())?;
+        Check.isTrue((await ws.sendText("yo")).isOk(), "a message")?;
+        var into = Vector<u8>.create();
+        Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+        Check.equalBytes("hi".bytes(), into.view())?;
+        Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+    }
+    // What the transport was given: the protocol, the request's fields and the version; then the frames (the
+    // message, the close echoed), and the end of what is sent.
+    {
+        let response = match (await client.get("https://example.com/log")) {
+            Ok(r) => r,
+            Err(e) => { return Err(failed(e)); },
+        };
+        let log = response.body();
+        let opening = "websocket\r\nSec-WebSocket-Protocol: chat, other\r\nSec-WebSocket-Version: 13\r\n\r\n".bytes();
+        Check.isTrue(log.length > opening.length, "the opening and the frames")?;
+        Check.equalBytes(opening, log[0..opening.length])?;
+        var at = opening.length;
+        var payload = Vector<u8>.create();
+        Check.equalU64(0x81, clientFrame(log, mut at, mut payload)? as u64)?;
+        Check.equalBytes("yo".bytes(), payload.view())?;
+        Check.equalU64(0x88, clientFrame(log, mut at, mut payload)? as u64)?;
+        Check.equalBytes([3u8, 0xE8][..], payload.view())?;
+        Check.equalBytes("<shut>".bytes(), log[at..])?;
+    }
+    // A subprotocol nobody offered, and an answer that is no agreement.
+    let plain = match (Request.create(Method.Get, "wss://example.com/chat")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (await client.webSocket(plain, WebSocketOptions.defaults())) {
+        Ok(_) => { return Check.fail("a subprotocol that was not offered"); }
+        Err(e) => { Check.equalBytes(HttpErrors.describe(HttpError.Response(Fault.BadWebSocket)).bytes(), HttpErrors.describe(e).bytes())?; }
+    }
+    let refused = match (Request.create(Method.Get, "wss://example.com/refused")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    match (await client.webSocket(refused, WebSocketOptions.defaults())) {
+        Ok(_) => { return Check.fail("403 opens nothing"); }
+        Err(e) => { Check.equalBytes(HttpErrors.describe(HttpError.NotSwitched(403)).bytes(), HttpErrors.describe(e).bytes())?; }
+    }
+    // A server that takes no tunnels: the WebSocket goes to TCP (which a test may not dial, so it fails there),
+    // and HTTP/3 is still used for requests.
+    let copies = made(Channel<u8>.create(4096))?;
+    script(client, "", 0, copies)?;
+    let none = match (Request.create(Method.Get, "wss://example.com/none")) {
+        Ok(r) => r,
+        Err(e) => { return Err(failed(e)); },
+    };
+    Check.isTrue((await client.webSocket(none, WebSocketOptions.defaults())).isErr(), "TCP is not there")?;
+    await over3(client, "https://example.com/port", "443")?;
     return Ok();
 }

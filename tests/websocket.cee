@@ -332,3 +332,100 @@ async fn framesThatBreakTheProtocol() -> Result<void, TestFailure> {
     Check.equalU64(0, await faultCode(raw("810568656c")?.view(), 1000)?)?; // cut short: an error, nothing to say
     return Ok();
 }
+
+/// A socket opened with compression offered, to a server that sends `frames` after agreeing to it.
+async fn compressing(frames: Slice<u8>, limit: usize, copies: borrow Channel<u8>) -> Result<WebSocket, TestFailure> {
+    let client = Client.create(ClientOptions.defaults());
+    var server = Vector<u8>.create();
+    switching(mut server, "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n")?;
+    made(server.extend(frames))?;
+    scriptBytes(client, server.view(), 0, 0, copies)?;
+    let request = wsRequest("ws://example.com/")?;
+    var options = WebSocketOptions.defaults();
+    options.compress = true;
+    options.maxMessageBytes = limit;
+    let key = [0u8; 16];
+    return match (await client.webSocketWithKey(request, options, key[..])) {
+        Ok(w) => Ok(w),
+        Err(e) => Err(failed(e)),
+    };
+}
+
+@test
+async fn compressedMessages() -> Result<void, TestFailure> {
+    Check.isTrue(agreesDeflate("permessage-deflate; server_no_context_takeover".bytes()), "as offered")?;
+    Check.isTrue(
+        agreesDeflate("Permessage-Deflate;client_no_context_takeover; SERVER_NO_CONTEXT_TAKEOVER ;server_max_window_bits=12".bytes()),
+        "with what it may add",
+    )?;
+    Check.isTrue(!agreesDeflate("permessage-deflate".bytes()), "a server that keeps its context")?;
+    Check.isTrue(!agreesDeflate("permessage-deflate; server_no_context_takeover; other=1".bytes()), "a parameter nobody knows")?;
+    Check.isTrue(!agreesDeflate("x-webkit-deflate-frame".bytes()), "another extension")?;
+    Check.isTrue(!agreesDeflate("permessage-deflate; server_no_context_takeover, permessage-deflate".bytes()), "two")?;
+    // What `zlib` makes of the messages with a sync flush, the last four bytes taken off (RFC 7692 §7.2.1).
+    let hello = raw("f248cdc9c9d751c840a192f3730b8a528b8b535314caf38b725214153ca8aa0c00")?;
+    let many = raw("ecc13101000000c2a0da8b6f0d0fa00000807703")?;
+    var frames = Vector<u8>.create();
+    serverFrame(mut frames, 0xC1, hello.view())?; // text, compressed
+    serverFrame(mut frames, 0x81, "plain".bytes())?; // not every message has to be
+    serverFrame(mut frames, 0x42, many[0..7])?; // binary, compressed, in two frames with a ping between
+    serverFrame(mut frames, 0x89, "".bytes())?;
+    serverFrame(mut frames, 0x80, many[7..])?;
+    serverFrame(mut frames, 0x88, raw("03e8")?.view())?;
+    let copies = made(Channel<u8>.create(8192))?;
+    var ws = await compressing(frames.view(), 65536, copies)?;
+    var into = Vector<u8>.create();
+    Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+    var expected = Vector<u8>.create();
+    for (k in 0..3) {
+        made(expected.extend("Hello, hello, hello, compressed world! ".bytes()))?;
+    }
+    Check.equalBytes(expected.view(), into.view())?;
+    Check.equalU64(1, await received(mut ws, mut into)? as u64)?;
+    Check.equalBytes("plain".bytes(), into.view())?;
+    Check.equalU64(2, await received(mut ws, mut into)? as u64)?;
+    Check.equalU64(3000, into.length as u64)?;
+    var same = true;
+    for (b in into.view()) {
+        if (b != 'x') {
+            same = false;
+        }
+    }
+    Check.isTrue(same, "three thousand x")?;
+    Check.equalU64(101000, await received(mut ws, mut into)? as u64)?;
+    // The offer is in the upgrade, and what the client sends is not compressed.
+    let wire = written(copies)?;
+    let offer = "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n";
+    Check.isTrue(wire.view().indexOf(offer.bytes()) != null, "the offer")?;
+    return Ok();
+}
+
+/// As `faultCode`, on a socket where compression was agreed.
+async fn deflateFault(frames: Slice<u8>, limit: usize) -> Result<u64, TestFailure> {
+    let copies = made(Channel<u8>.create(8192))?;
+    var ws = await compressing(frames, limit, copies)?;
+    var into = Vector<u8>.create();
+    loop {
+        match (await ws.receive(mut into)) {
+            Ok(_) => {}
+            Err(_) => { break; }
+        }
+    }
+    let wire = written(copies)?;
+    var at = (wire.view().indexOf("\r\n\r\n".bytes()) ?? 0) + 4;
+    var payload = Vector<u8>.create();
+    Check.equalU64(0x88, clientFrame(wire.view(), mut at, mut payload)? as u64)?;
+    return Ok(payload.readBE<u16>(0) as u64);
+}
+
+@test
+async fn compressedMessagesThatAreWrong() -> Result<void, TestFailure> {
+    Check.equalU64(1007, await deflateFault(raw("c20107")?.view(), 1000)?)?; // a block type that does not exist
+    Check.equalU64(1007, await deflateFault(raw("c207ecc13101000000")?.view(), 1000)?)?; // cut off inside a block's code lengths
+    // Twenty bytes that become three thousand: more than the socket takes.
+    Check.equalU64(1009, await deflateFault(raw("c214ecc13101000000c2a0da8b6f0d0fa00000807703")?.view(), 1000)?)?;
+    Check.equalU64(1002, await deflateFault(raw("020161c00161")?.view(), 1000)?)?; // marked on a continuation
+    Check.equalU64(1002, await deflateFault(raw("c900")?.view(), 1000)?)?; // marked on a ping
+    Check.equalU64(1002, await deflateFault(raw("a10161")?.view(), 1000)?)?; // the second reserved bit
+    return Ok();
+}

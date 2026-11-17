@@ -3,7 +3,8 @@
 // A WebSocket owns its connection, which never goes back to a pool. Sending and receiving both need the connection,
 // so one task does both; `receive` may be cancelled (raced against something to send) and called again with the same
 // vector, and loses nothing: what has arrived stays in the socket's buffers and the message so far in the vector.
-// Messages are not compressed (no permessage-deflate is offered).
+// With `WebSocketOptions.compress` the server may compress its messages (permessage-deflate); this client's are
+// never compressed.
 import web_core;
 import web_transport;
 import web_tls;
@@ -15,9 +16,14 @@ public struct WebSocketOptions {
     public handshakeMs: u64;
     /// The longest message `receive` accepts; a longer one closes the connection (1009).
     public maxMessageBytes: usize;
+    /// Offer permessage-deflate (RFC 7692), so that the server may compress its messages. Each message is then
+    /// compressed on its own (`server_no_context_takeover`): nothing is kept between messages. What this client
+    /// sends is never compressed.
+    public compress: bool;
 
-    /// 10 s for the handshake, messages up to 16 MiB.
-    public fn defaults() -> WebSocketOptions => WebSocketOptions { handshakeMs: 10000, maxMessageBytes: 16777216 };
+    /// 10 s for the handshake, messages up to 16 MiB, no compression.
+    public fn defaults() -> WebSocketOptions =>
+        WebSocketOptions { handshakeMs: 10000, maxMessageBytes: 16777216, compress: false };
 }
 
 /// What `WebSocket.receive` got.
@@ -60,6 +66,11 @@ public struct WebSocket {
     private frameOpen: bool;
     private frameLeft: u64;
     private frameFinal: bool;
+    /// permessage-deflate was agreed; the message being received is compressed; and what decompresses it.
+    private deflate: bool;
+    private compressed: bool;
+    private inflater: Inflater?;
+    private packed: Vector<u8>;
 
     /// The subprotocol the server chose among those the request offered (`Sec-WebSocket-Protocol`), empty if none.
     public fn protocol(borrow this) -> Slice<u8> => this.chosen.view();
@@ -156,6 +167,26 @@ public struct WebSocket {
                 this.frameOpen = false;
                 if (this.frameFinal) {
                     this.inMessage = false;
+                    if (this.compressed) {
+                        // The message is one DEFLATE stream without its last four bytes (RFC 7692 §7.2.2): they
+                        // are put back, and an empty final block after them ends the stream.
+                        swap(mut this.packed, mut into);
+                        let tail = [0u8, 0, 0xFF, 0xFF, 1, 0, 0, 0xFF, 0xFF];
+                        match (this.packed.extend(tail[..])) {
+                            Ok() => {}
+                            Err(_) => { return Err(HttpErrors.noMemory()); }
+                        }
+                        let done = match (borrow mut this.inflater) {
+                            Some(z) => z.inflateRaw(this.packed.view(), mut into, this.maxMessage),
+                            null => Err(Fault.BadEncoding),
+                        };
+                        this.packed.clear();
+                        match (done) {
+                            Ok() => {}
+                            Err(Fault.BodyTooLarge) => { return await this.fail(1009, Fault.BodyTooLarge); }
+                            Err(_) => { return await this.fail(1007, Fault.BadWebSocket); }
+                        }
+                    }
                     if (this.messageIsText) {
                         if (StringView.fromUtf8(into.view()) == null) {
                             return await this.fail(1007, Fault.BadWebSocket);
@@ -183,8 +214,14 @@ public struct WebSocket {
                 length = this.inbuf.readBE<u64>(this.start + 2);
                 header = 10;
             }
-            // No extension was agreed, so the reserved bits are 0; a server never masks; a length uses 63 bits.
-            if ((first & 0x70) != 0 || (second & 0x80) != 0 || length > 0x7FFFFFFFFFFFFFFF) {
+            // The first reserved bit marks a compressed message, on its first frame and only if that was agreed;
+            // the others are 0; a server never masks; a length uses 63 bits.
+            let marked = (first & 0x40) != 0;
+            if ((first & 0x30) != 0 ||
+                (marked &&
+                    (!this.deflate ||
+                        (opcode != OP_TEXT && opcode != OP_BINARY))) ||
+                (second & 0x80) != 0 || length > 0x7FFFFFFFFFFFFFFF) {
                 return await this.fail(1002, Fault.BadWebSocket);
             }
             if (opcode >= 8) {
@@ -235,6 +272,7 @@ public struct WebSocket {
                     return await this.fail(1002, Fault.BadWebSocket);
                 }
                 this.inMessage = true;
+                this.compressed = marked;
                 this.messageIsText = opcode == OP_TEXT;
             } else {
                 return await this.fail(1002, Fault.BadWebSocket);
@@ -377,7 +415,7 @@ async fn openWebSocket(
     };
     var keyText = Vector<u8>.create();
     var extra = Vector<u8>.create();
-    let built = buildUpgrade(key, mut keyText, mut extra);
+    let built = buildUpgrade(key, mut keyText, mut extra, options.compress);
     let written = if (built.isOk()) writeRequestHead(
         mut conn.out,
         Method.Get,
@@ -416,8 +454,19 @@ async fn openWebSocket(
         Some(i) => conn.value(i) == expected.view(),
         null => false,
     };
-    if (!upgraded || !connected || !accepted || conn.find("sec-websocket-extensions".bytes()) != null) {
+    if (!upgraded || !connected || !accepted) {
         return Err(HttpError.Response(Fault.BadWebSocket));
+    }
+    // An extension only if it was offered, and only as it was offered: each message compressed on its own.
+    var deflate = false;
+    match (conn.find("sec-websocket-extensions".bytes())) {
+        Some(i) => {
+            if (!options.compress || !agreesDeflate(conn.value(i))) {
+                return Err(HttpError.Response(Fault.BadWebSocket));
+            }
+            deflate = true;
+        }
+        null => {}
     }
     var chosen = Vector<u8>.create();
     match (conn.find("sec-websocket-protocol".bytes())) {
@@ -454,6 +503,10 @@ async fn openWebSocket(
         frameOpen: false,
         frameLeft: 0,
         frameFinal: false,
+        deflate: deflate,
+        compressed: false,
+        inflater: if (deflate) Some(Inflater.create()) else null,
+        packed: Vector<u8>.create(),
     });
 }
 
@@ -462,13 +515,54 @@ fn buildUpgrade(
     key: Slice<u8>,
     keyText: borrow mut Vector<u8>,
     extra: borrow mut Vector<u8>,
+    compress: bool,
 ) -> Result<void, AllocError> {
     Base64.encode(key, mut keyText)?;
     extra.extend(
         "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ".bytes(),
     )?;
     extra.extend(keyText.view())?;
+    if (compress) {
+        extra.extend(
+            "\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover".bytes(),
+        )?;
+    }
     return extra.extend("\r\n".bytes());
+}
+
+/// Whether a `Sec-WebSocket-Extensions` answer is permessage-deflate as this client can read it: that one
+/// extension, with `server_no_context_takeover`, and no parameter it does not know.
+fn agreesDeflate(value: Slice<u8>) -> bool {
+    if (value.indexOfByte(',') != null) {
+        return false;
+    }
+    var at: usize = 0;
+    var first = true;
+    var alone = false;
+    while (at <= value.length) {
+        var end = at;
+        while (end < value.length && value[end] != ';') {
+            end += 1;
+        }
+        let part = value[at..end].trim();
+        at = end + 1;
+        if (first) {
+            if (!part.equalsIgnoreAsciiCase("permessage-deflate".bytes())) {
+                return false;
+            }
+            first = false;
+        } else if (part.equalsIgnoreAsciiCase("server_no_context_takeover".bytes())) {
+            alone = true;
+        } else {
+            let known = part.equalsIgnoreAsciiCase("client_no_context_takeover".bytes()) ||
+                (part.length > 23 && part[0..23].equalsIgnoreAsciiCase("server_max_window_bits=".bytes())) ||
+                (part.length > 23 && part[0..23].equalsIgnoreAsciiCase("client_max_window_bits=".bytes()));
+            if (!known) {
+                return false;
+            }
+        }
+    }
+    return alone;
 }
 
 /// The `Sec-WebSocket-Accept` a server must answer `keyText` with: base64 of the SHA-1 of the key and the

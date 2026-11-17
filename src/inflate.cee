@@ -256,6 +256,20 @@ public struct Inflater {
         }
     }
 
+    /// Decodes bare DEFLATE (RFC 1951) into `out`, which is emptied first: the stream must end with a final block.
+    public fn inflateRaw(
+        borrow mut this,
+        input: Slice<u8>,
+        out: borrow mut Vector<u8>,
+        limit: usize,
+    ) -> Result<void, Fault> {
+        out.clear();
+        var written: usize = 0;
+        let end = this.inflate(input, 0, mut out, mut written, 0, limit)?;
+        out.truncate(written);
+        return Ok();
+    }
+
     /// Decodes a `deflate` content coding into `out`, which is emptied first: zlib (RFC 1950), as the coding is
     /// defined, or bare DEFLATE, which some servers send under that name.
     public fn undeflate(

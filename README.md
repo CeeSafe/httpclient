@@ -227,8 +227,10 @@ not the same measurement.
   checked; a frame that breaks the protocol, text that is not UTF-8 and a message over `maxMessageBytes` close the
   connection with 1002, 1007 and 1009. A payload goes out in one write up to 64 KiB, masked eight bytes at a time;
   a large frame's payload is read straight into the message. One task both sends and receives: `receive` may be
-  cancelled (raced against something to send) and called again without losing anything. Not done:
-  permessage-deflate, and WebSockets over HTTP/2 (RFC 8441): a `TlsConfig` for `wss` must offer only `http/1.1`.
+  cancelled (raced against something to send) and called again without losing anything. With
+  `WebSocketOptions.compress` the server may compress its messages (permessage-deflate, RFC 7692, each message on
+  its own); what the client sends is never compressed. Not done: WebSockets over HTTP/2 (RFC 8441): a `TlsConfig`
+  for `wss` must offer only `http/1.1`.
 - **Cookies** (`cookies`, off by default; RFC 6265). What `Set-Cookie` sets is kept in memory for the client's
   lifetime and sent back to the hosts and paths it belongs to, over both protocols and on each request a redirect
   leads to: `Domain` (the host and its subdomains, never a bare top-level name or another host), `Path`, `Secure`
@@ -254,7 +256,7 @@ not the same measurement.
 ## What is not here yet
 
 Of CosmoHttpClient's surface: HTTP/3 for streamed responses and uploads (buffered requests have it, through
-[cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; WebSocket permessage-deflate; Brotli and Zstandard; cookies and
+[cosmohttp3](cosmohttp3)); telemetry hooks (there are counters); typed JSON helpers; compressing the WebSocket messages the client sends; Brotli and Zstandard; cookies and
 the cache kept on disk; `Expect: 100-continue`; proxies (SOCKS5 included); TLS session resumption; a DNS cache. A name
 with several addresses is tried one address at a time, not raced. In HTTP/2: no PING keep-alive, no request
 trailers, and when every connection is full a request fails with `LimitExceeded` instead of waiting (bound requests
@@ -264,7 +266,7 @@ in flight with `maxPerOrigin`).
 
 ```sh
 ceesafec check && ceesafec fmt --check
-ceesafec test                 # 93 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
+ceesafec test                 # 95 tests over scripted connections; also --interp, --sweep alloc, --sweep cancel
 python3 bench/run.py          # the HTTP/1.1 table; --h2 for the HTTP/2 one
 python3 tools/gen_huffman.py  # src/huffman.bin, checked against RFC 7541's examples
 python3 tools/gen_inflate_vectors.py   # tests/data/, bodies compressed by Python's zlib

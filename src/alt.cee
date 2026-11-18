@@ -35,28 +35,72 @@ public struct Http3Failure {
 public interface Http3Transport {
     /// Sends the request to the URL's host at UDP port `port` and reads the whole response into `answer`. `fields`
     /// are lines, `name: value\r\n` each; `responseMs` (0: no limit) and `maxBodyBytes` are the client's limits.
-    async fn fetch(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, maxBodyBytes: u64, answer: borrow mut Http3Answer,) -> Result<void, Http3Failure>;
+    async fn fetch(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        maxBodyBytes: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, Http3Failure>;
 
     /// Sends the request and reads the response's head into `answer` (its status and fields; no body): a name for
     /// the response's stream, with which its body is `read`. The stream is held until `release`.
-    async fn open(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, body: Slice<u8>, responseMs: u64, answer: borrow mut Http3Answer) -> Result<u64, Http3Failure>;
+    async fn open(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        body: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure>;
 
     /// Starts a request to the URL's host at UDP port `port` whose body is written piece by piece: a name for its
     /// stream, for `write` and `finish`, held until `finish` or `release`. With `length` the request declares it.
-    async fn begin(borrow this, method: Method, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, length: u64?, maxBodyBytes: u64) -> Result<u64, Http3Failure>;
+    async fn begin(
+        borrow this,
+        method: Method,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        length: u64?,
+        maxBodyBytes: u64,
+    ) -> Result<u64, Http3Failure>;
 
     /// Sends the next bytes of the body of `stream`, waiting while the path takes no more.
     async fn write(borrow this, stream: u64, bytes: Slice<u8>) -> Result<void, HttpError>;
 
     /// Ends the body of `stream`, reads the whole response into `answer` and gives the stream up, whether or not
     /// that went well.
-    async fn finish(borrow this, stream: u64, responseMs: u64, answer: borrow mut Http3Answer) -> Result<void, HttpError>;
+    async fn finish(
+        borrow this,
+        stream: u64,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<void, HttpError>;
 
     /// Opens a tunnel to the URL's host at UDP port `port` with an extended CONNECT for `protocol` (RFC 9220:
     /// `websocket`): sends the request, leaves its stream open, and reads the response's head into `answer`. The
     /// stream's name: what is sent goes with `write`, what the server sends comes with `read`, until `release`. If
     /// the server has not said it takes such requests, the failure is `NotSwitched(0)`, and `unsent`.
-    async fn tunnel(borrow this, protocol: Slice<u8>, url: Slice<u8>, parts: UrlParts, port: u16, fields: Slice<u8>, responseMs: u64, answer: borrow mut Http3Answer) -> Result<u64, Http3Failure>;
+    async fn tunnel(
+        borrow this,
+        protocol: Slice<u8>,
+        url: Slice<u8>,
+        parts: UrlParts,
+        port: u16,
+        fields: Slice<u8>,
+        responseMs: u64,
+        answer: borrow mut Http3Answer,
+    ) -> Result<u64, Http3Failure>;
 
     /// Ends what is written on `stream`, a tunnel's, when that has all left; what the server sends is still read.
     async fn shut(borrow this, stream: u64) -> Result<void, HttpError>;
@@ -67,7 +111,12 @@ public interface Http3Transport {
     /// After `read` gave 0: appends the trailers of `stream` to `head` and `spans`; how many.
     @effects(
         alloc,
-    ) fn trailers(borrow this, stream: u64, head: borrow mut Vector<u8>, spans: borrow mut Vector<HeaderSpan>) -> Result<usize, AllocError>;
+    ) fn trailers(
+        borrow this,
+        stream: u64,
+        head: borrow mut Vector<u8>,
+        spans: borrow mut Vector<HeaderSpan>,
+    ) -> Result<usize, AllocError>;
 
     /// Whether the body of `stream` has been read to its end.
     @effects() fn isComplete(borrow this, stream: u64) -> bool;

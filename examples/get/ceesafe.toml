@@ -5,5 +5,5 @@ kind = "executable"
 
 [dependencies]
 httpclient = { path = "../.." }
-web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_core" }
-web_tls = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_tls" }
+web_core = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "c4b27880cec4350894393344651497d54cffce1d", dir = "packages/web_core" }
+web_tls = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "c4b27880cec4350894393344651497d54cffce1d", dir = "packages/web_tls" }

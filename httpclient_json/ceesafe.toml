@@ -2,12 +2,12 @@
 name = "httpclient_json"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.61.0"
+ceesafec = ">=0.69.0"
 tests = ["tests"]
 
 [dependencies]
 httpclient = { path = ".." }
 # The tests script their connections with web_transport's MockTransport (`Client.script`).
-web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "615a85d88b3841b1e9e51378a81aa52ad071663c", dir = "packages/web_transport" }
+web_transport = { git = "https://github.com/CeeSafe/CeeSafe.Web.git", rev = "c4b27880cec4350894393344651497d54cffce1d", dir = "packages/web_transport" }
 # ToJson, FromJson and the parser and writer behind them.
 json = { git = "https://github.com/CeeSafe/CeeSafeLibs.git", rev = "ca0a13fec248bbe192f0b61b930c8b8259175eed", dir = "json" }

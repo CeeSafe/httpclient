@@ -15,15 +15,16 @@ arm64 unless an entry says otherwise.
 | F6 | a loop's local cannot lend to a `drop` type made through `?` | CeeSafe | fixed in ceesafec 0.61.0 (ADR 0160 §3) |
 | F7 | a wait blocks after a full kqueue change queue's early send readied tasks | CeeSafe (runtime) | fixed in ceesafec 0.61.0 |
 | F8 | no DEFLATE decoder and no CRC-32 in lib/std | CeeSafe (library gap) | open; this package has its own |
-| F9 | a `bool` field read inside a returned struct literal is taken as a loan (N0245) | CeeSafe | open |
+| F9 | a `bool` field read inside a returned struct literal is taken as a loan (N0245) | CeeSafe | fixed in ceesafec 0.65.1 |
 | F10 | no practical way to keep a hook (callback) in a long-lived struct used from async code | CeeSafe (ergonomics, not a bug) | open; needs a design answer |
 | F11 | gcc 13 warns `free` called on `ceesafe_vec_empty` in generated C (`-Wfree-nonheap-object`) | CeeSafe (build noise, no runtime fault) | open |
-| F12 | `ceesafec fmt` never wraps an interface method's signature, and wraps its `@effects(...)` instead | CeeSafe (formatter) | open |
+| F12 | `ceesafec fmt` never wraps an interface method's signature, and wraps its `@effects(...)` instead | CeeSafe (formatter) | fixed in ceesafec 0.65.1 |
 | F13 | web_client over HTTP/2 with 64 KiB bodies: 117 to 1,079 requests a second on Linux | CeeSafe.Web (performance) | open, not looked into |
-| F14 | gcc 15.2 at `-O2` compiles a bitwise CRC loop in ceesafec's C to an empty function (`-foptimize-crc`) | gcc; ceesafec could pass `-fno-optimize-crc` | open; worked around here, reduced to C |
+| F14 | gcc 15.2 at `-O2` compiles a bitwise CRC loop in ceesafec's C to an empty function (`-foptimize-crc`) | gcc; ceesafec's runtime header turns the pass off | fixed in ceesafec 0.65.1 (a pragma in `rt.h` for gcc 15 and later; checked with gcc 15.3); the workaround here stays for older compilers |
 | F15 | `Async.timeout` and `Async.race` cannot wrap a call whose result borrows what the closure captures (N0245) | CeeSafe (ergonomics, not a bug) | open; worked around here |
 
-The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`). The CeeSafe.Web ones are in the
+The CeeSafe fixes were released in ceesafec 0.61.0 (2026-11-16, tag `v0.61.0`), and those of F9, F12 and F14 in
+ceesafec 0.65.1 (2026-11-18, tag `v0.65.1`). The CeeSafe.Web ones are in the
 worktree `~/dev/CeeSafe.Web-wt-client` (branch `fix/web-client-findings`, from `main` at `d8b0d38`), uncommitted.
 
 ## F1. A method cannot say its result borrows from `this` when it has another scoped parameter

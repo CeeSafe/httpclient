@@ -21,20 +21,20 @@ hash = "sha256:c83d0d607d2f50248e5f8b27fc0974cababf8d37c240d3d57ac2117baf7f4617"
 [[package]]
 name = "web_core"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+commit = "c4b27880cec4350894393344651497d54cffce1d"
 dir = "packages/web_core"
-hash = "sha256:d06487217199835e061256cba71b91354f3b6e5dd049215e123b0eb5f423579a"
+hash = "sha256:04d1f974bb8451f4d31d23fbd887968db77be5eab4a9cfe54ad822b51e43789c"
 
 [[package]]
 name = "web_tls"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+commit = "c4b27880cec4350894393344651497d54cffce1d"
 dir = "packages/web_tls"
-hash = "sha256:4fe72c14046eb079161b00ca154c9d915bd64e457f110b2faa87513c56a609fe"
+hash = "sha256:23880c13dc951ad7e4869018f2e6992aa2de5b1645133adcf14c93b9b900c3ef"
 
 [[package]]
 name = "web_transport"
 source = "git+https://github.com/CeeSafe/CeeSafe.Web.git"
-commit = "615a85d88b3841b1e9e51378a81aa52ad071663c"
+commit = "c4b27880cec4350894393344651497d54cffce1d"
 dir = "packages/web_transport"
-hash = "sha256:a70380914c02645dfdfb4dfc3f3f2016017d956b9ef410894a318fae944aa232"
+hash = "sha256:6950d4d4b23d5252c99d4d529605228fc99626bd16e62ab20fc14f4f02b28115"

@@ -653,7 +653,7 @@ fn assemble<region c>(
         inflater: if (deflate) Some(Inflater.create()) else null,
         packed: Vector<u8>.create(),
         deflater: deflater,
-        compressFrom: if (deflate) options.compressMinBytes else 0xFFFFFFFFFFFFFFFF,
+        compressFrom: if (deflate) options.compressMinBytes else ~0usize, // never: usize's largest on every target
         squeezed: Vector<u8>.create(),
     });
 }
